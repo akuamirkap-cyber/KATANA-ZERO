@@ -1,0 +1,8 @@
+{
+  "name": "影刃 Kageba — Duel Pedang Shinobi 3D",
+  "description": "Game aksi pertarungan shinobi 3D bertema Sekiro: duel katana presisi, parry, posture gauge, dan refleks pedang.",
+  "requestFramePermissions": [],
+  "majorCapabilities": [
+    "MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"
+  ]
+}

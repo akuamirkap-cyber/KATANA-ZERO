@@ -1,0 +1,5603 @@
+import * as THREE from 'three';
+import { EffectComposer } from 'three/addons/postprocessing/EffectComposer.js';
+import { RenderPass } from 'three/addons/postprocessing/RenderPass.js';
+import { UnrealBloomPass } from 'three/addons/postprocessing/UnrealBloomPass.js';
+import { ShaderPass } from 'three/addons/postprocessing/ShaderPass.js';
+import { OutputPass } from 'three/addons/postprocessing/OutputPass.js';
+import { Rig, Pose, PoseKey, KEYS, LimbName, createHumanoid, clonePose, copyPose, blendInto, sampleFrames, footStance, IDLE } from './rig';
+import { AnimDef, HitDef, P, PLAYER_COMBO, DEATHBLOW, KICK, enemyAttack, EnemyAttackName } from './anims';
+import { Loco, LocoOut, newLoco, newOut, stepLoco } from './locomotion';
+import { Sfx } from './audio';
+import { Particles, Sparks, Trail, Shocks } from './fx';
+import { buildWorld, buildWhiteWorld, applyEnvironment, applyWhiteEnvironment, Theme, World, ARENA_R } from './world';
+import type { Snapshot, GameEvent, EnemyView } from './types';
+import {
+  applyArcs, buildCut, AIM_POSE, buildDodge, DodgeKind, FLIP_OPEN, LAND_HERO_ANIM, LAND_BACK_ANIM,
+  EVADE_SIDE, EVADE_BACK, PARRY_POSE, IMPALE, IMPALED_POSE, TUMBLE_POSE,
+} from './anims';
+import { Streaks } from './streaks';
+import { SliceWorld, Piece, setSliceFxStyle } from './slice';
+import { Afterimages } from './ghosts';
+import { STYLES, StyleDef, STYLE_CHIBURI, STYLE_JODAN } from './styles';
+import { Projectiles, Proj } from './projectiles';
+import { IDLE_BOW, IDLE_GUN, rangedAttack, RangedAttackName } from './ranged';
+
+type EKind = 'blade' | 'archer' | 'gunner' | 'boss' | 'bladehead';
+import { RageShader } from './ragepass';
+
+interface CutPlane {
+  p0: THREE.Vector3;
+  normal: THREE.Vector3;
+  lineDir: THREE.Vector3;
+  perfect: boolean;
+  /** the last slash of blade mode (right-click): the only one that kills */
+  final?: boolean;
+}
+
+const DEFLECT_WINDOW = 0.26;
+
+/* ---------------- helpers ---------------- */
+const rand = (a: number, b: number) => a + Math.random() * (b - a);
+const clamp = (v: number, a: number, b: number) => Math.min(b, Math.max(a, v));
+const angDiff = (a: number, b: number) => {
+  let d = (b - a) % (Math.PI * 2);
+  if (d > Math.PI) d -= Math.PI * 2;
+  if (d < -Math.PI) d += Math.PI * 2;
+  return d;
+};
+const turnToward = (cur: number, target: number, step: number) => {
+  const d = angDiff(cur, target);
+  return cur + clamp(d, -step, step);
+};
+const fwd = (yaw: number) => new THREE.Vector3(Math.sin(yaw), 0, Math.cos(yaw));
+const TAU = Math.PI * 2;
+/** how hard a slow-motion cut pushes its halves apart (1 = a normal violent cut) — low, so nothing flies away while time crawls */
+const SLOW_CUT = 0.28;
+export type SizeMode = 'normal' | 'chibi';
+/** 'kz' = Katana ZERO: flat neon-red arterial bursts and hard white flashes · 'classic' = the electric-blue machine look */
+export type FxStyle = 'kz' | 'classic';
+/** overall body scale of the toon (Zelda / Link) fighters */
+const CHIBI_K = 0.78;
+const smooth01 = (x: number) => {
+  const t = Math.min(1, Math.max(0, x));
+  return t * t * (3 - 2 * t);
+};
+
+/** Spring damping per pose channel: <1 overshoots a little (whip / follow-through), >1 is overdamped (no wobble). */
+const DAMP = {} as Record<PoseKey, number>;
+for (const k of KEYS) DAMP[k] = 0.82;
+for (const k of ['sp', 'sw', 'sr'] as PoseKey[]) DAMP[k] = 0.55;
+for (const k of ['sx', 'sy', 'sz'] as PoseKey[]) DAMP[k] = 0.7;
+for (const k of ['torsoX', 'torsoY', 'hipYaw'] as PoseKey[]) DAMP[k] = 0.66;
+for (const k of ['grip', 'two', 'plant', 'rl', 'll', 'dy'] as PoseKey[]) DAMP[k] = 1.15;
+const zeroPose = (): Pose => {
+  const o = clonePose(IDLE);
+  for (const k of KEYS) o[k] = 0;
+  return o;
+};
+
+type EnemyState =
+  | 'spawn' | 'idle' | 'attack' | 'evade' | 'parry' | 'flinch' | 'recoil' | 'stagger' | 'kicked'
+  | 'impaled' | 'tumble' | 'broken' | 'dying' | 'dead';
+type PlayerState =
+  | 'idle' | 'attack' | 'dodge' | 'jump' | 'hurt' | 'broken' | 'heal' | 'stomp' | 'deathblow' | 'recoil' | 'cutaim' | 'cut' | 'style' | 'dive' | 'land' | 'impale' | 'climb' | 'dead';
+
+interface Foot {
+  wx: number;
+  wz: number;
+  stepping: boolean;
+  t: number;
+  dur: number;
+  fx: number;
+  fz: number;
+  tx: number;
+  tz: number;
+  lift: number;
+  pitch: number;
+  init: boolean;
+}
+const newFoot = (): Foot => ({
+  wx: 0, wz: 0, stepping: false, t: 0, dur: 0.15, fx: 0, fz: 0, tx: 0, tz: 0, lift: 0, pitch: 0, init: false,
+});
+
+interface Common {
+  feet: Foot[];
+  lastPos: THREE.Vector3;
+  gv: THREE.Vector3;
+  sig: string;
+  lastSig: string;
+  xfade: number;
+  soft: boolean;
+  gaitOn: boolean;
+  loco: Loco;
+  lout: LocoOut;
+  out: Pose;
+  locoCarry: boolean;
+  lastYaw: number;
+  yawRate: number;
+  pv: Pose;
+  /** seconds of extra springiness right after a swing — the blade and chest settle with a soft wobble */
+  settle: number;
+  aim: number;
+  rig: Rig;
+  pos: THREE.Vector3;
+  vel: THREE.Vector3;
+  yaw: number;
+  pose: Pose;
+  target: Pose;
+  walk: number;
+  flash: number;
+  react: number;
+  reactPose: Pose;
+  trail: Trail;
+  trailOn: boolean;
+  t: number;
+  hp: number;
+  hpMax: number;
+  posture: number;
+  postureT: number;
+  glow: number;
+  look: THREE.Vector3 | null;
+  lookW: number;
+}
+interface Player extends Common {
+  state: PlayerState;
+  anim: AnimDef | null;
+  hitIdx: number;
+  comboIdx: number;
+  comboTimer: number;
+  guardT: number;
+  guardPrev: boolean;
+  gourds: number;
+  resurrect: number;
+  jumpStart: number;
+  vy: number;
+  dodgeDir: THREE.Vector3;
+  dbTarget: Enemy | null;
+  dbDone: boolean;
+  healDone: boolean;
+  kickSide: number;
+  speed: number;
+  swingPlayed: boolean;
+  /* ninja moves */
+  flip: number;
+  flipV: number;
+  jumps: number;
+  diveAvail: boolean;
+  dashAvail: boolean;
+  airDashT: number;
+  diveHit: boolean;
+  flipEnd: number;
+  /** 'back' while a backflip dodge is in progress */
+  flipStyle: '' | 'back';
+  dodgeKind: DodgeKind;
+  dodgeSide: number;
+  /** remaining i-frames (seconds) */
+  inv: number;
+  landBack: boolean;
+  /** the colossus being climbed, and how far up its path (0 = blade tip on the ground, 1 = on the core) */
+  climbOn: Enemy | null;
+  climbT: number;
+  climbUp: number;
+  /** the enemy currently skewered on the blade */
+  impTarget: Enemy | null;
+  impStab: boolean;
+  impKick: boolean;
+}
+interface Enemy extends Common {
+  id: number;
+  name: string;
+  boss: boolean;
+  scale: number;
+  state: EnemyState;
+  stateT: number;
+  stateDur: number;
+  anim: AnimDef | null;
+  hitIdx: number;
+  swingIdx: number;
+  warned: boolean;
+  speedMul: number;
+  lungeD: number[];
+  pips: number;
+  maxPips: number;
+  postureMax: number;
+  lethal: boolean;
+  brokenDur: number;
+  attackTimer: number;
+  circleDir: number;
+  circleT: number;
+  defense: null | 'block' | 'deflect';
+  defenseUntil: number;
+  /** cooldowns so an enemy can't evade / parry every single swing */
+  evadeCD: number;
+  parryCD: number;
+  /** sideways direction of the current evade (+1 / −1), 0 = straight back */
+  evadeSide: number;
+  evadeDir: THREE.Vector3;
+  /** queued counter-attack right after a successful parry / evade */
+  punish: number;
+  /** spin while tumbling backwards off the blade */
+  tumbleV: number;
+  tumbleA: number;
+  /* ---- colossus: overhead chop that buries the head-blade in the ground ---- */
+  slamT: number;
+  /** seconds the blade stays stuck in the arena (0 = not embedded) */
+  stuck: number;
+  /** where the blade bit into the ground */
+  stuckAt: THREE.Vector3;
+  /** head-blade pitch written by the slam (overrides the pose) */
+  slamPitch: number;
+  /** damage taken while being climbed, drives the stagger */
+  rideHits: number;
+  dmgMul: number;
+  phase2: boolean;
+  removeAt: number;
+  lastAttack: string;
+  perilId: number;
+  imp: THREE.Vector3;
+  impDmg: number;
+  impHits: number;
+  kind: EKind;
+  fireIdx: number;
+  aiming: boolean;
+  aimMesh: THREE.Mesh;
+  /** number of limbs severed so far */
+  sevN: number;
+  /** lost its weapon arm (or the arm that draws the bow) → cannot attack any more */
+  disarmed: boolean;
+  /** time left of blood spurting from the stumps */
+  bleedT: number;
+  stumps: THREE.Object3D[];
+}
+
+const STAGES: { name: string; enemies: EKind[] }[] = [
+  { name: 'I · HASHA, Unit Bilah', enemies: ['bladehead'] },
+  { name: 'II · Gerbang Kuil', enemies: ['blade', 'archer'] },
+  { name: 'III · Hujan Panah & Api', enemies: ['blade', 'gunner', 'archer'] },
+  { name: 'IV · Jenderal Baja', enemies: ['boss', 'gunner'] },
+];
+/**
+ * HASHA is a colossus. At this scale the head sits ~48 m up and the blade is ~135 m long — when it chops the
+ * blade down it buries itself in the arena and becomes a ramp you can run up (Shadow of the Colossus style).
+ */
+const MEGA = 32;
+
+const PostShader = {
+  uniforms: {
+    tDiffuse: { value: null as THREE.Texture | null },
+    aberr: { value: 0 },
+    flash: { value: 0 },
+    hurt: { value: 0 },
+    sat: { value: 1 },
+    time: { value: 0 },
+    vig: { value: 0.55 },
+  },
+  vertexShader: /* glsl */ `
+    varying vec2 vUv;
+    void main(){ vUv = uv; gl_Position = projectionMatrix * modelViewMatrix * vec4(position,1.0); }`,
+  fragmentShader: /* glsl */ `
+    uniform sampler2D tDiffuse;
+    uniform float aberr, flash, hurt, sat, time, vig;
+    varying vec2 vUv;
+    float rnd(vec2 p){ return fract(sin(dot(p, vec2(12.9898,78.233))) * 43758.5453); }
+    void main(){
+      vec2 c = vUv - 0.5;
+      float d = length(c);
+      vec2 off = c * aberr * (0.4 + d);
+      vec3 col = vec3(texture2D(tDiffuse, vUv + off).r, texture2D(tDiffuse, vUv).g, texture2D(tDiffuse, vUv - off).b);
+      float l = dot(col, vec3(0.299, 0.587, 0.114));
+      col = mix(vec3(l), col, sat);
+      col *= 1.0 - vig * smoothstep(0.25, 0.85, d);
+      col = mix(col, vec3(0.85, 0.02, 0.02), hurt * smoothstep(0.05, 0.75, d));
+      col += vec3(flash);
+      col += (rnd(vUv * 1000.0 + time) - 0.5) * 0.025;
+      gl_FragColor = vec4(col, 1.0);
+    }`,
+};
+
+export class Game {
+  private renderer: THREE.WebGLRenderer;
+  private scene = new THREE.Scene();
+  private camera: THREE.PerspectiveCamera;
+  private composer: EffectComposer;
+  private post: ShaderPass;
+  private bloom: UnrealBloomPass;
+  private world: World;
+  private sfx = new Sfx();
+  private blood: Particles;
+  private dust: Particles;
+  private glowP: Particles;
+  private sparks: Sparks;
+  private shocks: Shocks;
+  private flashLight: THREE.PointLight;
+  private ro: ResizeObserver;
+
+  private player!: Player;
+  private enemies: Enemy[] = [];
+  private enemyId = 1;
+
+  private raf = 0;
+  private lastT = 0;
+  private time = 0;
+  private paused = false;
+  private disposed = false;
+  private hitStop = 0;
+  private slow = 0;
+  private slowScale = 1;
+  private trauma = 0;
+  private fovPunch = 0;
+  private aberr = 0;
+  private whiteFlash = 0;
+  private hurtFx = 0;
+  private sat = 1;
+
+  private camYaw = 0;
+  private camPitch = 0.32;
+  private camPos = new THREE.Vector3(0, 4, -8);
+  private camLook = new THREE.Vector3();
+  private lockOn = true;
+  private lockTarget: Enemy | null = null;
+  private fov = 58;
+
+  private keys = new Set<string>();
+  private mouseGuard = false;
+  private attackBuf = 0;
+  private dodgeBuf = 0;
+  private jumpBuf = 0;
+  private healBuf = 0;
+  private guardBuf = 0;
+  private kickBuf = 0;
+  private impaleBuf = 0;
+
+  /* ---- freestyle / cinematics / style rank ---- */
+  private styleBuf = 0;
+  private styleForce = -1;
+  private styleLast = -1;
+  private styleDef: StyleDef | null = null;
+  private styleFx = 0;
+  private styleSt = 0;
+  private pState: PlayerState = 'idle';
+  private idleT = 0;
+  private pendingT = 0;
+  private pendingIdx = STYLE_CHIBURI;
+  private ghosts!: Afterimages;
+  private ghostT = 0;
+  private prevSpd = 0;
+  private skidT = 0;
+  private camRoll = 0;
+  private rollKick = 0;
+  private camBob = 0;
+  private camSide = 0.65;
+  private cineW = 0;
+  private cine = {
+    kind: 'none' as 'none' | 'intro' | 'kill',
+    t: 0,
+    dur: 0,
+    center: new THREE.Vector3(),
+    a0: 0,
+    dir: 1,
+    r0: 6,
+    r1: 4,
+    h0: 2,
+    h1: 1.6,
+    fov: 36,
+  };
+  private styleScore = 0;
+  private styleHold = 0;
+
+  /* ---- ranged enemies · projectiles · screen shake ---- */
+  private proj = new Projectiles(this.scene);
+  private shakeScale = 1;
+  private hbT = 0;
+  private lastKills = 0;
+  private aimGeo = new THREE.BoxGeometry(0.018, 0.018, 1);
+
+  /* ---- rage / blade mode ---- */
+  private streaks!: Streaks;
+  private ragePass!: ShaderPass;
+  private sliceWorld!: SliceWorld;
+  private rage = {
+    on: false,
+    meter: 55,
+    aiming: false,
+    aimT: 0,
+    angle: 0.8,
+    weak: 1.2,
+    target: null as Enemy | null,
+    noAim: false,
+    cutT: 0,
+    cutDone: true,
+    chain: 0,
+    chainT: 0,
+    aimIdle: 0,
+    // final slash: right-click / F. Only this slash shows the yellow line and only this one can finish an enemy.
+    finisher: false,
+    finDown: false,
+    finBuf: 0,
+    finTap: false,
+    tapBuf: 0,
+    fanIdx: 0,
+    /** slash angle you steer with the mouse while blade mode is on (math angle, y up) */
+    slashAng: 0.7,
+    /** >0 while you are actively steering it — the guide line brightens, and the fan is overridden */
+    steerT: 0,
+    // the victim being carved: while set, every tap keeps cutting THIS body's pieces — the target never jumps to another enemy
+    focusOwner: null as number | null,
+    seqOwner: null as number | null,
+    keepAlive: false, // something was cut: stay in blade mode (slow-mo) until the final slash / gauge empties
+    endT: 0, // real seconds until blade mode ends after the final slash
+    queue: [] as { angle: number; perfect: boolean }[],
+    seq: [] as { angle: number; perfect: boolean; final: boolean; normal: THREE.Vector3; lineDir: THREE.Vector3 }[],
+    seqIdx: 0,
+    seqTarget: null as Enemy | null,
+    cutCenter: new THREE.Vector3(),
+    invert: 0,
+    plane: null as CutPlane | null,
+    dashFrom: new THREE.Vector3(),
+    dashTo: new THREE.Vector3(),
+  };
+  private rageFx = 0;
+
+  private kickV = new THREE.Vector3();
+  private lastStats = { deflects: 0, deathblows: 0, mikiri: 0 };
+  /** body scale of every fighter (1 = normal, <1 = chibi). Heights and reaches are measured against it. */
+  private sizeK = 1;
+  private chibi = false;
+  /** top sprint speed for this body size — every run effect triggers off a fraction of it, never a fixed m/s */
+  private sprintSpd = 10;
+  private thudAt = 0;
+  private sliceFx = {
+    blood: (p: THREE.Vector3, d: THREE.Vector3, n: number, s: number) => this.bloodBurst(p, d, n, s),
+    thud: (p: THREE.Vector3, power: number) => {
+      // a body part hitting the gravel: a small puff and a SOFT thud — and never more than a few per second, however many pieces drop
+      const now = performance.now();
+      if (now - this.thudAt < 120) return;
+      this.thudAt = now;
+      this.dustBurst(p, 1 + Math.round(power * 3), 0.8 + power * 1.1);
+      this.bloodBurst(p, new THREE.Vector3(0, 1, 0), 2 + Math.round(power * 4), 1.5 + power * 1.5);
+      this.sfx.partThud(power);
+      const d = p.distanceTo(this.player.pos);
+      if (d < 7) this.shake(0.015 * power * (1 - d / 7));
+    },
+  };
+
+  private stage = -1;
+  private stageTimer = 0;
+  private stageCleared = false;
+  private ended = false;
+  private streak = 0;
+  private streakT = 0;
+  private stats = { kills: 0, deathblows: 0, deflects: 0, time: 0, mikiri: 0 };
+  private perilCounter = 0;
+  private deadT = 0;
+
+  private tmpV = new THREE.Vector3();
+  private tmpV2 = new THREE.Vector3();
+
+  constructor(
+    private container: HTMLElement,
+    private onEvent: (e: GameEvent) => void,
+    private theme: Theme = 'white',
+    /** 'chibi' = Zelda / Link sized: small toon bodies with big heads in a full-size arena */
+    private sizeMode: SizeMode = 'chibi',
+    private fxStyle: FxStyle = 'kz',
+  ) {
+    const w = container.clientWidth || window.innerWidth;
+    const h = container.clientHeight || window.innerHeight;
+    this.renderer = new THREE.WebGLRenderer({ antialias: false, powerPreference: 'high-performance' });
+    const pr = Math.min(window.devicePixelRatio || 1, 1.75);
+    this.renderer.setPixelRatio(pr);
+    this.renderer.setSize(w, h);
+    this.renderer.shadowMap.enabled = true;
+    this.renderer.shadowMap.type = THREE.PCFSoftShadowMap;
+    this.renderer.toneMapping = THREE.ACESFilmicToneMapping;
+    this.renderer.toneMappingExposure = this.theme === 'white' ? 0.82 : 1.05;
+    this.renderer.domElement.style.display = 'block';
+    container.appendChild(this.renderer.domElement);
+
+    setSliceFxStyle(this.fxStyle);
+    this.chibi = this.sizeMode === 'chibi';
+    this.sizeK = this.chibi ? CHIBI_K : 1;
+    this.sprintSpd = 14.0 * (0.3 + 0.7 * (this.sizeK * (this.chibi ? 0.9 : 1)));
+    const white = this.theme === 'white';
+    this.scene.fog = white ? new THREE.FogExp2(0xd4d8e0, 0.011) : new THREE.FogExp2(0x2a1038, 0.015);
+    this.camera = new THREE.PerspectiveCamera(this.fov, w / h, 0.1, 700);
+    this.scene.add(this.camera);
+
+    this.world = white ? buildWhiteWorld(this.scene) : buildWorld(this.scene);
+    if (white) applyWhiteEnvironment(this.renderer, this.scene);
+    else applyEnvironment(this.renderer, this.scene);
+
+    this.blood = new Particles(this.scene, 700, false, 9, 0.6);
+    this.dust = new Particles(this.scene, 300, false, -0.2, 2.2, 1.2);
+    this.glowP = new Particles(this.scene, 500, true, 1.5, 2.5);
+    this.sparks = new Sparks(this.scene, 1200);
+    this.shocks = new Shocks(this.scene);
+    this.flashLight = new THREE.PointLight(0xffd9a0, 0, 16, 1.4);
+    this.scene.add(this.flashLight);
+
+    // post-processing
+    const rt = new THREE.WebGLRenderTarget(w * pr, h * pr, { type: THREE.HalfFloatType, samples: 4 });
+    this.composer = new EffectComposer(this.renderer, rt);
+    this.composer.setPixelRatio(pr);
+    this.composer.setSize(w, h);
+    this.composer.addPass(new RenderPass(this.scene, this.camera));
+    // subtle bloom: it must never wash out the blade, the enemy silhouette or the slash lines
+    this.bloom = new UnrealBloomPass(new THREE.Vector2(w, h), white ? 0.1 : 0.22, 0.35, white ? 1.25 : 1.1);
+    this.composer.addPass(this.bloom);
+    this.post = new ShaderPass(PostShader);
+    // the white void needs only the faintest vignette, or it stops reading as "blinding white"
+    if (white) this.post.uniforms.vig.value = 0.42;
+    this.composer.addPass(this.post);
+    this.composer.addPass(new OutputPass());
+
+    this.player = this.makePlayer();
+    this.setupInput();
+
+    this.ro = new ResizeObserver(() => this.resize());
+    this.ro.observe(container);
+    this.resize();
+  }
+
+  /* ================= lifecycle ================= */
+  start() {
+    this.sfx.init();
+    this.requestLock();
+    this.initRage();
+    this.nextStage();
+    // opening crane shot: swoops down from above and behind into the gameplay camera
+    this.startCine('intro', this.player.pos.clone().setY(1.3), 3.8);
+    this.lastT = performance.now();
+    this.raf = requestAnimationFrame(this.frame);
+  }
+
+  requestLock() {
+    try {
+      const el = this.renderer.domElement;
+      const r = el.requestPointerLock?.() as unknown as Promise<void> | undefined;
+      if (r && typeof r.catch === 'function') r.catch(() => {});
+    } catch {
+      /* pointer lock unavailable */
+    }
+  }
+
+  setPaused(p: boolean) {
+    this.paused = p;
+    if (!p) {
+      this.lastT = performance.now();
+      this.sfx.init();
+      this.requestLock();
+    }
+  }
+
+  dispose() {
+    this.disposed = true;
+    cancelAnimationFrame(this.raf);
+    this.teardownInput();
+    this.ro.disconnect();
+    if (document.pointerLockElement) document.exitPointerLock();
+    this.sliceWorld?.dispose();
+    this.ghosts?.dispose();
+    this.renderer.dispose();
+    this.composer.dispose();
+    this.sfx.ctx?.close().catch(() => {});
+    if (this.renderer.domElement.parentElement) this.renderer.domElement.parentElement.removeChild(this.renderer.domElement);
+  }
+
+  private resize() {
+    const w = this.container.clientWidth || window.innerWidth;
+    const h = this.container.clientHeight || window.innerHeight;
+    this.renderer.setSize(w, h);
+    this.composer.setSize(w, h);
+    this.camera.aspect = w / h;
+    this.camera.updateProjectionMatrix();
+    this.updatePointScale();
+  }
+
+  private updatePointScale() {
+    const h = this.renderer.domElement.height;
+    const s = h / (2 * Math.tan((this.camera.fov * Math.PI) / 360));
+    this.blood.setScale(s);
+    this.dust.setScale(s);
+    this.glowP.setScale(s);
+  }
+
+  /* ================= input ================= */
+  private onKeyDown = (e: KeyboardEvent) => {
+    if (e.repeat) return;
+    const c = e.code;
+    this.keys.add(c);
+    if (['Space', 'Tab', 'ArrowUp', 'ArrowDown', 'ArrowLeft', 'ArrowRight'].includes(c)) e.preventDefault();
+    if (this.paused) {
+      if (c === 'KeyP') this.onEvent({ type: 'pause', n: 0 });
+      return;
+    }
+    if (c === 'KeyJ') this.pressAttack();
+    if (c === 'Space') this.toggleRage();
+    if (c === 'KeyC') this.dodgeBuf = 0.2;
+    if (c === 'KeyE') this.jumpBuf = 0.2;
+    if (c === 'KeyH') this.healBuf = 0.2;
+    if (c === 'KeyK' || c === 'KeyF') {
+      if (this.rage.on) this.pressFinisher();
+      else this.guardBuf = 0.2;
+    }
+    if (c === 'KeyV' || c === 'KeyL') this.kickBuf = 0.2;
+    if (c === 'KeyG') {
+      this.styleBuf = 0.3;
+      this.styleForce = -1;
+    }
+    if (c === 'KeyQ') this.toggleLock();
+    if (c === 'Tab' || c === 'KeyX') this.switchTarget();
+    if (c === 'KeyR') this.revive();
+    if (c === 'KeyP') {
+      this.paused = true;
+      this.onEvent({ type: 'pause', n: 1 });
+    }
+  };
+  private onKeyUp = (e: KeyboardEvent) => {
+    this.keys.delete(e.code);
+    if (e.code === 'KeyJ') this.releaseAttack();
+    if (e.code === 'KeyK' || e.code === 'KeyF') this.releaseFinisher();
+  };
+  private onMouseDown = (e: MouseEvent) => {
+    if (this.paused) return;
+    if (e.button === 0) this.pressAttack();
+    if (e.button === 2) {
+      if (this.rage.on) {
+        // blade mode: right-click is the FINAL slash, not a guard
+        this.pressFinisher();
+      } else {
+        this.mouseGuard = true;
+        this.guardBuf = 0.2;
+      }
+    }
+    if (e.button === 1) {
+      e.preventDefault();
+      this.impaleBuf = 0.3; // scroll-wheel click: run him through, then boot him off the blade
+    }
+  };
+  private onMouseUp = (e: MouseEvent) => {
+    if (e.button === 2) {
+      this.mouseGuard = false;
+      this.releaseFinisher();
+    }
+    if (e.button === 0) this.releaseAttack();
+  };
+  private onMouseMove = (e: MouseEvent) => {
+    if (this.paused || document.pointerLockElement !== this.renderer.domElement) return;
+    if (this.rage.aiming) {
+      this.aimMouse(e.movementX, e.movementY);
+      return;
+    }
+    // blade mode: the mouse steers the ANGLE of the next slice instead of the camera (the camera holds the target)
+    if (this.rage.on) {
+      this.steerSlash(e.movementX, e.movementY);
+      return;
+    }
+    const pitchMin = -1.42;
+    const pitchMax = 1.38;
+    if (!(this.lockOn && this.lockTarget)) {
+      this.camYaw -= e.movementX * 0.0028;
+      this.camPitch = clamp(this.camPitch + e.movementY * 0.0022, pitchMin, pitchMax);
+    } else {
+      this.camYaw -= e.movementX * 0.0018;
+      this.camPitch = clamp(this.camPitch + e.movementY * 0.0022, pitchMin, pitchMax);
+    }
+  };
+  private onCtx = (e: Event) => e.preventDefault();
+  private onLockChange = () => {
+    if (!document.pointerLockElement && !this.paused && !this.disposed && this.lockWasOn) {
+      this.paused = true;
+      this.onEvent({ type: 'pause', n: 1 });
+    }
+    this.lockWasOn = !!document.pointerLockElement;
+  };
+  private lockWasOn = false;
+  private onBlur = () => {
+    this.keys.clear();
+    this.mouseGuard = false;
+  };
+
+  private setupInput() {
+    window.addEventListener('keydown', this.onKeyDown);
+    window.addEventListener('keyup', this.onKeyUp);
+    window.addEventListener('mousedown', this.onMouseDown);
+    window.addEventListener('mouseup', this.onMouseUp);
+    window.addEventListener('mousemove', this.onMouseMove);
+    window.addEventListener('contextmenu', this.onCtx);
+    window.addEventListener('blur', this.onBlur);
+    document.addEventListener('pointerlockchange', this.onLockChange);
+  }
+  private teardownInput() {
+    window.removeEventListener('keydown', this.onKeyDown);
+    window.removeEventListener('keyup', this.onKeyUp);
+    window.removeEventListener('mousedown', this.onMouseDown);
+    window.removeEventListener('mouseup', this.onMouseUp);
+    window.removeEventListener('mousemove', this.onMouseMove);
+    window.removeEventListener('contextmenu', this.onCtx);
+    window.removeEventListener('blur', this.onBlur);
+    document.removeEventListener('pointerlockchange', this.onLockChange);
+  }
+
+  private get guardHeld() {
+    return this.mouseGuard || this.keys.has('KeyK') || this.keys.has('KeyF');
+  }
+
+  private toggleLock() {
+    this.rage.focusOwner = null;
+    this.lockOn = !this.lockOn;
+    if (this.lockOn) this.lockTarget = this.nearestEnemy();
+  }
+  private switchTarget() {
+    this.rage.focusOwner = null; // moving on to someone else on purpose
+    const alive = this.enemies.filter((e) => this.alive(e));
+    if (alive.length < 2) {
+      this.lockOn = true;
+      this.lockTarget = alive[0] ?? null;
+      return;
+    }
+    const i = this.lockTarget ? alive.indexOf(this.lockTarget) : -1;
+    this.lockTarget = alive[(i + 1) % alive.length];
+    this.lockOn = true;
+  }
+  private nearestEnemy(): Enemy | null {
+    let best: Enemy | null = null;
+    let bd = 1e9;
+    for (const e of this.enemies) {
+      if (!this.alive(e)) continue;
+      const d = e.pos.distanceTo(this.player.pos);
+      if (d < bd) {
+        bd = d;
+        best = e;
+      }
+    }
+    return best;
+  }
+  private alive(e: Enemy) {
+    return e.state !== 'dying' && e.state !== 'dead' && e.state !== 'spawn';
+  }
+
+  /* ================= construction ================= */
+  private makeCommon(rig: Rig, trailColor: number): Common {
+    this.scene.add(rig.root);
+    rig.root.rotation.order = 'YXZ';
+    return {
+      feet: [newFoot(), newFoot()],
+      lastPos: new THREE.Vector3(),
+      gv: new THREE.Vector3(),
+      sig: '',
+      lastSig: '',
+      xfade: 0,
+      soft: true,
+      gaitOn: false,
+      loco: newLoco(),
+      lout: newOut(),
+      out: clonePose(IDLE),
+      locoCarry: true,
+      lastYaw: 0,
+      yawRate: 0,
+      pv: zeroPose(),
+      settle: 0,
+      aim: 0,
+      rig,
+      pos: new THREE.Vector3(),
+      vel: new THREE.Vector3(),
+      yaw: 0,
+      pose: clonePose(IDLE),
+      target: clonePose(IDLE),
+      walk: 0,
+      flash: 0,
+      react: 0,
+      reactPose: P.hurt,
+      trail: new Trail(this.scene, trailColor),
+      trailOn: false,
+      t: 0,
+      hp: 100,
+      hpMax: 100,
+      posture: 0,
+      postureT: 0,
+      glow: 0,
+      look: null,
+      lookW: 0.85,
+    };
+  }
+
+  private makePlayer(): Player {
+    const rig = createHumanoid({
+      // Katana ZERO look: black kimono, gold hem, black ponytail, geta
+      kind: 'player', skin: 0xe9c6a4, cloth: 0x15151b, cloth2: 0x1d1d25, accent: 0xe8bb3c, hair: 0x15131a,
+      blade: 0xf6f8fb, bladeGlow: 0x3a2a4a, chibi: this.chibi, scale: this.sizeK,
+    });
+    const c = this.makeCommon(rig, 0x9fdcff);
+    return {
+      ...c,
+      state: 'idle', anim: null, hitIdx: 0, comboIdx: 0, comboTimer: 0, guardT: 99, guardPrev: false,
+      gourds: 3, resurrect: 1, jumpStart: -9, vy: 0, dodgeDir: new THREE.Vector3(0, 0, 1),
+      dbTarget: null, dbDone: false, healDone: false, kickSide: 1, speed: 0, swingPlayed: false,
+      flip: 0, flipV: 0, jumps: 0, diveAvail: true, dashAvail: true, airDashT: 0, diveHit: false, flipEnd: 0,
+      flipStyle: '', dodgeKind: 'slip', dodgeSide: 1, inv: 0, landBack: false,
+      impTarget: null, impStab: false, impKick: false,
+      climbOn: null, climbT: 0, climbUp: 0,
+    };
+  }
+
+  private makeEnemy(kind: EKind, angle: number): Enemy {
+    const boss = kind === 'boss' || kind === 'bladehead';
+    const spec = {
+      blade: { name: 'Prajurit Kuil', hp: 130, posture: 110, atk: 0.9, dist: 8.5, trail: 0xff9a60 },
+      archer: { name: 'Pemanah Kuil', hp: 80, posture: 70, atk: 1.1, dist: 12.5, trail: 0x9acf60 },
+      gunner: { name: 'Penembak Api', hp: 95, posture: 80, atk: 1.6, dist: 11.5, trail: 0xffb060 },
+      boss: { name: 'Kurogane, Jenderal Baja', hp: 280, posture: 170, atk: 0.9, dist: 8.5, trail: 0xff4a30 },
+      bladehead: { name: 'HASHA · Unit Bilah Raksasa', hp: 480, posture: 260, atk: 0.85, dist: 26, trail: 0x30e0ff },
+    }[kind];
+    const rig = createHumanoid(
+      // every enemy is a machine: brushed-steel frame, cyan optics, neon trim
+      kind === 'bladehead'
+        ? {
+            kind: 'bladehead' as const, robot: true, skin: 0x6f7886, cloth: 0x15171f, cloth2: 0x101218,
+            accent: 0x30e0ff, scale: MEGA,
+          }
+        : kind === 'boss'
+        ? {
+            kind: 'boss' as const, robot: true, chibi: this.chibi, skin: 0x8f98a8, cloth: 0x14151c, cloth2: 0x2a1030,
+            accent: 0xff2fb0, scale: 1.18 * this.sizeK, blade: 0xf2f2f4, bladeGlow: 0x5a1038,
+          }
+        : kind === 'archer'
+          ? {
+              kind: 'soldier' as const, robot: true, chibi: this.chibi, weapon: 'bow' as const, skin: 0x79828f,
+              cloth: 0x1a2230, cloth2: 0x141a24, accent: 0x2ad8ff, hair: 0x11151c, scale: this.sizeK,
+            }
+          : kind === 'gunner'
+            ? {
+                kind: 'soldier' as const, robot: true, chibi: this.chibi, weapon: 'gun' as const, skin: 0x7c8694,
+                cloth: 0x241a2e, cloth2: 0x16141c, accent: 0xb44aff, hair: 0x11151c, scale: this.sizeK,
+              }
+            : {
+                kind: 'soldier' as const, robot: true, chibi: this.chibi, skin: 0x79828f, cloth: 0x1b1f28,
+                cloth2: 0x141820, accent: 0x2ad8ff, hair: 0x11151c, scale: this.sizeK,
+              },
+    );
+    const c = this.makeCommon(rig, spec.trail);
+    const hpMax = spec.hp;
+    const aimMesh = new THREE.Mesh(
+      this.aimGeo,
+      new THREE.MeshBasicMaterial({
+        color: 0xff3020, transparent: true, opacity: 0.2, depthWrite: false, blending: THREE.AdditiveBlending, fog: false,
+      }),
+    );
+    aimMesh.visible = false;
+    aimMesh.frustumCulled = false;
+    this.scene.add(aimMesh);
+    const e: Enemy = {
+      ...c,
+      id: this.enemyId++,
+      name: spec.name,
+      kind,
+      fireIdx: 0,
+      aiming: false,
+      aimMesh,
+      boss,
+      scale: kind === 'bladehead' ? MEGA : (boss ? 1.18 : 1) * this.sizeK,
+      state: 'spawn',
+      stateT: 0,
+      stateDur: 0,
+      anim: null,
+      hitIdx: 0,
+      swingIdx: 0,
+      warned: false,
+      speedMul: boss ? 1.1 : 1.05,
+      lungeD: [],
+      pips: boss ? 2 : 1,
+      maxPips: boss ? 2 : 1,
+      postureMax: spec.posture,
+      lethal: false,
+      brokenDur: 5,
+      attackTimer: spec.atk,
+      circleDir: Math.random() < 0.5 ? 1 : -1,
+      circleT: rand(1, 3),
+      defense: null,
+      defenseUntil: 0,
+      evadeCD: 0,
+      parryCD: 0,
+      evadeSide: 0,
+      evadeDir: new THREE.Vector3(),
+      punish: 0,
+      tumbleV: 0,
+      tumbleA: 0,
+      slamT: 0,
+      stuck: 0,
+      stuckAt: new THREE.Vector3(),
+      slamPitch: 0,
+      rideHits: 0,
+      dmgMul: boss ? 0.6 : 1,
+      phase2: false,
+      removeAt: 0,
+      lastAttack: '',
+      perilId: 0,
+      imp: new THREE.Vector3(),
+      impDmg: 0,
+      impHits: 0,
+      sevN: 0,
+      disarmed: false,
+      bleedT: 0,
+      stumps: [],
+    };
+    e.hp = hpMax;
+    e.hpMax = hpMax;
+    e.t = 0;
+    const d = spec.dist;
+    e.pos.set(
+      this.player.pos.x + Math.sin(angle) * d,
+      0,
+      this.player.pos.z + Math.cos(angle) * d,
+    );
+    this.clampArena(e.pos, 1);
+    e.yaw = Math.atan2(this.player.pos.x - e.pos.x, this.player.pos.z - e.pos.z);
+    e.rig.root.visible = true;
+    return e;
+  }
+
+  private nextStage() {
+    this.stage++;
+    if (this.stage >= STAGES.length) {
+      this.ended = true;
+      this.sfx.victory();
+      this.pendingT = 0.9;
+      this.pendingIdx = STYLE_JODAN;
+      this.onEvent({ type: 'victory' });
+      return;
+    }
+    const st = STAGES[this.stage];
+    this.stageCleared = false;
+    const base = this.camYaw;
+    st.enemies.forEach((kind, i) => {
+      const n = st.enemies.length;
+      const ang = base + (n > 1 ? (i / (n - 1) - 0.5) * 1.7 : 0);
+      const e = this.makeEnemy(kind, ang);
+      this.enemies.push(e);
+    });
+    this.sfx.stage();
+    this.onEvent({ type: 'stage', text: st.name });
+    this.lockTarget = this.nearestEnemy();
+    this.lockOn = true;
+  }
+
+  /* ================= main loop ================= */
+  private frame = (now: number) => {
+    if (this.disposed) return;
+    this.raf = requestAnimationFrame(this.frame);
+    const real = Math.min(0.05, (now - this.lastT) / 1000);
+    this.lastT = now;
+    if (!this.paused) this.step(real);
+    this.composer.render();
+  };
+
+  private step(real: number) {
+    let ts = 1;
+    if (this.hitStop > 0) {
+      this.hitStop -= real;
+      ts = 0.025;
+    } else if (this.slow > 0) {
+      this.slow -= real;
+      ts = this.slowScale;
+    }
+    // Blade mode: the world crawls (almost freezes while aiming a cut) but the player keeps moving fast.
+    const r0 = this.rage;
+    let pdt: number;
+    if (r0.on) {
+      ts = Math.min(ts, r0.aiming ? 0.012 : r0.cutT > 0 ? 0.045 : 0.1);
+      pdt = real * (r0.aiming ? 0.6 : r0.cutT > 0 ? 0.9 : 0.62) * (this.hitStop > 0 ? 0.35 : 1);
+    } else {
+      pdt = real * ts;
+    }
+    const dt = real * ts;
+    this.time += dt;
+    this.updateRage(real);
+    if (!this.ended) this.stats.time += real;
+
+    this.attackBuf -= real;
+    this.dodgeBuf -= real;
+    this.jumpBuf -= real;
+    this.healBuf -= real;
+    this.guardBuf -= real;
+    this.kickBuf -= real;
+    this.impaleBuf -= real;
+    this.styleBuf -= real;
+    if (this.pendingT > 0) {
+      this.pendingT -= real;
+      if (this.pendingT <= 0) {
+        this.styleBuf = 0.8;
+        this.styleForce = this.pendingIdx;
+      }
+    }
+    // style meter slowly cools down when you stop fighting stylishly
+    this.styleHold -= real;
+    if (this.styleHold <= 0) this.styleScore = Math.max(0, this.styleScore - 7 * real);
+
+    // keep a valid lock target
+    // …except while carving a body in blade mode: the dead victim stays the camera / target focus, so the view never jumps to another enemy
+    const carving = this.rage.on && this.rage.focusOwner !== null;
+    if (!carving) {
+      if (this.lockTarget && !this.alive(this.lockTarget)) this.lockTarget = this.nearestEnemy();
+      if (!this.lockTarget && this.lockOn) this.lockTarget = this.nearestEnemy();
+    }
+
+    this.updatePlayer(pdt);
+
+    // afterimages: dodge dash, blade-cut dash and full sprint leave translucent echoes behind
+    {
+      const pl = this.player;
+      const spd = Math.hypot(pl.vel.x, pl.vel.z);
+      const dashing =
+        pl.state === 'dodge' ||
+        pl.state === 'dive' ||
+        (pl.state === 'jump' && (pl.airDashT > 0 || pl.inv > 0)) ||
+        (pl.state === 'idle' && spd > this.sprintSpd * 0.78);
+      this.ghostT -= real;
+      if (dashing && this.ghostT <= 0) {
+        this.ghostT = pl.state === 'idle' ? 0.075 : 0.05;
+        const col = this.rage.on ? 0xff5a48 : 0x7fa6ff;
+        this.ghosts.snap(pl.rig.root, col, this.rage.on ? 0.3 : 0.22, 0.34);
+      }
+      this.ghosts.update(real);
+    }
+    for (const e of this.enemies) {
+      this.updateEnemy(e, dt);
+    }
+    this.updateProjectiles(dt);
+    // low-HP heartbeat: a soft thump in the frame and a red pulse at the edges
+    if (this.player.state !== 'dead' && this.player.hp / this.player.hpMax < 0.3) {
+      this.hbT -= real;
+      if (this.hbT <= 0) {
+        this.hbT = 0.85;
+        this.shake(0.07);
+        this.hurtFx = Math.max(this.hurtFx, 0.14);
+      }
+    }
+    this.separate();
+
+    // stage progression
+    if (!this.ended && !this.stageCleared && this.enemies.length > 0 && this.enemies.every((e) => !this.alive(e) && e.state !== 'spawn')) {
+      this.stageCleared = true;
+      this.stageTimer = 3.2;
+      // victory flourish: wipe the blade clean once the dust settles
+      this.pendingT = 1.3;
+      this.pendingIdx = STYLE_CHIBURI;
+      if (this.stage < STAGES.length - 1) this.onEvent({ type: 'stageClear' });
+    }
+    if (this.stageCleared && !this.ended) {
+      this.stageTimer -= dt;
+      if (this.stageTimer <= 0 && this.player.state !== 'dead') {
+        this.enemies = this.enemies.filter((e) => {
+          if (e.state === 'dead') this.removeEnemy(e);
+          return e.state !== 'dead';
+        });
+        if (this.stage < STAGES.length - 1) {
+          this.player.hp = Math.min(this.player.hpMax, this.player.hp + 35);
+          this.player.gourds = Math.min(3, this.player.gourds + 1);
+        }
+        this.nextStage();
+      }
+    }
+    // cleanup dead
+    this.enemies = this.enemies.filter((e) => {
+      if (e.state === 'dying' && this.time > e.removeAt) {
+        e.state = 'dead';
+      }
+      if (e.state === 'dead' && this.time > e.removeAt + 2.5 && !this.stageCleared) {
+        this.removeEnemy(e);
+        return false;
+      }
+      return true;
+    });
+
+    // streak decay
+    this.streakT += dt;
+    if (this.streakT > 6) this.streak = 0;
+
+    this.updateFx(dt, real);
+    this.updateCamera(dt, real);
+    this.world.update(this.time, dt);
+
+    // trails
+    for (const f of [this.player, ...this.enemies] as Common[]) {
+      f.rig.root.updateMatrixWorld(true);
+      f.rig.swordBase.getWorldPosition(this.tmpV);
+      f.rig.swordTip.getWorldPosition(this.tmpV2);
+      f.trail.update(dt, f.trailOn, this.tmpV, this.tmpV2);
+    }
+  }
+
+  /* ================= RAGE / BLADE MODE ================= */
+  private initRage() {
+    this.streaks = new Streaks(this.scene);
+    this.sliceWorld = new SliceWorld(this.scene);
+    this.ghosts = new Afterimages(this.scene, 4);
+    this.ragePass = new ShaderPass(RageShader);
+    this.composer.insertPass(this.ragePass, this.composer.passes.length - 1);
+    this.lastStats = { deflects: 0, deathblows: 0, mikiri: 0 };
+  }
+
+  private wrapHalf(d: number) {
+    return ((((d + Math.PI / 2) % Math.PI) + Math.PI) % Math.PI) - Math.PI / 2;
+  }
+
+  private addRage(a: number) {
+    this.rage.meter = Math.min(100, this.rage.meter + a);
+  }
+
+  private toggleRage() {
+    const p = this.player;
+    if (this.paused || p.state === 'dead' || p.state === 'deathblow' || p.state === 'cut') return;
+    this.setRage(!this.rage.on);
+  }
+
+  private setRage(on: boolean) {
+    const r = this.rage;
+    const p = this.player;
+    if (on === r.on) return;
+    if (on) {
+      if (r.meter < 18) {
+        this.sfx.rageDeny();
+        this.onEvent({ type: 'rageLow', text: 'Rage belum cukup' });
+        return;
+      }
+      if (!this.enemies.some((e) => this.alive(e))) return;
+      r.on = true;
+      this.sfx.rageOn();
+      this.sfx.setRage(true);
+      this.shocks.spawn(p.pos.clone().setY(0.1), 0xff2a1a, 9, 0.8);
+      this.shocks.spawn(p.pos.clone().setY(1.2), 0xffffff, 4, 0.4);
+      this.flashAt(p.pos.clone().setY(1.5), 0xff3020, 40);
+      this.glowBurst(p.pos.clone().setY(1.2), 30, 0.2, new THREE.Color(3, 0.3, 0.2), 5);
+      this.whiteFlash = 0.35;
+      this.aberr = 0.03;
+      this.fovPunch = -6;
+      this.shake(0.6);
+      this.onEvent({ type: 'rage', text: '怒' });
+    } else {
+      r.on = false;
+      this.cancelAim();
+      r.tapBuf = 0;
+      r.finBuf = 0;
+      r.endT = 0;
+      r.keepAlive = false;
+      r.focusOwner = null;
+      r.seqOwner = null;
+      this.sfx.rageOff();
+      this.sfx.setRage(false);
+      this.shocks.spawn(p.pos.clone().setY(0.1), 0x66aaff, 5, 0.5);
+      this.releaseImpulse();
+    }
+  }
+
+  /**
+   * Momentum burst: every slash landed during slow-mo was stored as impulse. The moment blade mode ends it is
+   * released all at once — enemies are hurled and debris explodes into more pieces.
+   */
+  private releaseImpulse() {
+    let big = false;
+    for (const e of this.enemies) {
+      if (!this.alive(e) || e.impHits === 0) continue;
+      big = true;
+      const imp = e.imp.clone();
+      imp.y = 0;
+      imp.clampLength(0, 2.2); // a firm shove, not a launch
+      const mag = Math.min(1, e.impHits / 4);
+      e.vel.addScaledVector(imp, 1.0 * (e.boss ? 0.6 : 1));
+      e.hp -= e.impDmg;
+      const c = e.pos.clone().setY(1.2 * e.scale);
+      this.bloodBurst(c, imp.clone().normalize(), 50 + 40 * mag, 9);
+      this.shocks.spawn(c, 0xff5a3a, 4 + 3 * mag, 0.5);
+      e.flash = 1;
+      e.react = 1;
+      e.reactPose = P.kicked;
+      e.imp.set(0, 0, 0);
+      e.impDmg = 0;
+      e.impHits = 0;
+      if (e.hp <= 0) {
+        e.hp = 0;
+        if (e.pips > 1) this.bossPipLoss(e);
+        else this.rageKill(e, rand(0.3, 2.8), 5);
+      } else if (e.state !== 'broken') {
+        this.interruptEnemy(e);
+        e.state = 'kicked';
+        e.stateT = 0;
+        e.stateDur = 1.0;
+        this.addEnemyPosture(e, 40);
+      }
+    }
+    // slow-mo is over: every piece cut during blade mode is hurled outward from the middle of the pile, at normal speed
+    {
+      const live = this.sliceWorld.pieces.filter((pc: Piece) => pc.gentle);
+      if (live.length) {
+        const mid = new THREE.Vector3();
+        for (const pc of live) mid.add(pc.pivot.position);
+        mid.divideScalar(live.length);
+        const launched = this.sliceWorld.burst(mid, 1);
+        if (launched.length) {
+          big = true;
+          this.bloodBurst(mid.clone().setY(Math.max(0.6, mid.y)), new THREE.Vector3(0, 1, 0), 36, 5);
+          this.shocks.spawn(mid.clone().setY(0.15), 0xff3a2a, 4.5, 0.55);
+        }
+      }
+    }
+    // (no second blast and no extra shattering here any more: one natural burst is all there is)
+    for (const pc of this.sliceWorld.pieces as Piece[]) {
+      pc.hits = 0;
+      pc.imp.set(0, 0, 0);
+    }
+    if (big) {
+      this.hitStop = 0.12;
+      this.shake(0.55);
+      this.aberr = 0.02;
+      this.sfx.postureBreak();
+      this.shocks.spawn(this.player.pos.clone().setY(0.1), 0xff6a4a, 5, 0.5);
+    }
+  }
+
+  private cancelAim() {
+    const r = this.rage;
+    const p = this.player;
+    r.aiming = false;
+    r.target = null;
+    r.queue.length = 0;
+    r.finisher = false;
+    if (p.state === 'cutaim') {
+      p.state = 'idle';
+      p.t = 0;
+    }
+  }
+
+  private pressAttack() {
+    if (this.rage.on) {
+      // blade mode: every click is one slice — just tap, no holding or releasing
+      this.rage.tapBuf = 0.3;
+    } else {
+      this.attackBuf = 0.32; // a longer input buffer lets combos chain without precise timing
+    }
+  }
+
+  private releaseAttack() {
+    /* nothing to release: every click is a complete action */
+  }
+
+  /** Mouse movement is ignored while a final slash auto-aims; otherwise it only matters for the camera. */
+  private aimMouse(mx: number, my: number) {
+    void mx;
+    void my;
+  }
+
+  /**
+   * Steer the slash line with the mouse: swipe in the direction you want to cut. A long swipe snaps the line to it,
+   * a short nudge turns it gradually. The line is an undirected axis, so up-left and down-right are the same cut.
+   */
+  private steerSlash(mx: number, my: number) {
+    const r = this.rage;
+    const len = Math.hypot(mx, my);
+    if (len < 1.2) return;
+    const want = Math.atan2(-my, mx);
+    const d = this.wrapHalf(want - r.slashAng);
+    r.slashAng = (((r.slashAng + d * clamp(len * 0.08, 0.12, 1)) % Math.PI) + Math.PI) % Math.PI;
+    r.steerT = 1.2;
+  }
+
+  private canAimNow() {
+    const p = this.player;
+    return (
+      p.state === 'idle' ||
+      p.state === 'style' ||
+      p.state === 'land' ||
+      (p.state === 'cut' && p.t >= 0.2) ||
+      (p.state === 'attack' && !!p.anim && p.t >= p.anim.cancelFrom)
+    );
+  }
+
+  /**
+   * One tap = one slice. The target is the locked / nearest enemy; the blade line cycles through a fan of diagonals,
+   * horizontals and verticals so a flurry of taps carves the body from every direction. Never lethal.
+   */
+  private doTapCut(): boolean {
+    const r = this.rage;
+    const p = this.player;
+    // 1) the body that was just cut stays the focus: keep carving ITS pieces (Tab / X is how you move on to someone else)
+    let tgt: Enemy | null = null;
+    let pile: THREE.Vector3 | null = null;
+    r.seqOwner = null;
+    if (r.focusOwner !== null) {
+      pile = this.sliceWorld.clusterNear(p.pos, 14, r.focusOwner);
+      if (pile) r.seqOwner = r.focusOwner;
+      else r.focusOwner = null; // nothing of it left in reach
+    }
+    // 2) otherwise the locked enemy (or the nearest one)
+    if (!pile) {
+      tgt = this.lockOn ? this.lockTarget : null;
+      if (!tgt || !this.alive(tgt) || tgt.pos.distanceTo(p.pos) > 14) tgt = this.nearestEnemy();
+      if (tgt && tgt.pos.distanceTo(p.pos) > 14) tgt = null;
+      // 3) nobody alive in reach → any pile still hanging in the slow-motion air
+      if (!tgt) {
+        const o = this.sliceWorld.ownerNear(p.pos, 14);
+        if (o === null) return false;
+        pile = this.sliceWorld.clusterNear(p.pos, 14, o);
+        if (!pile) return false;
+        r.seqOwner = o;
+        r.focusOwner = o;
+      }
+    }
+    // the angle you steered with the mouse wins; untouched, the slices cycle through a fan on their own
+    const fan = [0.7, 2.45, 0.1, 1.55, 1.15, 2.05, 0.4, 2.75];
+    const ang =
+      r.steerT > 0
+        ? r.slashAng
+        : (fan[r.fanIdx++ % fan.length] + (Math.random() - 0.5) * 0.18 + Math.PI) % Math.PI;
+    r.slashAng = ang;
+    const where = tgt ? tgt.pos : pile!;
+    if (tgt) {
+      this.lockTarget = tgt;
+      this.lockOn = true;
+    }
+    const pl0 = this.makePlane(where, ang);
+    r.finisher = false;
+    r.aiming = false;
+    r.seq = [{ angle: ang, perfect: false, final: false, normal: pl0.normal, lineDir: pl0.lineDir }];
+    r.seqIdx = 0;
+    r.seqTarget = tgt;
+    r.target = null;
+    r.cutCenter.copy(where);
+    this.beginCut();
+    return true;
+  }
+
+  /**
+   * FINAL SLASH (right-click / F / K while in blade mode). Hold to aim — the yellow line appears only now — and release to cut.
+   * A quick tap just cuts at once. This is the only slash in blade mode that can finish an enemy.
+   */
+  private pressFinisher() {
+    const r = this.rage;
+    if (!r.on || this.paused) return;
+    if (r.aiming && r.finisher) return; // already lining up the final slash
+    r.finBuf = 0.4;
+    this.tryStartFinisher();
+  }
+
+  private tryStartFinisher() {
+    const r = this.rage;
+    const p = this.player;
+    if (r.finBuf <= 0 || !r.on) return;
+    if (p.state === 'dead' || p.state === 'deathblow') return;
+    if (r.aiming || !this.canAimNow()) return;
+    // a body is mid-carving (or nobody is left alive): the final slash closes THAT pile, then slow-mo ends in a blast
+    const carving = r.focusOwner !== null && this.sliceWorld.hasPieces(r.focusOwner, p.pos, 16);
+    if (carving || !this.enemies.some((e) => this.alive(e))) {
+      r.finBuf = 0;
+      this.finalOnPieces();
+      return;
+    }
+    if (!this.startAim()) {
+      r.finBuf = 0;
+      return;
+    }
+    this.beginFinisher();
+    r.finBuf = 0;
+  }
+
+  /** Final slash with no live target: one big cut through the middle of the pile. */
+  private finalOnPieces() {
+    const r = this.rage;
+    const p = this.player;
+    const owner = r.focusOwner ?? this.sliceWorld.ownerNear(p.pos, 16);
+    const pile = owner === null ? null : this.sliceWorld.clusterNear(p.pos, 16, owner);
+    if (!pile || owner === null) {
+      this.setRage(false); // nothing left to cut — just leave blade mode
+      return;
+    }
+    const ang = (r.fanIdx++ % 2 === 0 ? 0.75 : 2.4) + (Math.random() - 0.5) * 0.2;
+    const pl0 = this.makePlane(pile, ang);
+    r.finisher = true;
+    r.aiming = false;
+    r.seq = [{ angle: ang, perfect: true, final: true, normal: pl0.normal, lineDir: pl0.lineDir }];
+    r.seqIdx = 0;
+    r.seqTarget = null;
+    r.seqOwner = owner;
+    r.target = null;
+    r.cutCenter.copy(pile);
+    this.beginCut();
+  }
+
+  /**
+   * The final slash aims ITSELF: the blade line sweeps onto the yellow line (a quick, cinematic lock-on) and cuts the moment they
+   * meet — always a perfect cut. One right-click is all it takes.
+   */
+  private beginFinisher() {
+    const r = this.rage;
+    r.finisher = true;
+    r.weak = 0.3 + Math.random() * 2.5; // the yellow line is born here
+    const off = (Math.random() < 0.5 ? 1 : -1) * (0.8 + Math.random() * 0.5);
+    r.angle = (((r.weak + off) % Math.PI) + Math.PI) % Math.PI; // start off-line and let it sweep in
+    r.aimIdle = 0;
+    this.sfx.rageOn();
+    this.shake(0.12);
+    this.aberr = Math.max(this.aberr, 0.01);
+  }
+
+  private releaseFinisher() {
+    /* nothing to release: one click is enough */
+  }
+
+  private startAim(): boolean {
+    const r = this.rage;
+    const p = this.player;
+    let tgt = this.lockOn ? this.lockTarget : null;
+    if (!tgt || !this.alive(tgt) || tgt.pos.distanceTo(p.pos) > 14) tgt = this.nearestEnemy();
+    if (!tgt || tgt.pos.distanceTo(p.pos) > 14) return false;
+    r.aiming = true;
+    r.aimT = 0;
+    r.target = tgt;
+    r.weak = 0.35 + Math.random() * 2.45;
+    // fully manual: the blade line starts at a random angle — YOU have to line it up with the golden line
+    r.angle = Math.random() * Math.PI;
+    r.aimIdle = 0;
+    r.queue.length = 0;
+    r.finisher = false; // a normal cut: no yellow line, never lethal
+    this.lockTarget = tgt;
+    this.lockOn = true;
+    p.state = 'cutaim';
+    p.t = 0;
+    p.anim = null;
+    p.trailOn = false;
+    p.vel.set(0, 0, 0);
+    this.sfx.cutAim();
+    return true;
+  }
+
+  private updateRage(real: number) {
+    const r = this.rage;
+    const p = this.player;
+    const st = this.stats;
+    const ls = this.lastStats;
+    // rage gauge fills from skilled play
+    r.meter = Math.min(
+      100,
+      r.meter + (st.deflects - ls.deflects) * 9 + (st.deathblows - ls.deathblows) * 28 + (st.mikiri - ls.mikiri) * 16,
+    );
+    if (st.deflects > ls.deflects) {
+      this.addStyle(12 * (st.deflects - ls.deflects));
+      this.rollKick = (Math.random() < 0.5 ? 1 : -1) * 0.045; // the frame jolts sideways on a perfect parry
+    }
+    if (st.deathblows > ls.deathblows) this.addStyle(26);
+    if (st.mikiri > ls.mikiri) this.addStyle(20);
+    ls.deflects = st.deflects;
+    ls.deathblows = st.deathblows;
+    ls.mikiri = st.mikiri;
+    // every kill keeps the flow going: a little health and rage back
+    if (st.kills > this.lastKills) {
+      const n = st.kills - this.lastKills;
+      this.lastKills = st.kills;
+      p.hp = Math.min(p.hpMax, p.hp + 6 * n);
+      this.addRage(10 * n);
+    }
+    r.cutT = Math.max(0, r.cutT - real);
+    r.chainT = Math.max(0, r.chainT - real);
+    if (r.chainT <= 0) r.chain = 0;
+    r.invert *= Math.exp(-6 * real);
+    const alive = this.enemies.some((e) => this.alive(e));
+    if (r.on) {
+      // aiming costs almost nothing, so you can chain as many precision cuts as you like
+      r.meter -= (r.aiming ? 0.5 : 3.2) * (1 - 0.4 * this.flowLevel()) * real; // drains in real time (~14 s of blade mode from a 55 % gauge)
+      if (r.endT > 0) {
+        r.endT -= real;
+        if (r.endT <= 0) {
+          r.endT = 0;
+          this.setRage(false); // final slash landed → slow-mo ends, the pieces blast outward at normal speed
+          return;
+        }
+      }
+      if (r.meter <= 0) {
+        r.meter = 0;
+        this.setRage(false);
+      } else if (p.state === 'dead' || (!alive && !r.keepAlive)) {
+        this.setRage(false);
+      }
+    } else {
+      r.meter = Math.min(100, r.meter + 2.4 * real);
+    }
+    if (!r.on) return;
+
+    p.glow = Math.max(p.glow, 0.1);
+    if (Math.random() < 0.18) {
+      this.glowBurst(
+        this.tmpV2.set(p.pos.x + rand(-0.7, 0.7), rand(0.1, 1.9), p.pos.z + rand(-0.7, 0.7)),
+        1,
+        0.07,
+        new THREE.Color(2.6, 0.25, 0.15),
+        0.5,
+      );
+    }
+    // right-click pressed while the stance wasn't ready: keep trying for a short moment
+    r.finBuf = Math.max(0, r.finBuf - real);
+    if (r.finBuf > 0 && !(r.aiming && r.finisher)) this.tryStartFinisher();
+    r.steerT = Math.max(0, r.steerT - real);
+    // left-click taps: each one is a slice. Buffered, so mashing the button never drops a cut.
+    r.tapBuf = Math.max(0, r.tapBuf - real);
+    if (r.tapBuf > 0 && !r.aiming && this.canAimNow()) {
+      if (this.doTapCut()) r.tapBuf = 0;
+      else {
+        r.tapBuf = 0;
+        this.attackBuf = 0.3; // nobody in range: swing normally instead
+      }
+    }
+    if (r.aiming) {
+      r.aimT += real;
+      r.aimIdle += real;
+      if (p.state !== 'cutaim') {
+        this.cancelAim();
+        return;
+      }
+      // Tab / X while lining up → hop to another enemy
+      const lt = this.lockTarget;
+      if (lt && lt !== r.target && this.alive(lt) && lt.pos.distanceTo(p.pos) < 14) {
+        r.target = lt;
+        r.weak = 0.35 + Math.random() * 2.45;
+      }
+      if (r.finisher) {
+        // AUTO-ALIGN: the blade line is drawn onto the yellow line, then the cut fires by itself
+        const diff = this.wrapHalf(r.weak - r.angle);
+        const step = Math.min(1, 11 * real);
+        r.angle += diff * step + Math.sign(diff) * Math.min(Math.abs(diff), 1.2 * real);
+        r.angle = ((r.angle % Math.PI) + Math.PI) % Math.PI;
+        const left = Math.abs(this.wrapHalf(r.weak - r.angle));
+        if (!r.target || !this.alive(r.target)) this.cancelAim();
+        else if ((left < 0.03 && r.aimT > 0.26) || r.aimT > 0.75) {
+          r.angle = r.weak; // lock exactly on the line
+          this.executeCut();
+        }
+      } else {
+        r.angle = ((r.angle % Math.PI) + Math.PI) % Math.PI;
+        if (!r.target || !this.alive(r.target)) this.cancelAim();
+        else if (r.aimT > 0.2) this.executeCut();
+      }
+    }
+  }
+
+  /** Cut plane that contains the camera's view axis and the on-screen line direction → exactly the line the player sees. */
+  private makePlane(p0: THREE.Vector3, ang: number): CutPlane {
+    this.camera.updateMatrixWorld(true);
+    const r = new THREE.Vector3();
+    const u = new THREE.Vector3();
+    const b = new THREE.Vector3();
+    this.camera.matrixWorld.extractBasis(r, u, b);
+    const lineDir = r.multiplyScalar(Math.cos(ang)).addScaledVector(u, Math.sin(ang)).normalize();
+    const normal = new THREE.Vector3().crossVectors(b.negate(), lineDir).normalize();
+    return { p0: p0.clone(), normal, lineDir, perfect: false };
+  }
+
+  /** World-space direction of a slash line, given its orientation as seen from behind the player. */
+  private slashLine(ang: number): THREE.Vector3 {
+    const yaw = this.player.aim;
+    const right = new THREE.Vector3(-Math.cos(yaw), 0, Math.sin(yaw));
+    return right.multiplyScalar(Math.cos(ang)).add(new THREE.Vector3(0, Math.sin(ang), 0)).normalize();
+  }
+
+  private executeCut() {
+    const r = this.rage;
+    const p = this.player;
+    const tgt = r.target;
+    r.aiming = false;
+    if (!tgt || !this.alive(tgt) || p.state !== 'cutaim') {
+      this.cancelAim();
+      return;
+    }
+    // a normal aimed cut is a spammable wound; only the final slash (right-click) has a yellow line, a bonus and a kill
+    const fin = r.finisher;
+    r.finisher = false;
+    r.finDown = false;
+    const perfect = fin && Math.abs(this.wrapHalf(r.weak - r.angle)) < 0.22;
+    r.queue.length = 0;
+    const pl0 = this.makePlane(tgt.pos, r.angle);
+    r.seq = [{ angle: r.angle, perfect, final: fin, normal: pl0.normal, lineDir: pl0.lineDir }];
+    r.seqIdx = 0;
+    r.seqTarget = tgt;
+    r.target = null;
+    r.cutCenter.copy(tgt.pos);
+    this.beginCut();
+  }
+
+  /** One dash-through along one line of the sequence. */
+  private beginCut() {
+    const r = this.rage;
+    const p = this.player;
+    const s = r.seq[r.seqIdx];
+    const tgt = r.seqTarget;
+    const live = !!tgt && this.alive(tgt);
+    if (live) r.cutCenter.copy(tgt!.pos);
+    const scale = live ? tgt!.scale : 1;
+    const center = r.cutCenter.clone();
+    if (live) center.setY(1.2 * scale); // a pile of pieces keeps its real height
+    r.plane = { p0: center, normal: s.normal.clone(), lineDir: s.lineDir.clone(), perfect: s.perfect, final: s.final };
+    const dir = new THREE.Vector3(r.cutCenter.x - p.pos.x, 0, r.cutCenter.z - p.pos.z);
+    const d = dir.length();
+    if (d > 0.01) dir.divideScalar(d);
+    else dir.copy(fwd(p.yaw));
+    // STAY PUT: the slice is cast from where the player stands — no dash through the enemy, the feet never move
+    r.dashFrom.copy(p.pos);
+    r.dashTo.copy(p.pos);
+    p.yaw = Math.atan2(dir.x, dir.z);
+    p.aim = p.yaw;
+    p.anim = buildCut(s.angle);
+    p.state = 'cut';
+    p.t = 0;
+    p.hitIdx = 0;
+    p.vel.set(0, 0, 0);
+    r.cutT = 0.7;
+    r.cutDone = false;
+    this.sfx.whoosh();
+  }
+
+  /** The instant the blade passes through: every enemy the plane touches is cut. */
+  private performCut() {
+    const r = this.rage;
+    const pl = r.plane;
+    const p = this.player;
+    if (!pl) return;
+    const fin = !!pl.final;
+    // the slash leaves the blade right in front of the player…
+    const near = p.pos.clone().addScaledVector(fwd(p.yaw), 1.3).setY(1.25);
+    this.streaks.spawn(near, pl.lineDir, fin ? 4 : 3, fin ? 0.2 : 0.12, new THREE.Color(4, 3.2, 3), fin ? 0.5 : 0.3);
+    // …and tears through the target wherever it is standing
+    this.streaks.spawn(pl.p0, pl.lineDir, fin ? 7 : 5, fin ? 0.34 : 0.2, new THREE.Color(5, 0.5, 0.4), fin ? 1.0 : 0.6);
+    this.streaks.spawn(pl.p0, pl.lineDir, fin ? 4.5 : 3.5, 0.09, new THREE.Color(7, 7, 7), fin ? 0.7 : 0.45);
+    this.sfx.slice(pl.perfect);
+    // spam cuts are light and snappy; the final slash gets the full freeze, shake and flash
+    this.hitStop = fin ? 0.14 : 0.04;
+    this.shake(fin ? (pl.perfect ? 1 : 0.8) : 0.3);
+    this.whiteFlash = fin ? 0.5 : 0.15;
+    this.aberr = fin ? 0.04 : 0.015;
+    this.fovPunch = fin ? 9 : 3.5;
+    r.invert = fin ? (pl.perfect ? 1 : 0.55) : 0;
+    this.kickV.copy(fwd(p.yaw)).multiplyScalar(fin ? 0.3 : 0.12);
+    p.glow = 0.3;
+    // ONE victim per slice. The plane passes through everything on the camera's line of sight, so we never ask "who does it touch" —
+    // only the body being carved is cut; enemies standing behind or beside it are left alone.
+    const victimId = r.seqTarget ? r.seqTarget.id : r.seqOwner;
+    // pieces of that same victim are cut again first (so the halves this very slice creates aren't cut twice).
+    // In slow motion they barely part, so the pile stays together.
+    if (victimId !== null) {
+      const recut = this.sliceWorld.cutPieces(pl.p0, pl.normal, pl.lineDir, 3.6, 4, SLOW_CUT, victimId);
+      if (recut > 0) {
+        r.keepAlive = true;
+        r.focusOwner = victimId;
+        this.bloodBurst(pl.p0, pl.normal, 10 + recut * 4, 3.5);
+      }
+    }
+    const tgt = r.seqTarget;
+    if (tgt && this.alive(tgt)) this.cutEnemy(tgt, pl.perfect, pl, fin);
+    // the FINAL slash closes blade mode: a short beat to see it land, then slow-mo ends and everything cut flies apart
+    if (fin) r.endT = 0.55;
+    this.cutProjectiles(pl.p0, 9, pl);
+    // chain: every cut within 4 s of the last one extends the chain and refunds a little rage, so you can keep going
+    r.chain = r.chainT > 0 ? r.chain + 1 : 1;
+    r.chainT = 4;
+    this.addRage(Math.min(14, 3 + r.chain * 2));
+    this.addStyle(pl.perfect ? 30 : fin ? 20 : 9);
+    this.onEvent({ type: pl.perfect ? 'perfect' : 'cut', text: '斬', n: r.chain });
+    r.target = null;
+  }
+
+  /**
+   * Spam cut (final = false): hurts and staggers but can NEVER kill — the enemy is left hanging on a sliver of health.
+   * Final slash (final = true, right-click): ends a normal enemy outright; a perfect one (on the yellow line) also heals you,
+   * refills rage and costs a boss one of its lives.
+   */
+  private cutEnemy(e: Enemy, perfect: boolean, pl: CutPlane, final: boolean) {
+    const p = this.player;
+    const chest = e.pos.clone().setY(1.2 * e.scale);
+    let kill = false;
+    if (final) {
+      if (perfect) {
+        this.addRage(26);
+        p.hp = Math.min(p.hpMax, p.hp + p.hpMax * 0.2);
+        if (e.pips > 1) this.bossPipLoss(e);
+        else kill = true;
+      } else if (e.boss) {
+        // a boss needs the yellow line to be cut down in one go — otherwise it just takes a heavy blow
+        e.hp -= e.hpMax * 0.4;
+        if (e.hp <= 0) {
+          e.hp = 0;
+          if (e.pips > 1) this.bossPipLoss(e);
+          else kill = true;
+        }
+      } else kill = true;
+    } else if (!e.boss) {
+      // SPAM SLICE: the plane cuts the victim's actual body mesh. The enemy is replaced by the two halves (no copy is left standing),
+      // which drift apart slowly while blade mode lasts and are carved again by every following tap.
+      e.hp = 0;
+      this.sliceKill(e, pl, 5, SLOW_CUT);
+      this.sfx.slice(false);
+      return;
+    } else {
+      // a boss can't be killed by spam: it takes a wound and loses a limb (the limb mesh itself is sliced along the plane)
+      e.hp = Math.max(e.hpMax * 0.05, e.hp - e.hpMax * 0.09);
+      e.imp.addScaledVector(pl.lineDir, 2.5);
+      e.impDmg += e.hpMax * 0.02;
+      e.impHits++;
+      this.severLimb(e, pl);
+    }
+    if (kill) {
+      this.sliceKill(e, pl, 6, this.rage.on ? SLOW_CUT : 1);
+      return;
+    }
+    // wound: a sheet of blood along the cut + stagger
+    e.flash = 1;
+    e.react = 1;
+    e.reactPose = P.hurt;
+    this.bloodBurst(chest, pl.normal, 40, 7);
+    this.bloodBurst(chest, pl.normal.clone().negate(), 40, 7);
+    this.sparkBurst(chest, pl.lineDir, 24, 8, 1, new THREE.Color(3, 0.6, 0.4), 0.5);
+    if (e.state !== 'broken' && e.state !== 'recoil') {
+      this.interruptEnemy(e);
+      e.state = 'flinch';
+      e.stateT = 0;
+      e.stateDur = 0.9;
+    }
+    // spam cuts barely build posture, so they can't chain into a posture-break finish by themselves
+    this.addEnemyPosture(e, final ? 55 : 8);
+  }
+
+  /**
+   * A spam slice (left-click in blade mode) cuts clean through the limb nearest to the blade's plane: it becomes a free rigid body
+   * that tumbles away, blood sprays from the stump, and the enemy fights on without it. Max 3 limbs per enemy (never both legs).
+   * The head and torso stay for the final slash.
+   */
+  private severLimb(e: Enemy, pl: CutPlane): boolean {
+    if (e.sevN >= 3 || !this.alive(e)) return false;
+    const rig = e.rig;
+    rig.root.updateMatrixWorld(true);
+    const names: LimbName[] = ['rArm', 'lArm', 'rLeg', 'lLeg'];
+    const box = new THREE.Box3();
+    const c = new THREE.Vector3();
+    let best: LimbName | null = null;
+    let bd = 1.3 * e.scale;
+    let bs = 1;
+    for (const nm of names) {
+      if (rig.severed.has(nm)) continue;
+      if (nm === 'rLeg' && rig.severed.has('lLeg')) continue;
+      if (nm === 'lLeg' && rig.severed.has('rLeg')) continue;
+      box.setFromObject(rig.limbs[nm]);
+      box.getCenter(c);
+      const sd = pl.normal.dot(c.sub(pl.p0));
+      if (Math.abs(sd) < bd) {
+        bd = Math.abs(sd);
+        best = nm;
+        bs = sd >= 0 ? 1 : -1;
+      }
+    }
+    if (!best) return false;
+    const limb = rig.limbs[best];
+    const joint = limb.getWorldPosition(new THREE.Vector3());
+    const base = new THREE.Vector3(e.vel.x, 0, e.vel.z);
+    // build the debris BEFORE hiding the limb (hidden meshes are skipped). The limb's own mesh is sliced along the blade's plane,
+    // so the severed piece has a real cut face; if the plane misses it, the whole limb simply drops.
+    const lc = box.setFromObject(limb).getCenter(new THREE.Vector3());
+    lc.addScaledVector(pl.normal, -pl.normal.dot(lc.clone().sub(pl.p0)));
+    const cutLimb = this.sliceWorld.cutObject(limb, lc, pl.normal, pl.lineDir, { J: 5, vel: base, gentle: SLOW_CUT, owner: e.id });
+    if (!cutLimb) this.sliceWorld.detach(limb, joint, pl.p0, pl.normal, pl.lineDir, bs, { J: 5, vel: base, gentle: SLOW_CUT, owner: e.id });
+    this.rage.keepAlive = true;
+    this.rage.focusOwner = e.id;
+    if (best === 'rArm') {
+      // the sword goes with the arm
+      this.sliceWorld.detach(rig.weaponObj, null, pl.p0, pl.normal, pl.lineDir, -bs, { J: 4, vel: base, gentle: SLOW_CUT, owner: e.id });
+      rig.dropWeapon();
+      e.disarmed = true;
+    }
+    if (best === 'lArm' && e.kind === 'archer') e.disarmed = true; // can't draw the bow any more
+    rig.sever(best);
+    e.stumps.push(rig.stumps[best]);
+    e.sevN++;
+    e.bleedT = 3.2;
+    if (e.state === 'attack') this.interruptEnemy(e);
+    this.bloodBurst(joint, pl.normal.clone().multiplyScalar(bs), 46, 8);
+    this.bloodBurst(joint, new THREE.Vector3(0, 1, 0), 22, 6);
+    this.sparkBurst(joint, pl.lineDir, 18, 7, 1, new THREE.Color(3, 0.7, 0.45), 0.4);
+    this.sfx.hit(true);
+    this.shake(0.22);
+    return true;
+  }
+
+  private bossPipLoss(e: Enemy) {
+    e.pips--;
+    e.hp = e.hpMax;
+    e.posture = 0;
+    e.lethal = false;
+    this.interruptEnemy(e);
+    e.state = 'recoil';
+    e.stateT = 0;
+    e.stateDur = 1.6;
+    e.phase2 = true;
+    e.speedMul = 1.38;
+    e.dmgMul = 0.75;
+    e.rig.bladeMat.emissive.setHex(0xff2010);
+    e.glow = 0.4;
+    this.onEvent({ type: 'phase2', text: 'Jenderal mengamuk!' });
+  }
+
+  /** Real mesh split: the fighter is replaced by two clipped clones that fly apart. */
+  private sliceKill(e: Enemy, pl: CutPlane, power = 6, gentle = 1) {
+    const chest = this.tmpV.copy(e.pos).setY(1.2 * e.scale);
+    const off = pl.normal.dot(this.tmpV2.copy(chest).sub(pl.p0));
+    const c = chest.clone().addScaledVector(pl.normal, -off);
+    const J = power;
+    // the victim's own body is cut along the plane — its mesh becomes the two halves, nothing is copied or duplicated
+    const base = new THREE.Vector3(e.vel.x, 0, e.vel.z).multiplyScalar(gentle);
+    const pieces = this.sliceWorld.cutObject(e.rig.root, c, pl.normal, pl.lineDir, { J, vel: base, gentle, owner: e.id });
+    if (gentle < 1) {
+      // blade mode stays on so the pieces can keep being carved in slow motion — and THIS body stays the focus
+      this.rage.keepAlive = true;
+      this.rage.focusOwner = e.id;
+    }
+    if (pieces) {
+      e.rig.root.visible = false;
+      e.trail.mesh.visible = false;
+      e.trailOn = false;
+      e.state = 'dying';
+      e.stateT = 0;
+      e.removeAt = this.time + 0.2;
+    } else {
+      // plane missed the body — fall back to a normal death
+      e.state = 'dying';
+      e.stateT = 0;
+      e.removeAt = this.time + (e.boss ? 3.5 : 2.2);
+      e.trailOn = false;
+    }
+    e.hp = 0;
+    e.lethal = false;
+    this.stats.kills++;
+    if (pieces && e.impHits >= 3 && gentle >= 1 && !this.rage.on) this.sliceWorld.shatter(pieces, 3 + Math.min(3, e.impHits));
+    this.maybeKillCam(e);
+    if (gentle >= 1) this.sliceWorld.cutPieces(c, pl.normal, pl.lineDir, 2.5, 3, 1, e.id);
+    const nn = pl.normal.clone().negate();
+    const ln = pl.lineDir.clone().negate();
+    // in slow motion the spray is lighter, so the cut face stays readable instead of vanishing into a red cloud
+    const bk = gentle < 1 ? 0.45 : 1;
+    this.bloodBurst(c, pl.normal, Math.round(90 * bk), 9 * (0.5 + 0.5 * bk));
+    this.bloodBurst(c, nn, Math.round(90 * bk), 9 * (0.5 + 0.5 * bk));
+    this.bloodBurst(c, pl.lineDir, Math.round(30 * bk), 8);
+    this.bloodBurst(c, ln, Math.round(30 * bk), 8);
+    this.sparkBurst(c, pl.lineDir, 40, 10, 1.2, new THREE.Color(3.5, 0.6, 0.4), 0.8);
+    this.sparkBurst(c, ln, 40, 10, 1.2, new THREE.Color(3.5, 0.6, 0.4), 0.8);
+    this.glowBurst(c, 24, 0.28, new THREE.Color(3, 0.3, 0.2), 6);
+    this.shocks.spawn(c, 0xff3a2a, 6, 0.7);
+    this.shocks.spawn(c, 0xffffff, 3, 0.4);
+    this.flashAt(c, 0xff5a40, 50);
+  }
+
+  /** Normal slash that lands the final blow while in blade mode → the enemy is cut apart along that slash. */
+  private rageKill(e: Enemy, ang: number, power = 6) {
+    const pl = this.slashPlane(e.pos.clone().setY(1.2 * e.scale), ang + rand(-0.1, 0.1));
+    e.hp = 0;
+    if (e.pips > 1) this.bossPipLoss(e);
+    else this.sliceKill(e, pl, power);
+    this.sfx.slice(false);
+    this.streaks.spawn(pl.p0, pl.lineDir, 4.5, 0.2, new THREE.Color(5, 0.6, 0.4), 0.7);
+    this.addRage(6);
+  }
+
+  /**
+   * Physical plane of a normal slash: it contains the blade's travel line AND the player's forward axis,
+   * so a diagonal swing cuts the body on that exact diagonal, a horizontal swing cuts at the waist, etc.
+   */
+  private slashPlane(p0: THREE.Vector3, ang: number): CutPlane {
+    const ld = this.slashLine(ang);
+    const f = fwd(this.player.aim);
+    const normal = new THREE.Vector3().crossVectors(f, ld);
+    if (normal.lengthSq() < 1e-4) normal.set(0, 1, 0);
+    normal.normalize();
+    return { p0: p0.clone(), normal, lineDir: ld, perfect: false };
+  }
+
+  /** Every swing leaves a razor streak along its true cut line + a directional camera push. */
+  private onPlayerStrike(h: HitDef) {
+    const p = this.player;
+    if (h.kind === 'kick') return;
+    const ld = this.slashLine(h.ang ?? 0.6);
+    const c = p.pos.clone().addScaledVector(fwd(p.aim), 1.45).setY(1.25);
+    this.streaks.spawn(
+      c,
+      ld,
+      h.heavy ? 3.4 : 2.7,
+      h.heavy ? 0.17 : 0.11,
+      this.rage.on ? new THREE.Color(4, 0.5, 0.4) : new THREE.Color(2.2, 2.6, 3.2),
+      h.heavy ? 0.34 : 0.26,
+    );
+    this.kickV.addScaledVector(fwd(p.aim), h.heavy ? 0.28 : 0.14);
+    // any swing also cuts arrows and bullets out of the air
+    this.cutProjectiles(p.pos.clone().addScaledVector(fwd(p.aim), 1.5).setY(1.2), 2.8);
+    p.glow = Math.max(p.glow, 0.25);
+    if (this.rage.on) {
+      // the blade also slices any debris still tumbling through the air along its path
+      const pl = this.slashPlane(c, h.ang ?? 0.6);
+      this.sliceWorld.cutPieces(c, pl.normal, ld, 2.4, 3);
+    }
+  }
+
+  private onPlayerHitFx(e: Enemy, h: HitDef, impact: THREE.Vector3) {
+    void e;
+    const ld = this.slashLine(h.ang ?? 0.6);
+    this.bloodBurst(impact, ld, h.heavy ? 22 : 12, h.heavy ? 9 : 6);
+    this.bloodBurst(impact, ld.clone().negate(), 8, 5);
+    this.streaks.spawn(
+      impact,
+      ld,
+      h.heavy ? 3.0 : 2.3,
+      0.15,
+      this.rage.on ? new THREE.Color(5, 0.6, 0.4) : new THREE.Color(3, 2.4, 1.6),
+      0.3,
+    );
+    if (!this.rage.on) this.addRage(h.heavy ? 6 : 3.5);
+    this.addStyle(h.heavy ? 8 : 4.5);
+    if (h.heavy) this.slowmo(0.07, 0.4);
+  }
+
+  private rageSnapshot(): Snapshot['rage'] {
+    const r = this.rage;
+    let aim: Snapshot['rage']['aim'] = null;
+    const t = r.target;
+    if (r.aiming && t && this.alive(t)) {
+      const c = t.pos.clone().setY(1.2 * t.scale);
+      const s0 = this.project(c);
+      const rr = new THREE.Vector3();
+      const uu = new THREE.Vector3();
+      const bb = new THREE.Vector3();
+      this.camera.matrixWorld.extractBasis(rr, uu, bb);
+      const s1 = this.project(c.clone().addScaledVector(rr, 0.9 * t.scale));
+      const half = Math.hypot(s1.x - s0.x, s1.y - s0.y);
+      aim = {
+        x: s0.x,
+        y: s0.y,
+        angle: r.angle,
+        weak: r.weak,
+        finisher: r.finisher,
+        // only the final slash has a yellow line, so only it can ever read as "perfect"
+        perfect: r.finisher && Math.abs(this.wrapHalf(r.weak - r.angle)) < 0.22,
+        band: Math.max(60, half * 2),
+        locked: [],
+      };
+    }
+    // guide line: shows where the next tap will cut, drawn over the body you are carving
+    let guide: Snapshot['rage']['guide'] = null;
+    if (r.on && !r.aiming) {
+      let c: THREE.Vector3 | null = null;
+      if (r.focusOwner !== null) c = this.sliceWorld.clusterNear(this.player.pos, 14, r.focusOwner);
+      if (!c) {
+        let t2 = this.lockOn ? this.lockTarget : null;
+        if (!t2 || !this.alive(t2) || t2.pos.distanceTo(this.player.pos) > 14) t2 = this.nearestEnemy();
+        if (t2 && t2.pos.distanceTo(this.player.pos) <= 14) c = t2.pos.clone().setY(1.2 * t2.scale);
+      }
+      if (c) {
+        const s0 = this.project(c);
+        if (s0.on) guide = { x: s0.x, y: s0.y, angle: r.slashAng, hot: r.steerT > 0 };
+      }
+    }
+    return { on: r.on, meter: clamp(r.meter / 100, 0, 1), ready: r.meter >= 18, chain: r.chain, aim, guide };
+  }
+
+  /* ================= FREESTYLE / CINEMA / STYLE RANK ================= */
+  private startStyle() {
+    const p = this.player;
+    let idx = this.styleForce >= 0 ? this.styleForce : Math.floor(Math.random() * STYLES.length);
+    if (this.styleForce < 0 && idx === this.styleLast) idx = (idx + 1) % STYLES.length;
+    this.styleForce = -1;
+    this.styleLast = idx;
+    this.styleDef = STYLES[idx];
+    this.styleFx = 0;
+    this.styleSt = 0;
+    p.state = 'style';
+    p.t = 0;
+    p.anim = null;
+    p.vel.multiplyScalar(0.3);
+    p.aim = p.yaw;
+    this.idleT = 0;
+    this.addStyle(8);
+  }
+
+  /** Start a cinematic shot. It blends over the gameplay camera and fades back out. */
+  private startCine(kind: 'intro' | 'kill', center: THREE.Vector3, dur: number) {
+    const c = this.cine;
+    c.kind = kind;
+    c.t = 0;
+    c.dur = dur;
+    c.center.copy(center);
+    c.dir = Math.random() < 0.5 ? 1 : -1;
+    if (kind === 'intro') {
+      c.a0 = 0;
+      c.r0 = 15;
+      c.r1 = 6.4;
+      c.h0 = 10;
+      c.h1 = 2.6;
+      c.fov = 50;
+    } else {
+      c.a0 = Math.atan2(this.camPos.x - center.x, this.camPos.z - center.z);
+      c.r0 = 5.4;
+      c.r1 = 3.1;
+      c.h0 = 1.5;
+      c.h1 = 1.15;
+      c.fov = 34;
+    }
+  }
+
+  /* ================= COLOSSUS: overhead chop, embedded blade, climbing ================= */
+
+  /** HASHA hauls the head-blade overhead and drives it into the ground like an axe. */
+  private startSlam(e: Enemy) {
+    const p = this.player;
+    this.interruptEnemy(e);
+    e.state = 'attack';
+    e.anim = null;
+    e.slamT = 0.001;
+    e.stuck = 0;
+    e.t = 0;
+    e.stateT = 0;
+    e.warned = true;
+    e.perilId = ++this.perilCounter;
+
+    // Aim towards player
+    const d = new THREE.Vector3(p.pos.x - e.pos.x, 0, p.pos.z - e.pos.z);
+    const distToP = d.length();
+    if (distToP < 1e-4) d.set(0, 0, 1);
+    d.normalize();
+    e.aim = Math.atan2(d.x, d.z);
+    e.yaw = e.aim;
+
+    // If player is far away, the colossus lunges forward so the blade slams down right in front of the player!
+    if (distToP > 20) {
+      const step = Math.min(distToP - 16, 18);
+      e.pos.addScaledVector(d, step);
+      this.clampArena(e.pos, 4);
+      this.dustBurst(e.pos.clone().setY(0.1), 35, 7);
+      this.shake(0.35);
+    }
+
+    e.stuckAt.copy(p.pos).setY(0);
+    this.clampArena(e.stuckAt, 3);
+    this.sfx.perilous();
+    this.shake(0.5);
+  }
+
+  /** Per-frame drive of the chop. Returns true while it owns the enemy. */
+  private slamTick(e: Enemy, dt: number): boolean {
+    const p = this.player;
+    e.slamT += dt;
+    const t = e.slamT;
+
+    // Phase 1: Heavy wind-up rearing high overhead (t < 1.7s)
+    if (t < 1.7) {
+      const u = t / 1.7;
+      e.slamPitch = -0.6 * smooth01(u);
+      e.aim = turnToward(e.aim, Math.atan2(p.pos.x - e.pos.x, p.pos.z - e.pos.z), 0.9 * dt);
+      e.yaw = e.aim;
+      if (Math.random() < 0.15) this.shake(0.12);
+    }
+    // Phase 2: Downswing accelerating chop until ground impact
+    else if (e.stuck <= 0) {
+      const u = clamp((t - 1.7) / 0.42, 0, 1);
+      e.slamPitch = -0.6 + 2.65 * (u * u * u);
+
+      // Check if blade tip has hit the ground or downswing completed
+      e.rig.root.updateMatrixWorld(true);
+      const tipPos = e.rig.swordTip.getWorldPosition(this.tmpV);
+
+      if (u >= 0.95 || tipPos.y <= 0.8) {
+        // EXACT GROUND IMPACT
+        e.stuck = 9.0; // 9 seconds stuck in the ground for climbing & attacking!
+        e.slamPitch = 2.05; // Planted squarely into the earth
+        e.rig.root.updateMatrixWorld(true);
+        const tip = e.rig.swordTip.getWorldPosition(new THREE.Vector3());
+        const mount = e.rig.swordBase.getWorldPosition(new THREE.Vector3());
+        e.stuckAt.copy(tip).setY(0);
+
+        // Thunderous visual and audio ground effects
+        this.shocks.spawn(tip.clone().setY(0.1), 0x38bdf8, 45, 1.6);
+        this.shocks.spawn(tip.clone().setY(0.1), 0xffffff, 26, 0.9);
+        this.shocks.spawn(mount.clone().setY(0.1), 0x06b6d4, 32, 1.2);
+        this.dustBurst(tip.clone().setY(0.2), 95, 18);
+        this.dustBurst(mount.clone().setY(0.2), 55, 12);
+        this.sfx.kick();
+        this.sfx.postureBreak();
+        this.shake(2.8);
+        this.hitstop(0.18);
+        this.kickV.y -= 0.8;
+
+        // ACCURATE DAMAGE CALCULATION: Tested along the entire blade contact line
+        const seg = new THREE.Vector3().subVectors(tip, mount);
+        const pToM = new THREE.Vector3().subVectors(p.pos, mount);
+        const tSeg = clamp(pToM.dot(seg) / Math.max(1e-4, seg.lengthSq()), 0, 1);
+        const closest = new THREE.Vector3().copy(mount).addScaledVector(seg, tSeg);
+        const distToBlade = p.pos.distanceTo(closest);
+        const distToTip = p.pos.distanceTo(tip);
+
+        const inHitZone = distToBlade < 7.2 || distToTip < 9.5;
+        const isGrounded = p.pos.y <= 0.8;
+
+        if (inHitZone && p.inv <= 0 && p.state !== 'dead') {
+          if (isGrounded) {
+            // Caught on the ground: hit by the shockwave & cleaver
+            const away = new THREE.Vector3(p.pos.x - tip.x, 0, p.pos.z - tip.z).normalize();
+            if (away.lengthSq() < 1e-4) away.set(0, 0, 1);
+            p.hp -= 42;
+            p.vel.addScaledVector(away, 20);
+            p.vy = 7;
+            p.state = 'jump';
+            p.t = 0;
+            p.jumps = 1;
+            this.hurtFx = 1;
+            this.sfx.hurt();
+            this.onEvent({ type: 'playerBreak', text: 'Terhempas Kapak Bilah!' });
+            if (p.hp <= 0) {
+              p.hp = 0;
+              this.killPlayer();
+            }
+          } else {
+            // Jumped over the ground slam!
+            this.sfx.deflect();
+            this.addStyle(20);
+            this.onEvent({ type: 'stomp', text: '踏 · Melompati Hantaman!' });
+          }
+        }
+      }
+    }
+    // Phase 4: Embedded in the ground (e.stuck > 0)
+    else if (e.stuck > 0) {
+      e.stuck -= dt;
+
+      // DYNAMIC GROUND-LOCKING: Keeps the blade tip flush with the arena floor!
+      e.rig.root.updateMatrixWorld(true);
+      const tip = e.rig.swordTip.getWorldPosition(this.tmpV);
+      const dy = 0.05 - tip.y;
+      e.slamPitch += clamp(dy * 0.12, -0.2, 0.2);
+      e.slamPitch += Math.sin(t * 8) * 0.008; // Straining heave
+
+      if (e.stuck <= 0) {
+        // Rip blade free
+        const tipPos = e.rig.swordTip.getWorldPosition(new THREE.Vector3());
+        this.dustBurst(tipPos.setY(0.2), 55, 9);
+        this.shake(1.0);
+        this.sfx.unsheathe();
+        if (p.climbOn === e) this.dismountClimb(true);
+      }
+    }
+    // Phase 5: Recovery
+    else {
+      e.slamPitch += (0 - e.slamPitch) * (1 - Math.exp(-3.5 * dt));
+      if (t > 2.2 + 9.0 + 1.2) {
+        e.slamT = 0;
+        e.state = 'idle';
+        e.stateT = 0;
+        e.warned = false;
+        e.attackTimer = rand(1.8, 3.0);
+        return false;
+      }
+    }
+    return true;
+  }
+
+  /**
+   * The climbing route up a colossus: the buried blade tip on the ground → up the blade → the head mount → the core.
+   * Returns the world point and the surface "up" at parameter u (0…1).
+   */
+  private climbPoint(e: Enemy, u: number, out: THREE.Vector3): void {
+    e.rig.root.updateMatrixWorld(true);
+    const tip = e.rig.swordTip.getWorldPosition(this.tmpV);
+    const mount = e.rig.swordBase.getWorldPosition(this.tmpV2);
+    const core = e.rig.chestObj.getWorldPosition(new THREE.Vector3());
+    if (u < 0.72) {
+      // along the blade, from the ground-stuck tip up to the mount
+      out.copy(tip).lerp(mount, u / 0.72);
+      // Lift player comfortably above the top spine of the giant blade
+      out.y += 1.25;
+    } else {
+      // over the mount and onto the core
+      out.copy(mount).lerp(core, (u - 0.72) / 0.28);
+      out.y += 1.1;
+    }
+  }
+
+  private tryMountClimb(force = false): boolean {
+    const p = this.player;
+    for (const e of this.enemies) {
+      if (e.kind !== 'bladehead' || e.stuck <= 0 || !this.alive(e)) continue;
+      e.rig.root.updateMatrixWorld(true);
+      const tip = e.rig.swordTip.getWorldPosition(new THREE.Vector3());
+      const mount = e.rig.swordBase.getWorldPosition(new THREE.Vector3());
+
+      const seg = new THREE.Vector3().subVectors(mount, tip);
+      const segLenSq = seg.lengthSq();
+      if (segLenSq < 1e-4) continue;
+      const pToTip = new THREE.Vector3().subVectors(p.pos, tip);
+      const tSeg = clamp(pToTip.dot(seg) / segLenSq, 0, 1);
+      const closest = new THREE.Vector3().copy(tip).addScaledVector(seg, tSeg);
+      const dist = p.pos.distanceTo(closest);
+
+      // Generous auto-mount range along the entire blade
+      const mountThreshold = force ? 10.0 : (p.state === 'jump' ? 8.0 : 5.2);
+      if (dist > mountThreshold) continue;
+
+      p.climbOn = e;
+      p.climbT = clamp(tSeg * 0.70, 0.04, 0.70);
+      p.climbUp = 0;
+      p.state = 'climb';
+      p.t = 0;
+      p.anim = null;
+      p.vel.set(0, 0, 0);
+      p.vy = 0;
+      this.sfx.dodge();
+      this.onEvent({ type: 'mount', text: '登 · Panjat Bos' });
+      return true;
+    }
+    return false;
+  }
+
+  private dismountClimb(thrown: boolean) {
+    const p = this.player;
+    p.climbOn = null;
+    p.state = 'jump';
+    p.t = 0;
+    p.jumps = 1;
+    p.diveAvail = true;
+    p.dashAvail = true;
+    p.flipStyle = '';
+    if (thrown) {
+      p.vy = 8;
+      p.vel.set(rand(-7, 7), 0, rand(-7, 7));
+      this.shake(0.6);
+      this.sfx.hurt();
+    } else {
+      p.vy = 6;
+      const forward = fwd(p.yaw).multiplyScalar(5);
+      p.vel.copy(forward);
+      this.sfx.dodge();
+    }
+  }
+
+  /** Final blow of a stage → slow-motion orbit around the fallen enemy. */
+  private maybeKillCam(e: Enemy) {
+    if (this.rage.on) return; // blade mode already is the slow-motion show — no second camera on top of it
+    if (this.enemies.some((o) => o !== e && this.alive(o))) return;
+    if (this.cine.kind === 'kill' && this.cine.t < this.cine.dur) return;
+    this.startCine('kill', e.pos.clone().setY(1.1 * e.scale), 2.1);
+    this.slowmo(1.3, 0.22);
+  }
+
+  private addStyle(n: number) {
+    this.styleScore = Math.min(100, this.styleScore + n);
+    this.styleHold = 3.2;
+  }
+
+  private styleRank() {
+    const s = this.styleScore;
+    const ranks: [number, string][] = [[88, 'SSS'], [74, 'SS'], [60, 'S'], [44, 'A'], [28, 'B'], [14, 'C'], [3, 'D']];
+    for (const [t, r] of ranks) if (s >= t) return r;
+    return '';
+  }
+
+  /* ================= RANGED ENEMIES & PROJECTILES ================= */
+  private flowLevel() {
+    return clamp((this.styleScore - 30) / 60, 0, 1);
+  }
+
+  setShakeScale(v: number) {
+    this.shakeScale = v;
+  }
+
+  private enemyFire(e: Enemy, idx: number) {
+    const p = this.player;
+    e.rig.root.updateMatrixWorld(true);
+    const mp = e.rig.muzzle.getWorldPosition(new THREE.Vector3());
+    const arrow = e.kind === 'archer';
+    const spd = arrow ? 27 : 58;
+    const target = p.pos.clone();
+    target.y += 1.1;
+    const t = mp.distanceTo(target) / spd;
+    // lead the target only partly: strafing gets punished, a well-timed dodge still wins
+    target.x += p.vel.x * t * 0.5;
+    target.z += p.vel.z * t * 0.5;
+    const dir = target.sub(mp).normalize();
+    if (arrow && e.anim?.name === 'volley') {
+      const a = (idx - 1) * 0.1;
+      const c = Math.cos(a);
+      const s = Math.sin(a);
+      const x = dir.x * c - dir.z * s;
+      dir.z = dir.x * s + dir.z * c;
+      dir.x = x;
+    } else {
+      dir.x += rand(-0.012, 0.012);
+      dir.y += rand(-0.01, 0.01);
+      dir.normalize();
+    }
+    this.proj.spawn(arrow ? 'arrow' : 'bullet', mp, dir.clone().multiplyScalar(spd), e.id, arrow ? 15 : 24, arrow ? 16 : 26);
+    if (arrow) {
+      this.sfx.bowRelease();
+      e.react = 0.25;
+    } else {
+      this.sfx.shot();
+      this.sparkBurst(mp, dir, 14, 9, 0.5, new THREE.Color(2.2, 1.4, 0.6), 0.25);
+      this.glowBurst(mp, 5, 0.14, new THREE.Color(1.8, 1.2, 0.6), 2);
+      this.dustBurst(mp, 6, 1.6);
+      this.flashAt(mp, 0xffc080, 14);
+      e.vel.addScaledVector(dir, -2.5);
+      e.react = 0.5;
+      // the crack shakes the frame more the closer the gunner is
+      this.shake(0.1 + 0.2 * clamp(1 - mp.distanceTo(p.pos) / 22, 0, 1));
+    }
+    e.reactPose = P.deflected;
+  }
+
+  /** Per-frame logic of a ranged attack: telegraph, bow draw animation, and releasing the shots on time. */
+  private rangedTick(e: Enemy, a: AnimDef) {
+    const f = a.fire!;
+    if (a.aimT && e.fireIdx < f.length && e.t >= a.aimT[0]) {
+      if (!e.warned) {
+        e.warned = true;
+        this.sfx.aimWarn();
+        if (e.kind === 'archer') this.sfx.bowDraw();
+      }
+      e.aiming = e.fireIdx === 0;
+    }
+    if (e.kind === 'archer') {
+      let draw = 0;
+      let nock = false;
+      if (e.fireIdx < f.length) {
+        const lead = e.fireIdx === 0 ? 0.75 : 0.28;
+        draw = clamp(1 - (f[e.fireIdx] - e.t) / lead, 0, 1);
+        draw = draw * draw * (3 - 2 * draw);
+        nock = true;
+      }
+      e.rig.setDraw(draw, nock);
+    }
+    while (e.fireIdx < f.length && e.t >= f[e.fireIdx]) {
+      this.enemyFire(e, e.fireIdx);
+      e.fireIdx++;
+    }
+  }
+
+  /** Thin red aim line from the muzzle to the player that sharpens right before the shot. */
+  private updateAimLine(e: Enemy) {
+    const m = e.aimMesh;
+    const a = e.anim;
+    if (!e.aiming || !a?.aimT || !a.fire) {
+      m.visible = false;
+      return;
+    }
+    const u = clamp((e.t - a.aimT[0]) / Math.max(0.01, a.fire[0] - a.aimT[0]), 0, 1);
+    const from = e.rig.muzzle.getWorldPosition(new THREE.Vector3());
+    const to = this.player.pos.clone();
+    to.y += 1.1;
+    const d = to.sub(from);
+    const len = Math.min(d.length(), 24);
+    d.normalize();
+    m.visible = true;
+    m.position.copy(from).addScaledVector(d, len / 2);
+    m.scale.set(1 + u * 2, 1 + u * 2, len);
+    m.quaternion.setFromUnitVectors(new THREE.Vector3(0, 0, 1), d);
+    (m.material as THREE.MeshBasicMaterial).opacity = 0.1 + 0.4 * u * u;
+  }
+
+  private updateProjectiles(dt: number) {
+    const p = this.player;
+    this.proj.update(dt);
+    const q = new THREE.Vector3();
+    for (const pr of this.proj.items.slice()) {
+      if (pr.stuck) {
+        if (pr.life <= 0) this.proj.remove(pr);
+        continue;
+      }
+      if (pr.life <= 0 || Math.hypot(pr.pos.x, pr.pos.z) > ARENA_R + 8) {
+        this.proj.remove(pr);
+        continue;
+      }
+      if (pr.pos.y <= 0.05) {
+        q.copy(pr.pos).setY(0.1);
+        if (pr.kind === 'arrow') {
+          pr.stuck = true;
+          pr.life = 5;
+          pr.vel.set(0, 0, 0);
+          this.dustBurst(q, 4, 1.5);
+          this.sfx.arrowHit();
+        } else {
+          this.dustBurst(q, 6, 2);
+          this.sparkBurst(q, new THREE.Vector3(0, 1, 0), 10, 5, 1, new THREE.Color(2.2, 1.6, 0.9), 0.3);
+          this.proj.remove(pr);
+        }
+        continue;
+      }
+      let consumed = false;
+      for (let s = 1; s <= 3 && !consumed; s++) {
+        q.copy(pr.prev).lerp(pr.pos, s / 3);
+        if (!pr.reflected) {
+          const dx = q.x - p.pos.x;
+          const dz = q.z - p.pos.z;
+          if (dx * dx + dz * dz < 0.3 && q.y > p.pos.y - 0.1 && q.y < p.pos.y + 1.95 * this.sizeK) {
+            const r = this.projectileHitPlayer(pr);
+            if (r === 'hit') consumed = true;
+            else if (r === 'deflect') break;
+          }
+        } else {
+          for (const e of this.enemies) {
+            if (!this.alive(e)) continue;
+            const dx = q.x - e.pos.x;
+            const dz = q.z - e.pos.z;
+            if (dx * dx + dz * dz < 0.45 * e.scale * e.scale + 0.15 && q.y > 0 && q.y < 2.0 * e.scale) {
+              this.reflectedHit(pr, e);
+              consumed = true;
+              break;
+            }
+          }
+        }
+      }
+      if (consumed) this.proj.remove(pr);
+    }
+  }
+
+  private projectileHitPlayer(pr: Proj): 'hit' | 'pass' | 'deflect' {
+    const p = this.player;
+    if (p.state === 'dead' || p.state === 'deathblow' || p.state === 'cut') return 'pass';
+    if (p.inv > 0 || (p.state === 'dodge' && p.t > 0.03 && p.t < 0.34)) {
+      if (!pr.whooshed) {
+        pr.whooshed = true;
+        this.sfx.whoosh();
+        this.addStyle(10);
+        this.shake(0.1);
+      }
+      return 'pass';
+    }
+    const vdir = pr.vel.clone().normalize();
+    const facing = fwd(p.yaw);
+    const frontal = facing.dot(vdir) < -0.1;
+    const contact = p.pos.clone().addScaledVector(facing, 0.75).setY(1.3);
+    if (p.state === 'idle' && this.guardHeld && frontal) {
+      if (p.guardT <= 0.3) {
+        this.deflectProjectile(pr, contact);
+        return 'deflect';
+      }
+      // plain block
+      this.sfx.block();
+      this.sparkBurst(contact, vdir.clone().multiplyScalar(-0.5).setY(0.3), 24, 6, 1, new THREE.Color(2.2, 1.1, 0.4), 0.4);
+      this.flashAt(contact, 0xffb060, 10);
+      this.hitstop(0.05);
+      this.shake(0.28);
+      this.kickV.addScaledVector(vdir, 0.15);
+      p.vel.addScaledVector(vdir, 3.5);
+      p.react = 0.7;
+      p.reactPose = p.kickSide > 0 ? P.kickA : P.kickB;
+      p.kickSide *= -1;
+      p.hp = Math.max(1, p.hp - pr.dmg * 0.1);
+      this.streak = 0;
+      this.addPlayerPosture(pr.post);
+      return 'hit';
+    }
+    // clean hit
+    const impact = p.pos.clone().setY(1.25);
+    p.hp -= pr.dmg;
+    this.streak = 0;
+    this.sfx.hurt();
+    if (pr.kind === 'arrow') this.sfx.arrowHit();
+    this.bloodBurst(impact, vdir, 24, 7);
+    this.sparkBurst(impact, vdir, 8, 5, 1, new THREE.Color(2.4, 0.8, 0.5), 0.3);
+    this.hitstop(0.09);
+    this.shake(0.6);
+    this.kickV.addScaledVector(vdir, 0.32);
+    this.hurtFx = 0.9;
+    this.aberr = 0.015;
+    p.flash = 1;
+    p.vel.addScaledVector(vdir, 4);
+    p.anim = null;
+    p.trailOn = false;
+    if (p.hp <= 0) {
+      p.hp = 0;
+      this.killPlayer();
+      return 'hit';
+    }
+    if (p.state !== 'broken') {
+      p.state = 'hurt';
+      p.t = 0;
+    }
+    this.addPlayerPosture(pr.post * 0.6);
+    return 'hit';
+  }
+
+  /** Perfect parry on a projectile: it is sent flying back at the shooter, faster and deadlier. */
+  private deflectProjectile(pr: Proj, contact: THREE.Vector3) {
+    const p = this.player;
+    this.streak++;
+    this.streakT = 0;
+    this.stats.deflects++;
+    const shooter = this.enemies.find((e) => e.id === pr.owner && this.alive(e)) ?? this.nearestEnemy();
+    const dir = shooter
+      ? new THREE.Vector3(shooter.pos.x - contact.x, 1.2 * shooter.scale - contact.y, shooter.pos.z - contact.z).normalize()
+      : pr.vel.clone().normalize().multiplyScalar(-1);
+    const spd = pr.vel.length() * 1.3;
+    pr.pos.copy(contact);
+    pr.prev.copy(contact);
+    pr.vel.copy(dir).multiplyScalar(spd);
+    pr.reflected = true;
+    pr.life = 3;
+    pr.dmg = pr.kind === 'bullet' ? 60 : 40;
+    pr.post = 45;
+    this.sfx.deflect(this.streak);
+    this.sparkBurst(contact, dir.clone().multiplyScalar(-0.3).setY(0.5), 70, 9, 1.1, new THREE.Color(3, 2.4, 1.2), 0.6);
+    this.glowBurst(contact, 10, 0.18, new THREE.Color(2, 1.6, 0.8), 3);
+    this.shocks.spawn(contact, 0xfff0c0, 2.6, 0.35);
+    this.flashAt(contact, 0xffe8b0, 26);
+    this.hitstop(0.09);
+    this.shake(0.45);
+    this.aberr = 0.012;
+    this.fovPunch = 3;
+    p.glow = 1;
+    p.react = 1;
+    p.reactPose = p.kickSide > 0 ? P.kickA : P.kickB;
+    p.kickSide *= -1;
+    this.addPlayerPosture(3);
+    this.onEvent({ type: 'deflect', n: this.streak });
+  }
+
+  /** A reflected arrow / bullet reaches an enemy. */
+  private reflectedHit(pr: Proj, e: Enemy) {
+    const dir = pr.vel.clone().normalize();
+    const impact = pr.pos.clone();
+    this.sfx.hit(true);
+    this.bloodBurst(impact, dir, 28, 8);
+    this.sparkBurst(impact, dir, 16, 7, 1, new THREE.Color(2.6, 1.8, 0.9), 0.4);
+    this.shocks.spawn(impact, 0xffd890, 3, 0.4);
+    this.flashAt(impact, 0xffd0a0, 16);
+    this.hitstop(0.1);
+    this.slowmo(0.12, 0.35);
+    this.shake(0.5);
+    e.flash = 1;
+    e.react = 1;
+    e.reactPose = P.hurt;
+    e.vel.addScaledVector(dir, 4);
+    e.hp -= pr.dmg;
+    this.addRage(8);
+    this.addStyle(18);
+    this.onEvent({ type: 'reflect', text: '返し' });
+    // a shot you batted back is a kill: the body is cut open along the line it travelled
+    if (pr.lethal && this.alive(e)) {
+      this.hitstop(0.12);
+      this.slowmo(0.3, 0.3);
+      this.shake(0.7);
+      this.whiteFlash = 0.25;
+      e.hp = 0;
+      if (e.pips > 1) this.bossPipLoss(e);
+      else {
+        const ang = Math.atan2(dir.y, Math.hypot(dir.x, dir.z)) + Math.PI / 2;
+        const pl = this.slashPlane(impact, ang);
+        this.sliceKill(e, pl, 7, 1);
+      }
+      return;
+    }
+    if (e.hp <= 0 && e.state !== 'broken') {
+      e.hp = 0;
+      this.breakEnemy(e, true);
+    } else if (this.alive(e)) {
+      if (e.state === 'attack') this.interruptEnemy(e);
+      if (e.state === 'idle' || e.state === 'attack') {
+        e.state = 'flinch';
+        e.stateT = 0;
+        e.stateDur = 0.5;
+      }
+      this.addEnemyPosture(e, pr.post);
+    }
+  }
+
+  /**
+   * A blade in the path of an arrow / bullet BATS IT BACK at whoever fired it (Katana ZERO style) — a returned shot
+   * is lethal: it kills a normal enemy outright and takes a huge bite out of a boss.
+   */
+  private cutProjectiles(center: THREE.Vector3, reach: number, plane?: CutPlane): number {
+    let n = 0;
+    const q = new THREE.Vector3();
+    for (const pr of this.proj.items.slice()) {
+      if (pr.stuck || pr.reflected) continue;
+      if (pr.pos.distanceTo(center) > reach) continue;
+      if (plane && Math.abs(plane.normal.dot(q.copy(pr.pos).sub(plane.p0))) > 0.7) continue;
+      n++;
+      // aim it back at the shooter (or at the nearest enemy if he is already gone)
+      let tgt = this.enemies.find((e) => e.id === pr.owner && this.alive(e)) ?? null;
+      if (!tgt) tgt = this.nearestEnemy();
+      const dir = tgt
+        ? new THREE.Vector3(tgt.pos.x - pr.pos.x, 1.15 * tgt.scale - pr.pos.y, tgt.pos.z - pr.pos.z).normalize()
+        : pr.vel.clone().normalize().multiplyScalar(-1);
+      pr.vel.copy(dir).multiplyScalar(Math.max(34, pr.vel.length() * 1.45));
+      pr.prev.copy(pr.pos);
+      pr.reflected = true;
+      pr.lethal = true;
+      pr.life = 3;
+      pr.dmg = 9999; // a returned shot finishes whoever it reaches
+      pr.post = 60;
+      this.sfx.arrowCut();
+      this.sparkBurst(pr.pos, dir.clone().multiplyScalar(-0.4).setY(0.4), 26, 8, 1, new THREE.Color(2.6, 2.2, 1.2), 0.4);
+      this.streaks.spawn(pr.pos, dir, 2.4, 0.1, new THREE.Color(3.4, 3, 2), 0.22);
+      this.flashAt(pr.pos, 0xffe2a0, 14);
+    }
+    if (n) {
+      this.addRage(7 * n);
+      this.addStyle(12 * n);
+      this.hitstop(0.05);
+      this.shake(0.22);
+    }
+    return n;
+  }
+
+  private removeEnemy(e: Enemy) {
+    this.scene.remove(e.aimMesh);
+    this.scene.remove(e.rig.root);
+    this.scene.remove(e.trail.mesh);
+  }
+
+  /* ================= effects ================= */
+  private shake(a: number) {
+    this.trauma = Math.min(1, this.trauma + a * this.shakeScale);
+  }
+  private hitstop(s: number) {
+    this.hitStop = Math.max(this.hitStop, this.rage.on ? s * 0.4 : s);
+  }
+  private slowmo(s: number, scale: number) {
+    this.slow = Math.max(this.slow, s);
+    this.slowScale = scale;
+  }
+
+  private sparkBurst(p: THREE.Vector3, dir: THREE.Vector3, n: number, speed: number, spread: number, color: THREE.Color, life = 0.55) {
+    const v = new THREE.Vector3();
+    for (let i = 0; i < n; i++) {
+      v.set(rand(-1, 1), rand(-0.3, 1), rand(-1, 1)).normalize().multiplyScalar(spread);
+      v.addScaledVector(dir, 1);
+      v.multiplyScalar(speed * rand(0.35, 1.2));
+      this.sparks.emit(p, v, color, life * rand(0.6, 1.2));
+    }
+  }
+  private glowBurst(p: THREE.Vector3, n: number, size: number, color: THREE.Color, speed: number) {
+    const v = new THREE.Vector3();
+    for (let i = 0; i < n; i++) {
+      v.set(rand(-1, 1), rand(-1, 1), rand(-1, 1)).normalize().multiplyScalar(speed * rand(0.2, 1));
+      this.glowP.emit(p, v, color, size * rand(0.6, 1.4), rand(0.2, 0.55));
+    }
+  }
+  /**
+   * 'kz'      — Katana ZERO: thick neon-red gore, flat and loud, thrown in a hard fan.
+   * 'classic' — the machines spit arcs of blue electricity and coolant instead.
+   */
+  private bloodBurst(p: THREE.Vector3, dir: THREE.Vector3, n: number, speed: number) {
+    const v = new THREE.Vector3();
+    const c = new THREE.Color();
+    const kz = this.fxStyle === 'kz';
+    for (let i = 0; i < n; i++) {
+      v.set(rand(-1, 1), rand(-0.2, 1), rand(-1, 1)).multiplyScalar(kz ? 0.55 : 0.7);
+      v.addScaledVector(dir, kz ? 1.45 : 1.2).multiplyScalar(speed * rand(0.3, 1.1));
+      if (kz) {
+        // fat crimson droplets + a few bright streaks tearing through them
+        if (i % 5 === 0) {
+          c.setRGB(rand(2.6, 4.0), rand(0.1, 0.35), rand(0.1, 0.3));
+          this.sparks.emit(p, v, c, rand(0.16, 0.4));
+        } else {
+          c.setRGB(rand(0.6, 1.0), rand(0.01, 0.06), rand(0.02, 0.08));
+          this.blood.emit(p, v, c, rand(0.08, 0.22), rand(0.5, 1.3));
+        }
+      } else if (i % 2 === 0) {
+        c.setRGB(rand(0.3, 0.9), rand(1.8, 3.2), rand(2.6, 4.2));
+        this.sparks.emit(p, v, c, rand(0.18, 0.5));
+      } else {
+        c.setRGB(rand(0.05, 0.3), rand(0.7, 1.5), rand(1.4, 2.2));
+        this.blood.emit(p, v, c, rand(0.04, 0.12), rand(0.35, 0.9));
+      }
+    }
+  }
+  private dustBurst(p: THREE.Vector3, n: number, speed = 2) {
+    const v = new THREE.Vector3();
+    const c = new THREE.Color(0.55, 0.45, 0.42);
+    for (let i = 0; i < n; i++) {
+      v.set(rand(-1, 1), rand(0.1, 0.6), rand(-1, 1)).multiplyScalar(speed * rand(0.4, 1));
+      this.dust.emit(p, v, c, rand(0.25, 0.6), rand(0.5, 1.0));
+    }
+  }
+  private flashAt(p: THREE.Vector3, color: number, intensity: number) {
+    this.flashLight.position.copy(p);
+    this.flashLight.color.setHex(color);
+    // kept low: a strong point light right on the enemy is what used to wash them out to white
+    this.flashLight.intensity = intensity * 0.07;
+  }
+
+  private updateFx(dt: number, real: number) {
+    // Blade mode slows the WHOLE world — pieces, blood, dust, sparks all crawl together. When the final slash ends the mode,
+    // the clock returns to normal and the pieces (launched in releaseImpulse) fly at full speed.
+    const fxDt = dt;
+    this.blood.update(fxDt);
+    this.dust.update(fxDt);
+    this.glowP.update(dt);
+    this.sparks.update(fxDt);
+    this.shocks.update(dt, this.camera);
+    this.flashLight.intensity *= Math.exp(-11 * dt);
+    this.trauma = Math.max(0, this.trauma - real * 1.7);
+    this.fovPunch *= Math.exp(-10 * real);
+    this.aberr *= Math.exp(-9 * real);
+    this.whiteFlash *= Math.exp(-14 * real);
+    this.hurtFx *= Math.exp(-4 * real);
+    const u = this.post.uniforms;
+    u.aberr.value = this.aberr * 0.3;
+    u.flash.value = this.whiteFlash * 0.05;
+    const lowHp = this.player.hp / this.player.hpMax < 0.3 && this.player.state !== 'dead' ? 0.12 + Math.sin(this.time * 6) * 0.05 : 0;
+    u.hurt.value = Math.max(this.hurtFx, lowHp);
+    const targetSat = this.player.state === 'dead' ? 0.15 : 1;
+    this.sat += (targetSat - this.sat) * (1 - Math.exp(-3 * real));
+    u.sat.value = this.sat;
+    u.time.value = this.time % 100;
+    // the muzzle-flash light must fade in real time, not in (slow) world time
+    this.flashLight.intensity *= Math.exp(-11 * Math.max(0, real - dt));
+    this.streaks.update(real, this.camera);
+    this.sliceWorld.update(fxDt, real, this.sliceFx);
+    this.rageFx += ((this.rage.on ? 1 : 0) - this.rageFx) * (1 - Math.exp(-5 * real));
+    const ru = this.ragePass.uniforms;
+    ru.rage.value = this.rageFx;
+    ru.aim.value = this.rage.aiming ? Math.min(1, ru.aim.value + real * 5) : Math.max(0, ru.aim.value - real * 4);
+    ru.invert.value = this.rage.invert * 0.1;
+    ru.time.value = (performance.now() * 0.001) % 100;
+    u.aberr.value += this.rageFx * 0.0008;
+    const pp = this.player;
+    const sprintK =
+      pp.state === 'idle' ? clamp((Math.hypot(pp.vel.x, pp.vel.z) - this.sprintSpd * 0.6) / (this.sprintSpd * 0.35), 0, 1) : 0;
+    ru.speed.value += (sprintK - ru.speed.value) * (1 - Math.exp(-6 * real));
+    ru.edge.value = Math.max(this.cineW, this.rage.aiming ? 0.7 : 0);
+  }
+
+  /* ================= camera ================= */
+  private updateCamera(dt: number, real: number) {
+    const p = this.player;
+    const tgt = this.lockOn ? this.lockTarget : null;
+    const arrow = (this.keys.has('ArrowLeft') ? 1 : 0) - (this.keys.has('ArrowRight') ? 1 : 0);
+    if (!tgt) this.camYaw += arrow * 2.2 * real;
+    // smaller fighters → pull the camera in so they still fill the frame
+    let dist = 6.2 * (0.45 + 0.55 * this.sizeK);
+    let pitch = this.camPitch;
+    // sense of speed: the lens widens when sprinting
+    let fovT = 58 + (p.state === 'idle' ? clamp((Math.hypot(p.vel.x, p.vel.z) - 6) * 1.7, 0, 8) : 0);
+    const pivot = this.tmpV.copy(p.pos).add(new THREE.Vector3(0, 1.55 * this.sizeK, 0));
+    if (tgt) {
+      const dx = tgt.pos.x - p.pos.x;
+      const dz = tgt.pos.z - p.pos.z;
+      const d = Math.hypot(dx, dz);
+      const want = Math.atan2(dx, dz);
+      this.camYaw += angDiff(this.camYaw, want) * (1 - Math.exp(-8 * real));
+      dist = clamp(5.0 + d * 0.38, 5.4, 8.6);
+      pivot.x += dx * 0.28;
+      pivot.z += dz * 0.28;
+      // a colossus needs air: drop back, widen the lens and crane up so the whole thing fits on screen
+      if (tgt.kind === 'bladehead') {
+        if (p.state === 'climb') {
+          // Shadow of the Colossus climbing camera: wide dramatic angle showing the climb up the titan
+          dist = 11.5;
+          fovT = 65;
+          pitch = clamp(this.camPitch, -1.30, 1.25);
+          pivot.copy(p.pos).add(new THREE.Vector3(0, 1.8 * this.sizeK, 0));
+        } else {
+          dist = clamp(26 + d * 0.45, 28, 56);
+          fovT = 66;
+          // Complete vertical freedom to look all the way up at the towering head blade or down
+          pitch = clamp(pitch, -1.38, 1.30);
+          pivot.y += 12;
+        }
+      }
+    }
+    if (p.state === 'deathblow') {
+      dist = 3.8;
+      fovT = 40;
+      pitch = 0.2;
+    }
+    if (this.rage.on) {
+      dist *= 0.88;
+      fovT -= 4;
+      const finalShot = this.rage.aiming || p.state === 'cutaim' || (p.state === 'cut' && !!this.rage.plane?.final);
+      if (finalShot) {
+        // cinematic close-up while the final slash locks on — spam taps keep the wider gameplay camera
+        dist = 3.6;
+        fovT = 34;
+        pitch = 0.16;
+        const t2 = this.rage.target ?? this.rage.seqTarget ?? this.lockTarget;
+        if (t2) pivot.lerp(this.tmpV2.set(t2.pos.x, pivot.y, t2.pos.z), 0.5);
+      } else if (p.state === 'cut') {
+        dist *= 0.82;
+        fovT -= 3;
+      }
+    }
+    if (this.kickV.lengthSq() > 1e-6) {
+      this.camPos.add(this.kickV);
+      this.kickV.multiplyScalar(Math.exp(-30 * real));
+    }
+    const dir = new THREE.Vector3(Math.sin(this.camYaw), 0, Math.cos(this.camYaw));
+    const right = new THREE.Vector3(-Math.cos(this.camYaw), 0, Math.sin(this.camYaw));
+    // over-the-shoulder side follows where you strafe, so the camera "leads" the action
+    const lat = p.vel.x * right.x + p.vel.z * right.z;
+    this.camSide += ((p.state === 'deathblow' ? 1.0 : 0.65 + clamp(lat * 0.06, -0.35, 0.35)) - this.camSide) * (1 - Math.exp(-3 * real));
+    const desired = pivot
+      .clone()
+      .addScaledVector(dir, -dist * Math.cos(pitch))
+      .addScaledVector(right, this.camSide);
+    desired.y = pivot.y + Math.sin(pitch) * dist;
+    desired.y = Math.max(0.7, desired.y);
+    const lookT = pivot.clone().addScaledVector(dir, 1.2);
+
+    // ---- cinematic shot: orbit / crane blended over the gameplay camera ----
+    const cn = this.cine;
+    let cw = 0;
+    if (cn.dur > 0) {
+      cn.t += real;
+      const u = cn.t / cn.dur;
+      if (u >= 1) {
+        cn.dur = 0;
+        cn.kind = 'none';
+      } else {
+        const sm = (a: number, b: number, x: number) => {
+          const t = clamp((x - a) / (b - a), 0, 1);
+          return t * t * (3 - 2 * t);
+        };
+        const ease = 1 - Math.pow(1 - u, 2.2);
+        if (cn.kind === 'intro') {
+          cw = 1 - sm(0.55, 1, u);
+          const r = cn.r0 + (cn.r1 - cn.r0) * ease;
+          const h = cn.h0 + (cn.h1 - cn.h0) * ease;
+          const a = this.camYaw + Math.PI + 1.9 * (1 - ease);
+          cn.center.set(p.pos.x, 1.3, p.pos.z);
+          this.tmpV2.set(cn.center.x + Math.sin(a) * r, h, cn.center.z + Math.cos(a) * r);
+          desired.lerp(this.tmpV2, cw);
+          lookT.lerp(cn.center, cw * 0.85);
+          fovT += (cn.fov - fovT) * cw;
+        } else {
+          cw = sm(0, 0.16, u) * (1 - sm(0.78, 1, u));
+          const r = cn.r0 + (cn.r1 - cn.r0) * ease;
+          const h = cn.h0 + (cn.h1 - cn.h0) * ease + Math.sin(u * Math.PI) * 0.25;
+          const a = cn.a0 + cn.dir * (0.25 + 1.25 * ease);
+          this.tmpV2.set(cn.center.x + Math.sin(a) * r, h, cn.center.z + Math.cos(a) * r);
+          desired.lerp(this.tmpV2, cw);
+          lookT.lerp(cn.center, cw);
+          // dolly-zoom: the lens tightens while the camera pushes in
+          fovT += (cn.fov - 8 * ease - fovT) * cw;
+        }
+      }
+    }
+    this.cineW += (cw - this.cineW) * (1 - Math.exp(-12 * real));
+    this.fov += (fovT - this.fov) * (1 - Math.exp(-7 * real));
+    this.camPos.lerp(desired, 1 - Math.exp(-14 * real));
+    this.camLook.lerp(lookT, 1 - Math.exp(-16 * real));
+
+    // camera roll: banks into strafes and turns, kicked sideways by deflects
+    const spdNow = Math.hypot(p.vel.x, p.vel.z);
+    const rollT = clamp(-lat * 0.0055, -0.05, 0.05) + clamp(-p.yawRate * 0.004 * Math.min(1, spdNow / 5), -0.04, 0.04);
+    this.camRoll += (rollT - this.camRoll) * (1 - Math.exp(-6 * real));
+    this.rollKick *= Math.exp(-7 * real);
+    // run bob: head-height rhythm locked to the footfalls (stronger when sprinting)
+    const bobAmt = p.state === 'idle' ? clamp((spdNow - 2.5) / 7, 0, 1) : 0;
+    this.camBob += ((Math.sin(p.loco.phase * Math.PI * 4) * 0.045 * bobAmt) - this.camBob) * (1 - Math.exp(-18 * real));
+
+    const tr = this.trauma * this.trauma;
+    const tt = this.time * 40 + performance.now() * 0.03;
+    const sx = (Math.sin(tt * 1.3) + Math.sin(tt * 2.9)) * 0.5 * tr * 0.35;
+    const sy = (Math.sin(tt * 1.7 + 2) + Math.sin(tt * 3.3)) * 0.5 * tr * 0.3;
+    this.camera.position.copy(this.camPos);
+    this.camera.position.x += sx;
+    this.camera.position.y += sy + this.camBob;
+    this.camera.lookAt(this.camLook);
+    this.camera.rotation.z += Math.sin(tt * 2.1) * tr * 0.03 + this.camRoll + this.rollKick;
+    const f = this.fov - this.fovPunch;
+    if (Math.abs(this.camera.fov - f) > 0.01) {
+      this.camera.fov = f;
+      this.camera.updateProjectionMatrix();
+      this.updatePointScale();
+    }
+    void dt;
+  }
+
+  /* ================= pose / render sync ================= */
+  private walkOverlay(T: Pose, f: Common, speed: number, dt: number, maxSpeed: number, vx = 0, vz = 0, carry = true) {
+    // locomotion itself (feet, pelvis, arms, lean) lives in the phase-locked layer — see updateLoco / buildOut.
+    // here: only the "alive while standing" idle motion.
+    void dt;
+    void vx;
+    void vz;
+    f.locoCarry = carry;
+    const amp = clamp(speed / maxSpeed, 0, 1);
+    const ph = f.rig.root.id * 1.7;
+    const br = Math.sin(this.time * 2.3 + ph);
+    T.torsoX += br * 0.014;
+    T.headX -= br * 0.01;
+    // idle katana: the tip drifts in a slow, living figure-eight
+    const idleW = 1 - amp;
+    // light fighter's bounce on the balls of the feet
+    T.dy += Math.sin(this.time * 3.3 + ph) * 0.011 * idleW;
+    T.sp += Math.sin(this.time * 1.7 + ph) * 0.045 * idleW;
+    T.sw += Math.sin(this.time * 1.2 + ph * 2) * 0.05 * idleW;
+    T.sy += (br * 0.008 + Math.sin(this.time * 2.4 + ph) * 0.005) * idleW;
+    T.hipZ += Math.sin(this.time * 0.9 + ph) * 0.022 * (1 - amp * 0.6);
+    T.torsoZ -= Math.sin(this.time * 0.9 + ph) * 0.012;
+  }
+
+  /**
+   * Procedural footwork. Each foot is pinned to the ground in world space; when the body drifts away from its
+   * natural stance the foot takes a low gliding step (suri-ashi) to a spot slightly ahead of the motion.
+   * Standing still = planted. Turning = pivot steps. Dashing = quick alternating ninja steps.
+   */
+  private updateGait(f: Common, dt: number) {
+    const g = f.rig.gait;
+    const on = f.gaitOn && dt > 1e-4;
+    const cy = Math.cos(f.yaw);
+    const sy = Math.sin(f.yaw);
+    if (dt > 1e-4) {
+      const vx = (f.pos.x - f.lastPos.x) / dt;
+      const vz = (f.pos.z - f.lastPos.z) / dt;
+      const a = 1 - Math.exp(-12 * dt);
+      f.gv.x += (clamp(vx, -12, 12) - f.gv.x) * a;
+      f.gv.z += (clamp(vz, -12, 12) - f.gv.z) * a;
+    }
+    f.lastPos.copy(f.pos);
+    const speed = Math.hypot(f.gv.x, f.gv.z);
+    const sf = clamp(speed / 4.2, 0, 1);
+    const dx = speed > 0.05 ? f.gv.x / speed : 0;
+    const dz = speed > 0.05 ? f.gv.z / speed : 0;
+    // the rig's local space is scaled by the body size — world offsets must be converted, or short legs get
+    // stretched past their reach (and the IK then clamps, so the feet skate)
+    const k = (f.rig.root.scale.x || 1) * f.rig.legK;
+    const lead = clamp(speed * 0.1, 0, 0.42) ;
+    const th = (0.13 + lead * 0.85) * k;
+    const stepDur = clamp(0.2 - speed * 0.017, 0.1, 0.2);
+    const lh = (0.07 + 0.1 * sf);
+
+    for (let i = 0; i < 2; i++) {
+      const ft = f.feet[i];
+      const st = footStance(f.pose, i === 1);
+      // in motion the stance relaxes toward a symmetric stride centred under the hips
+      const nlx = st.x + ((i === 1 ? 0.12 : -0.12) - st.x) * sf * 0.5;
+      const nlz = st.z * (1 - 0.85 * sf);
+      const nx = f.pos.x + (nlx * cy + nlz * sy) * k;
+      const nz = f.pos.z + (-nlx * sy + nlz * cy) * k;
+      if (!on || !ft.init) {
+        ft.wx = nx;
+        ft.wz = nz;
+        ft.stepping = false;
+        ft.lift = 0;
+        ft.pitch = 0;
+        ft.init = true;
+      } else if (ft.stepping) {
+        ft.t += dt;
+        const u = Math.min(1, ft.t / ft.dur);
+        const e = u * u * (3 - 2 * u);
+        // keep re-aiming the landing spot so the foot lands where the body actually is
+        ft.tx = nx + dx * lead;
+        ft.tz = nz + dz * lead;
+        ft.wx = ft.fx + (ft.tx - ft.fx) * e;
+        ft.wz = ft.fz + (ft.tz - ft.fz) * e;
+        ft.lift = Math.sin(Math.PI * u) * lh;
+        ft.pitch = Math.sin(Math.PI * 2 * u) * (0.35 + 0.35 * sf);
+        if (u >= 1) {
+          ft.stepping = false;
+          ft.wx = ft.tx;
+          ft.wz = ft.tz;
+          ft.lift = 0;
+          ft.pitch = 0;
+          if (speed > 2.5) this.dustBurst(this.tmpV2.set(ft.wx, 0.05, ft.wz), 1, 0.8);
+        }
+      }
+      // local planted position vs the foot spot the pose asks for
+      const ex = ft.wx - f.pos.x;
+      const ez = ft.wz - f.pos.z;
+      const lx = (ex * cy - ez * sy) / k;
+      const lz = (ex * sy + ez * cy) / k;
+      const ox = lx - st.x;
+      const oz = lz - st.z;
+      // when leaving locomotion (attack, hit…) offsets relax away instead of snapping to zero
+      const dec = Math.exp(-15 * Math.max(dt, 0.001));
+      if (i === 0) {
+        g.rx = on ? ox : g.rx * dec;
+        g.rz = on ? oz : g.rz * dec;
+        g.rl = on ? ft.lift : g.rl * dec;
+        g.rp = on ? ft.pitch : g.rp * dec;
+      } else {
+        g.lx = on ? ox : g.lx * dec;
+        g.lz = on ? oz : g.lz * dec;
+        g.ll = on ? ft.lift : g.ll * dec;
+        g.lp = on ? ft.pitch : g.lp * dec;
+      }
+    }
+
+    if (on) {
+      // begin a step when a foot has fallen behind its natural spot (alternate feet, allow a double-step if far)
+      const r = f.feet[0];
+      const l = f.feet[1];
+      const err = (ft: Foot, i: number) => {
+        const st = footStance(f.pose, i === 1);
+        const nlx = st.x + ((i === 1 ? 0.12 : -0.12) - st.x) * sf * 0.5;
+        const nlz = st.z * (1 - 0.85 * sf);
+        const nx = f.pos.x + (nlx * cy + nlz * sy) * k;
+        const nz = f.pos.z + (-nlx * sy + nlz * cy) * k;
+        return { e: Math.hypot(nx - ft.wx, nz - ft.wz), nx, nz };
+      };
+      const er = err(r, 0);
+      const el = err(l, 1);
+      const pickI = er.e > el.e ? 0 : 1;
+      const ft = pickI === 0 ? r : l;
+      const ee = pickI === 0 ? er : el;
+      const other = pickI === 0 ? l : r;
+      if (!ft.stepping && ee.e > th && (!other.stepping || ee.e > th * 2.2)) {
+        ft.stepping = true;
+        ft.t = 0;
+        ft.dur = stepDur;
+        ft.fx = ft.wx;
+        ft.fz = ft.wz;
+        ft.tx = ee.nx + dx * lead;
+        ft.tz = ee.nz + dz * lead;
+      } else if (ee.e > 1.5) {
+        // teleported (knock-back, spawn) — snap
+        ft.wx = ee.nx;
+        ft.wz = ee.nz;
+      }
+    }
+
+    // pelvis shifts over the supporting leg, hips dip slightly on each step
+    const tsway = on ? clamp((g.rl - g.ll) * 0.5, -0.04, 0.04) * (0.4 + sf) : 0;
+    const tbob = on ? -Math.max(g.rl, g.ll) * 0.22 : 0;
+    const a = 1 - Math.exp(-18 * Math.max(dt, 0.001));
+    g.sway += (tsway - g.sway) * a;
+    g.bob += (tbob - g.bob) * a;
+  }
+
+  /**
+   * Spring-damper pose follower (replaces plain exponential smoothing). Slightly under-damped channels
+   * overshoot and settle, giving the sword/torso real follow-through instead of robotic easing.
+   */
+  private springPose(f: Common, rate: number, dt: number) {
+    const w0 = rate * 1.55;
+    const n = Math.max(1, Math.ceil(dt / 0.007));
+    const h = dt / n;
+    const ww = w0 * w0;
+    // just after a swing the damping is eased off, so the blade and chest overshoot a touch and settle — real follow-through
+    f.settle = Math.max(0, f.settle - dt);
+    const loose = 1 - 0.3 * Math.min(1, f.settle / 0.3);
+    for (let s = 0; s < n; s++) {
+      for (const key of KEYS) {
+        const x = f.pose[key];
+        const v = f.pv[key];
+        const nv = v + ((f.target[key] - x) * ww - 2 * DAMP[key] * loose * w0 * v) * h;
+        f.pv[key] = nv;
+        f.pose[key] = x + nv * h;
+      }
+    }
+  }
+
+  /**
+   * Phase-driven run cycle layered over the planted-foot system. Feet are lifted high, knees drive up, the
+   * stance foot travels exactly at body speed (so it never skates), and hips dip / sway over the support leg.
+   */
+  private updateLoco(f: Common, dt: number) {
+    const g = f.rig.gait;
+    const L = f.loco;
+    const o = f.lout;
+    const d = Math.max(dt, 0.001);
+    const on = f.gaitOn && dt > 1e-4;
+    const cy = Math.cos(f.yaw);
+    const sy = Math.sin(f.yaw);
+    const speed = Math.hypot(f.gv.x, f.gv.z);
+    const lvx = f.gv.x * cy - f.gv.z * sy; // local: + = character's left
+    const lvz = f.gv.x * sy + f.gv.z * cy; // local: + = forward
+
+    // turn rate (for banking into corners)
+    f.yawRate += (clamp(angDiff(f.lastYaw, f.yaw) / d, -9, 9) - f.yawRate) * (1 - Math.exp(-10 * d));
+    f.lastYaw = f.yaw;
+
+    const want = on && (L.active ? speed > 0.7 : speed > 1.1);
+    if (want && !L.active && L.w < 0.05) L.phase = 0.6; // first stride starts with the rear foot
+    L.active = want;
+    stepLoco(L, o, dt, on ? lvx : 0, on ? lvz : 0, on ? f.yawRate : 0, want, (f.rig.root.scale.x || 1) * f.rig.legK);
+
+    // layer weights
+    L.w += ((want ? 1 : 0) - L.w) * (1 - Math.exp(-(want ? 14 : 8) * d));
+    if (!on) L.w *= Math.exp(-30 * d);
+    if (L.w < 0.004) L.w = 0;
+    L.lw += ((on ? 1 : 0) - L.lw) * (1 - Math.exp(-(on ? 12 : 30) * d));
+    if (L.lw < 0.004) L.lw = 0;
+
+    if (L.w <= 0) return;
+    const w = L.w;
+    // the stride is produced in world metres; the rig's legs live in a scaled local space
+    const k = (f.rig.root.scale.x || 1) * f.rig.legK;
+    for (let i = 0; i < 2; i++) {
+      const ft = f.feet[i];
+      const st = footStance(f.pose, i === 1);
+      const tgt = o.feet[i];
+      const cx = i === 0 ? g.rx : g.lx;
+      const cz = i === 0 ? g.rz : g.lz;
+      const cl = i === 0 ? g.rl : g.ll;
+      const cp = i === 0 ? g.rp : g.lp;
+      const nx = cx + (tgt.x / k - st.x - cx) * w;
+      const nz = cz + (tgt.z / k - st.z - cz) * w;
+      const nl = cl + (tgt.lift / k - cl) * w;
+      const np = cp + (tgt.pitch - cp) * w;
+      if (i === 0) {
+        g.rx = nx; g.rz = nz; g.rl = nl; g.rp = np;
+      } else {
+        g.lx = nx; g.lz = nz; g.ll = nl; g.lp = np;
+      }
+      if (want) {
+        // keep the pinned world position in sync so stopping hands over to the planted system seamlessly
+        const lx = (st.x + nx) * k;
+        const lz = (st.z + nz) * k;
+        ft.wx = f.pos.x + lx * cy + lz * sy;
+        ft.wz = f.pos.z - lx * sy + lz * cy;
+        ft.stepping = false;
+        ft.init = true;
+      }
+    }
+    g.sway += (o.sway / k - g.sway) * w;
+    g.bob += (o.bob / k - g.bob) * w;
+
+    // footfalls: gravel crunch (player only, so the mix stays clean) + dust puffs at speed
+    if (want && L.sp > 0.9) {
+      const p0 = L.prevPhase;
+      const p1 = L.phase;
+      const hit0 = p1 < p0; // right foot lands when the phase wraps
+      const hit1 = p0 < 0.5 && p1 >= 0.5; // left foot lands at half-cycle
+      for (let i = 0; i < 2; i++) {
+        if (i === 0 ? hit0 : hit1) {
+          const ft = f.feet[i];
+          if (f === this.player) {
+            this.sfx.step(L.sp);
+            if (L.sp > this.sprintSpd * 0.72) this.shake(0.024); // sprinting: every footfall thumps the frame
+          }
+          if ((f as Enemy).kind === 'bladehead') {
+            // EARTHQUAKE: a seven-storey machine puts its foot down. Dust wall, double shock ring, deep boom,
+            // and a jolt that fades with distance — standing far away you feel a rumble, up close it throws the camera.
+            const at = this.tmpV2.set(ft.wx, 0.06, ft.wz);
+            this.dustBurst(at, 26, 5.5);
+            this.dustBurst(at, 14, 2.2);
+            this.shocks.spawn(at, 0xcfe4ff, 9, 0.75);
+            this.shocks.spawn(at, 0xffffff, 4.5, 0.4);
+            this.sfx.land(1);
+            this.sfx.kick();
+            const dd = at.distanceTo(this.player.pos);
+            this.shake(1.05 * clamp(1 - dd / 26, 0.18, 1));
+            this.kickV.y -= 0.1 * clamp(1 - dd / 20, 0, 1);
+          } else {
+            // Katana ZERO footfalls: a kick of dust that gets bigger with speed, plus a scuff streak at a sprint
+            const fs = L.sp / this.sprintSpd;
+            if (fs > 0.3) {
+              const big = fs > 0.62;
+              this.dustBurst(this.tmpV2.set(ft.wx, 0.05, ft.wz), big ? 5 : 2, big ? 2.2 : 1.2);
+              if (big && f === this.player) {
+                this.shocks.spawn(this.tmpV2.set(ft.wx, 0.04, ft.wz), 0xffffff, 0.9, 0.22);
+              }
+            }
+          }
+        }
+      }
+    }
+  }
+
+  /** Final pose = spring-followed pose + phase-locked locomotion layer (so it can never lag behind the feet). */
+  private buildOut(f: Common) {
+    const out = f.out;
+    copyPose(out, f.pose);
+    const L = f.loco;
+    const o = f.lout;
+    const lw = L.lw;
+    const w = L.w;
+    // whole-body lean: speed + acceleration + banking; the head stays level and looks ahead
+    const lean = o.leanF * lw;
+    out.hipX += 0.4 * lean;
+    out.torsoX += 0.6 * lean;
+    out.headX -= 0.85 * lean;
+    out.torsoZ += o.roll * lw * 0.7;
+    out.hipZ += o.roll * lw * 0.3;
+    if (w <= 0.001) return;
+    const ph = L.phase * TAU;
+    out.hipYaw += o.pelvisYaw * w;
+    out.torsoY += o.torsoYaw * w;
+    out.hipZ += o.hipRoll * w;
+    out.torsoZ += o.torsoRoll * w;
+    if (f.locoCarry) {
+      // free arm drives against the legs; the katana is carried one-handed, tip raised and ready
+      const c = smooth01((L.sp - 0.9) / 1.6) * w;
+      const amp = 0.35 + 0.55 * o.run + 0.15 * o.spr; // arm swing amplitude (rad)
+      // sprinter's pump: elbow locked ~90°, hand drives up to the chin and back past the hip
+      out.lsX += (-0.3 - o.arm * amp - out.lsX) * c;
+      out.lsZ += (0.12 + 0.08 * o.run - out.lsZ) * c;
+      out.leX += (-(0.7 + 0.75 * o.run) - 0.25 * Math.max(0, o.arm) * o.run - out.leX) * c;
+      out.two *= 1 - c;
+      out.sx += (-0.3 - out.sx) * c;
+      out.sy += (0.36 - out.sy) * c;
+      out.sz += (0.34 - out.sz) * c;
+      out.sp += (0.62 - out.sp) * c;
+      out.sw += (0.26 - out.sw) * c;
+      out.sr += (0.3 - out.sr) * c;
+      out.sp += Math.sin(ph * 2) * 0.07 * c;
+      out.sw += -0.12 * o.arm * c;
+      // the sword hand pumps too (opposite to the free arm) — no more frozen right arm
+      const sw2 = -o.arm * (0.5 + 0.5 * o.run);
+      out.sz += sw2 * 0.16 * c;
+      out.sy += (sw2 * 0.06 + 0.025 * o.bounce) * c;
+
+      // NINJA RUN: chest dives low, the free arm streams back and out, and the katana is carried back by the
+      // hip with its TIP SWEPT UP — the shinobi silhouette, without the blade ever pointing backwards.
+      const n = o.ninja * w;
+      if (n > 0.001) {
+        // free arm: swept back, elbow almost straight, still breathing with the stride
+        out.lsX += (0.82 + o.arm * 0.26 - out.lsX) * n;
+        out.lsZ += (0.3 - out.lsZ) * n;
+        out.leX += (-0.22 - 0.12 * Math.max(0, o.arm) - out.leX) * n;
+        // sword hand: low and behind the hip, blade raked up and out at ~50°
+        out.two *= 1 - n;
+        out.sx += (-0.34 - out.sx) * n;
+        out.sy += (0.3 + 0.04 * o.bounce - out.sy) * n;
+        out.sz += (-0.2 + sw2 * 0.09 - out.sz) * n;
+        out.sp += (0.88 + Math.sin(ph * 2) * 0.06 - out.sp) * n;
+        out.sw += (0.46 - 0.07 * o.arm - out.sw) * n;
+        out.sr += (0.3 - out.sr) * n;
+        // the whole body drives forward, head stays up and locked ahead
+        out.torsoX += 0.2 * n;
+        out.hipX += 0.06 * n;
+        out.headX -= 0.16 * n;
+        out.dy -= 0.03 * n;
+      }
+    }
+  }
+
+  private finishPose(f: Common, rate: number, dt: number) {
+    if (f.react > 0.001) blendInto(f.target, f.target, f.reactPose, f.react * 0.85);
+    // eyes follow the opponent — head turns independently of the torso
+    if (f.look && f.lookW > 0) {
+      const want = Math.atan2(f.look.x - f.pos.x, f.look.z - f.pos.z);
+      const base = f.yaw + f.pose.hipYaw + f.pose.torsoY;
+      const d = clamp(angDiff(base, want), -1.0, 1.0);
+      f.target.headY = f.target.headY * (1 - f.lookW) + d * f.lookW;
+      const dist = Math.hypot(f.look.x - f.pos.x, f.look.z - f.pos.z);
+      f.target.headX += clamp((dist - 4) * 0.01, -0.05, 0.05) - 0.04;
+    }
+    // crossfade: whenever the animation state changes, ease the follower in so poses melt into each other
+    if (f.sig !== f.lastSig) {
+      f.lastSig = f.sig;
+      f.xfade = 1;
+    }
+    f.xfade = Math.max(0, f.xfade - dt / 0.22);
+    const eased = f.xfade * f.xfade;
+    this.springPose(f, f.soft ? rate * (1 - 0.6 * eased) : rate, dt);
+    this.updateGait(f, dt);
+    this.updateLoco(f, dt);
+    this.buildOut(f);
+    f.rig.apply(f.out);
+    f.rig.root.position.copy(f.pos);
+    f.rig.root.rotation.y = f.yaw;
+    if (f === this.player && f.rig.root.rotation.x !== 0 && this.player.state !== 'dead') {
+      // somersault around the body centre (not the feet)
+      const q = new THREE.Quaternion().setFromEuler(f.rig.root.rotation);
+      const v = new THREE.Vector3(0, 1, 0).applyQuaternion(q);
+      f.rig.root.position.x -= v.x;
+      f.rig.root.position.y += 1 - v.y;
+      f.rig.root.position.z -= v.z;
+    }
+    f.rig.update(dt);
+    if (f.flash > 0.001) f.rig.setFlash(f.flash * 0.9);
+    else f.rig.setFlash(0);
+    f.rig.setBladeGlow(f.glow);
+  }
+
+  /* ================= player ================= */
+  private moveInput(): THREE.Vector3 {
+    let mx = 0;
+    let mz = 0;
+    const k = this.keys;
+    if (k.has('KeyW')) mz += 1;
+    if (k.has('KeyS')) mz -= 1;
+    if (k.has('KeyD')) mx += 1;
+    if (k.has('KeyA')) mx -= 1;
+    const dir = new THREE.Vector3(Math.sin(this.camYaw), 0, Math.cos(this.camYaw));
+    const right = new THREE.Vector3(-Math.cos(this.camYaw), 0, Math.sin(this.camYaw));
+    const v = dir.multiplyScalar(mz).add(right.multiplyScalar(mx));
+    if (v.lengthSq() > 1) v.normalize();
+    return v;
+  }
+
+  private pEffMax() {
+    return 100 * (0.6 + 0.4 * (this.player.hp / this.player.hpMax));
+  }
+  private eEffMax(e: Enemy) {
+    return e.postureMax * (0.55 + 0.45 * (e.hp / e.hpMax));
+  }
+
+  private clampArena(v: THREE.Vector3, margin = 0.8) {
+    const r = Math.hypot(v.x, v.z);
+    const m = ARENA_R - margin;
+    if (r > m) {
+      v.x *= m / r;
+      v.z *= m / r;
+    }
+  }
+
+  private separate() {
+    const p = this.player;
+    for (const e of this.enemies) {
+      if (e.state === 'dying' || e.state === 'dead' || e.state === 'spawn') continue;
+      if (e.state === 'impaled') continue; // he is pinned on the blade — don't push him away
+      const dx = p.pos.x - e.pos.x;
+      const dz = p.pos.z - e.pos.z;
+      const d = Math.hypot(dx, dz);
+      // a 7× machine would otherwise shove the player clear across the arena — keep its body radius sane
+      const min = e.kind === 'bladehead' ? 2.1 : 0.95 * e.scale;
+      if (d < min && d > 0.001 && p.pos.y < 0.8) {
+        const push = (min - d) * 0.5;
+        p.pos.x += (dx / d) * push;
+        p.pos.z += (dz / d) * push;
+        e.pos.x -= (dx / d) * push * 0.6;
+        e.pos.z -= (dz / d) * push * 0.6;
+      }
+    }
+    for (let i = 0; i < this.enemies.length; i++) {
+      for (let j = i + 1; j < this.enemies.length; j++) {
+        const a = this.enemies[i];
+        const b = this.enemies[j];
+        if (!this.alive(a) || !this.alive(b)) continue;
+        const dx = a.pos.x - b.pos.x;
+        const dz = a.pos.z - b.pos.z;
+        const d = Math.hypot(dx, dz);
+        if (d < 1.1 && d > 0.001) {
+          const push = (1.1 - d) * 0.5;
+          a.pos.x += (dx / d) * push;
+          a.pos.z += (dz / d) * push;
+          b.pos.x -= (dx / d) * push;
+          b.pos.z -= (dz / d) * push;
+        }
+      }
+    }
+    this.clampArena(p.pos);
+    this.enemies.forEach((e) => this.clampArena(e.pos, 0.8));
+  }
+
+  private nearestDist(): number {
+    let d = 99;
+    for (const e of this.enemies) if (this.alive(e)) d = Math.min(d, e.pos.distanceTo(this.player.pos));
+    return d;
+  }
+
+  private updatePlayer(dt: number) {
+    const p = this.player;
+    p.t += dt;
+    p.postureT += dt;
+    p.flash = Math.max(0, p.flash - dt * 6);
+    p.react = Math.max(0, p.react - dt * 5);
+    p.glow = Math.max(0, p.glow - dt * 5);
+    if (p.state !== 'attack') p.comboTimer -= dt;
+    p.inv = Math.max(0, p.inv - dt);
+
+    const gh = this.guardHeld;
+    if (gh && !p.guardPrev) p.guardT = 0;
+    if (gh) p.guardT += dt;
+    p.guardPrev = gh;
+
+    // posture regen
+    if (p.state !== 'broken' && p.state !== 'dead' && p.postureT > 1.1) {
+      const hpF = p.hp / p.hpMax;
+      p.posture = Math.max(0, p.posture - (gh ? 20 : 28) * (0.5 + 0.5 * hpF) * dt);
+    }
+
+    const move = this.moveInput();
+    const tgt = this.lockOn ? this.lockTarget : null;
+    const T = p.target;
+    let rate = 12;
+    let desiredSpeed = 0;
+    const guarding = p.state === 'idle' && gh;
+
+    const free = () =>
+      p.state === 'idle' ||
+      p.state === 'style' ||
+      (p.state === 'attack' && !!p.anim && p.t >= p.anim.cancelFrom) ||
+      (p.state === 'cut' && p.t >= 0.3) ||
+      (p.state === 'land' && p.t > 0.2) ||
+      (p.state === 'recoil' && p.t > 0.2);
+    const dodgeFree = () =>
+      free() ||
+      (p.state === 'attack' && !!p.anim && p.t >= p.anim.hits[0].t + 0.02) ||
+      (p.state === 'cut' && p.t >= 0.2) ||
+      (p.state === 'land' && p.t > 0.08) ||
+      (p.state === 'hurt' && p.t > 0.16) ||
+      (p.state === 'dodge' && p.t > 0.24) ||
+      (p.state === 'heal' && p.t > 0.2 && !p.healDone);
+
+    // AUTO-LATCH: If near stuck colossus blade, automatically and smoothly mount like Shadow of the Colossus
+    if (p.state !== 'climb' && p.state !== 'dead' && p.state !== 'deathblow') {
+      if (this.tryMountClimb()) {
+        return;
+      }
+    }
+
+    // ---- global actions ----
+    if (p.state !== 'dead' && p.state !== 'deathblow' && p.state !== 'jump' && p.state !== 'stomp' && p.state !== 'dive') {
+      if (this.dodgeBuf > 0 && dodgeFree()) {
+        this.dodgeBuf = 0;
+        if (!this.tryMikiri()) this.startDodge(move);
+      } else if (this.jumpBuf > 0 && free()) {
+        this.jumpBuf = 0;
+        if (!this.tryMountClimb(true)) {
+          this.startJump(move);
+        }
+      } else if (this.healBuf > 0 && free()) {
+        this.healBuf = 0;
+        if (p.gourds > 0 && p.hp < p.hpMax) this.startHeal();
+      } else if (
+        this.guardBuf > 0 &&
+        gh &&
+        p.state === 'attack' &&
+        p.anim &&
+        p.t >= p.anim.hits[0].t + 0.08
+      ) {
+        p.state = 'idle';
+        p.t = 0;
+        p.anim = null;
+        p.trailOn = false;
+        p.guardT = 0;
+        this.guardBuf = 0;
+      } else if (this.styleBuf > 0 && free() && !this.rage.aiming && !this.rage.on) {
+        this.styleBuf = 0;
+        this.startStyle();
+      } else if (this.impaleBuf > 0 && free() && !this.rage.on) {
+        this.impaleBuf = 0;
+        if (!this.startImpale()) this.kickBuf = 0.2; // nobody in range → just throw the kick
+      } else if (this.kickBuf > 0 && free()) {
+        this.kickBuf = 0;
+        this.attackBuf = 0;
+        this.startAttack(KICK);
+      } else if (this.attackBuf > 0 && free()) {
+        this.attackBuf = 0;
+        // blade mode has its own finisher (right-click) — a stray click must not trigger a deathblow
+        const db = this.rage.on ? null : this.findDeathblowTarget();
+        if (db) this.startDeathblow(db);
+        else this.startAttack();
+      }
+    }
+
+    // leaving a freestyle spin: re-wrap the blade angles so the pose never "unwinds" backwards
+    if (this.pState === 'style' && p.state !== 'style') {
+      for (const k of ['sp', 'sw'] as const) p.pose[k] -= Math.round((p.pose[k] - IDLE[k]) / TAU) * TAU;
+      this.styleDef = null;
+    }
+    this.pState = p.state;
+    // lazy fighter? after a quiet moment the blade starts to play on its own
+    if (p.state === 'idle' && move.lengthSq() < 0.01 && !gh) {
+      this.idleT += dt;
+      if (this.idleT > 7 && (this.nearestDist() > 8 || !this.enemies.some((e) => this.alive(e)))) {
+        this.idleT = 0;
+        this.styleBuf = 0.3;
+        this.styleForce = -1;
+      }
+    } else if (p.state !== 'style') this.idleT = 0;
+
+    // ---- state behaviour ----
+    switch (p.state) {
+      case 'idle': {
+        const sprint = !guarding && (this.keys.has('ShiftLeft') || this.keys.has('ShiftRight'));
+        // "flow": a high style rank makes you a little faster
+        // short legs cover less ground, so speed follows body size
+        // speed is capped by what the legs can actually turn over — outrun your own stride and the feet skate
+        const bodyK = this.sizeK * (this.chibi ? 0.9 : 1);
+        let spd = (guarding ? 2.4 : sprint ? 14.0 : 8.4) * (1 + 0.08 * this.flowLevel()) * (0.3 + 0.7 * bodyK);
+        if (move.lengthSq() > 0.01) desiredSpeed = spd;
+        // weighty acceleration: ~0.2 s to full run, firm braking — the lean in the animation comes from this
+        const desVel = move.clone().multiplyScalar(spd);
+        const dvx = desVel.x - p.vel.x;
+        const dvz = desVel.z - p.vel.z;
+        const dvl = Math.hypot(dvx, dvz);
+        const maxStep = (move.lengthSq() > 0.01 ? (sprint ? 30 : 36) : 46) * dt;
+        const k = dvl > maxStep ? maxStep / dvl : 1;
+        p.vel.x += dvx * k;
+        p.vel.z += dvz * k;
+        spd = Math.hypot(p.vel.x, p.vel.z);
+        p.speed = spd;
+        // brake skid: let go of the stick at a sprint → dig the heels in and slide, throwing up gravel
+        if (move.lengthSq() < 0.01 && this.prevSpd > 6.5 && spd < this.prevSpd - 0.2) {
+          if (this.skidT <= 0) this.sfx.skid();
+          this.skidT = 0.34;
+        }
+        this.skidT -= dt;
+        if (this.skidT > 0 && spd > 2.5) {
+          this.dustBurst(this.tmpV2.set(p.pos.x, 0.06, p.pos.z), 2, 2.4);
+          if (Math.random() < 0.5) this.sparkBurst(this.tmpV2.set(p.pos.x, 0.05, p.pos.z), fwd(p.yaw).multiplyScalar(-1), 1, 3, 0.8, new THREE.Color(1.2, 0.9, 0.6), 0.25);
+        }
+        this.prevSpd = spd;
+        // facing: strafe around the target — unless sprinting (then run facing the direction of travel)
+        if (tgt && !(sprint && spd > 3)) {
+          const want = Math.atan2(tgt.pos.x - p.pos.x, tgt.pos.z - p.pos.z);
+          p.yaw = turnToward(p.yaw, want, 14 * dt);
+        } else if (spd > 0.5) {
+          p.yaw = turnToward(p.yaw, Math.atan2(p.vel.x, p.vel.z), (sprint ? 9 : 12) * dt);
+        }
+        copyPose(T, guarding ? P.guard : P.idle);
+        p.look = tgt ? tgt.pos : (this.nearestEnemy()?.pos ?? null);
+        this.walkOverlay(T, p, spd, dt, 7.6, p.vel.x, p.vel.z, !guarding);
+        rate = guarding ? 26 : 12;
+        break;
+      }
+      case 'attack': {
+        const a = p.anim!;
+        // swing sound
+        if (!p.swingPlayed && p.t >= a.hits[0].t - 0.09) {
+          p.swingPlayed = true;
+          if (a.hits[0].kind === 'kick') this.sfx.kickSwing();
+          else this.sfx.swing(!!a.hits[0].heavy);
+        }
+        const nd = this.nearestDist();
+        // magnetism: keep turning toward the locked target while winding up
+        if (tgt && p.t < a.hits[0].t - 0.03) {
+          const want = Math.atan2(tgt.pos.x - p.pos.x, tgt.pos.z - p.pos.z);
+          p.aim = turnToward(p.aim, want, 9 * dt);
+        }
+        for (const l of a.lunge) {
+          if (p.t >= l.t0 && p.t <= l.t1 + dt) {
+            const sp = l.dist / (l.t1 - l.t0);
+            if (nd > 1.5) p.pos.addScaledVector(fwd(p.aim), sp * dt);
+          }
+        }
+        // spinning cuts rotate the whole body around its aim direction
+        let spinA = 0;
+        if (a.spins) {
+          for (const s of a.spins) {
+            const u = clamp((p.t - s.t0) / (s.t1 - s.t0), 0, 1);
+            spinA += s.turns * Math.PI * 2 * (u * u * (3 - 2 * u));
+          }
+        }
+        p.yaw = p.aim + spinA;
+        p.vel.multiplyScalar(0.8);
+        while (p.hitIdx < a.hits.length && p.t >= a.hits[p.hitIdx].t) {
+          const h = a.hits[p.hitIdx++];
+          // the planted front foot bites into the gravel on every strike
+          this.dustBurst(p.pos.clone().setY(0.1), h.kind === 'kick' ? 12 : 5, 2.6);
+          this.onPlayerStrike(h);
+          this.playerStrike(h);
+        }
+        p.trailOn = a.trail.some(([s, e]) => p.t >= s && p.t <= e);
+        sampleFrames(a.frames, p.t, T);
+        applyArcs(a, p.t, T);
+        rate = 38;
+        if (p.t >= a.dur) {
+          p.state = 'idle';
+          p.t = 0;
+          p.trailOn = false;
+          p.comboTimer = 0.45;
+          p.settle = 0.34; // the blade swings back into the stance and wobbles to a stop
+        }
+        break;
+      }
+      case 'style': {
+        const a = this.styleDef;
+        if (!a) {
+          p.state = 'idle';
+          p.t = 0;
+          break;
+        }
+        sampleFrames(a.frames, p.t, T);
+        p.trailOn = a.trail.some(([s, e]) => p.t >= s && p.t <= e);
+        while (this.styleFx < a.sfx.length && p.t >= a.sfx[this.styleFx]) {
+          this.sfx.swing(false);
+          this.styleFx++;
+        }
+        while (this.styleSt < a.streaks.length && p.t >= a.streaks[this.styleSt].t) {
+          const s = a.streaks[this.styleSt++];
+          const c = p.pos.clone().addScaledVector(fwd(p.aim), 1.2).setY(1.3);
+          this.streaks.spawn(c, this.slashLine(s.ang), 2.4, 0.1, new THREE.Color(2.2, 2.6, 3.2), 0.3);
+        }
+        // keep facing the foe; any movement input breaks the pose back into the stance
+        if (tgt) p.yaw = turnToward(p.yaw, Math.atan2(tgt.pos.x - p.pos.x, tgt.pos.z - p.pos.z), 5 * dt);
+        p.aim = p.yaw;
+        p.look = tgt ? tgt.pos : null;
+        p.vel.multiplyScalar(Math.exp(-8 * dt));
+        rate = 26;
+        if ((p.t > 0.3 && move.lengthSq() > 0.05) || p.t >= a.dur) {
+          p.state = 'idle';
+          p.t = 0;
+          p.trailOn = false;
+        }
+        break;
+      }
+      case 'cutaim': {
+        // Blade-mode stance: coiled, katana drawn back, eyes locked on the target
+        copyPose(T, AIM_POSE);
+        const tg = this.rage.target;
+        p.look = tg ? tg.pos : null;
+        if (tg) p.yaw = turnToward(p.yaw, Math.atan2(tg.pos.x - p.pos.x, tg.pos.z - p.pos.z), 16 * dt);
+        p.vel.set(0, 0, 0);
+        rate = 20;
+        break;
+      }
+      case 'cut': {
+        // the dash-through: blur across the enemy, blade flashing along the chosen line
+        const a = p.anim!;
+        const r = this.rage;
+        const u = clamp(p.t / 0.11, 0, 1);
+        const ez = 1 - Math.pow(1 - u, 3);
+        p.pos.lerpVectors(r.dashFrom, r.dashTo, ez);
+        p.look = null;
+        p.trailOn = a.trail.some(([s, e]) => p.t >= s && p.t <= e);
+        sampleFrames(a.frames, p.t, T);
+        applyArcs(a, p.t, T);
+        rate = 46;
+        if (!r.cutDone && p.t >= 0.11) {
+          r.cutDone = true;
+          this.performCut();
+        }
+        // next line of a multi-cut sequence: flash straight into it
+        if (r.cutDone && r.seqIdx < r.seq.length - 1 && p.t >= 0.19) {
+          r.seqIdx++;
+          this.beginCut();
+          break;
+        }
+        if (p.t >= a.dur) {
+          p.state = 'idle';
+          p.t = 0;
+          p.trailOn = false;
+        }
+        break;
+      }
+      case 'dodge': {
+        const a = p.anim!;
+        const k = p.dodgeKind;
+        // each evade has its own speed curve: slips and thru-slides burst fast, ducks stay compact, hops arc backwards
+        const speedK = k === 'slip' ? 17.5 : k === 'thru' ? 16 : k === 'duck' ? 10 : 15;
+        const f = 1 - p.t / (a.dur * 0.88);
+        if (f > 0) p.pos.addScaledVector(p.dodgeDir, speedK * f * f * 1.4 * dt);
+        // small hop for the back-hop, a tiny skim for slips
+        const u = clamp(p.t / a.dur, 0, 1);
+        p.pos.y = (k === 'hop' ? 0.34 : k === 'slip' ? 0.05 : 0) * Math.sin(Math.PI * u);
+        sampleFrames(a.frames, p.t, T);
+        rate = 34;
+        p.look = tgt ? tgt.pos : null;
+        // gravel kicked up along the slide
+        if (p.pos.y < 0.2 && f > 0.1) this.dustBurst(this.tmpV2.set(p.pos.x, 0.06, p.pos.z), 1, 2);
+        // keep facing the attacker (the blade stays on them)
+        const foe = tgt ?? this.nearestEnemy();
+        if (foe) p.yaw = turnToward(p.yaw, Math.atan2(foe.pos.x - p.pos.x, foe.pos.z - p.pos.z), 12 * dt);
+        p.aim = p.yaw;
+        if (p.t >= a.dur) {
+          p.pos.y = 0;
+          p.state = 'idle';
+          p.t = 0;
+        }
+        break;
+      }
+      case 'land': {
+        // anime hero landing: crouched, hand to the ground, eyes on the enemy; any input breaks out of it early
+        const a = p.anim!;
+        sampleFrames(a.frames, p.t, T);
+        rate = 30;
+        p.look = tgt ? tgt.pos : (this.nearestEnemy()?.pos ?? null);
+        if (tgt) p.yaw = turnToward(p.yaw, Math.atan2(tgt.pos.x - p.pos.x, tgt.pos.z - p.pos.z), 9 * dt);
+        p.aim = p.yaw;
+        if (p.landBack && p.vel.lengthSq() > 4 && Math.random() < 0.7) {
+          this.dustBurst(this.tmpV2.set(p.pos.x, 0.06, p.pos.z), 1, 2.4); // the skid throws gravel
+        }
+        if ((p.t > 0.22 && move.lengthSq() > 0.05) || p.t >= a.dur) {
+          p.state = 'idle';
+          p.t = 0;
+        }
+        break;
+      }
+      case 'jump': {
+        const sweeping = this.enemies.some((e) => e.state === 'attack' && e.anim?.warn?.kind === 'sweep');
+        // ---- double jump: a second somersault, with a burst of air ----
+        if (this.jumpBuf > 0 && p.jumps < 2) {
+          this.jumpBuf = 0;
+          p.jumps = 2;
+          p.flipStyle = '';
+          p.vy = 7.8;
+          const front = move.lengthSq() < 0.05 || move.dot(fwd(p.yaw)) > -0.2;
+          p.flipV = (front ? 1 : -1) * 10.5;
+          p.flipEnd = p.flip + (front ? 1 : -1) * TAU;
+          if (move.lengthSq() > 0.05) p.vel.copy(move).multiplyScalar(6.4);
+          p.jumpStart = -9;
+          p.airDashT = 0;
+          this.sfx.whoosh();
+          this.shocks.spawn(p.pos.clone().setY(p.pos.y + 0.2), 0x9fc8ff, 2.4, 0.35);
+          this.dustBurst(p.pos.clone().setY(p.pos.y + 0.1), 5, 1.5);
+          this.shake(0.1);
+        }
+        // ---- air dash (C): a flat, fast burst that ignores gravity for a moment ----
+        if (this.dodgeBuf > 0 && p.dashAvail && p.airDashT <= 0) {
+          this.dodgeBuf = 0;
+          p.dashAvail = false;
+          p.airDashT = 0.2;
+          const dd = move.lengthSq() > 0.05 ? move.clone().normalize() : fwd(p.yaw);
+          p.vel.copy(dd).multiplyScalar(17.5);
+          p.vy = 0.6;
+          p.flipV = 0;
+          p.flipEnd = p.flip;
+          this.sfx.dodge();
+          this.shake(0.14);
+          this.aberr = Math.max(this.aberr, 0.008);
+          this.kickV.addScaledVector(dd, 0.14);
+          this.shocks.spawn(p.pos.clone().setY(p.pos.y + 1), 0xbfd8ff, 2.2, 0.3);
+        }
+        // ---- Flying Swallow (attack in mid-air): dive at the target, rebound off it, repeat ----
+        if (this.attackBuf > 0 && p.diveAvail && p.pos.y > 0.4) {
+          this.attackBuf = 0;
+          this.startDive();
+          break;
+        }
+        if (p.airDashT > 0) {
+          p.airDashT -= dt;
+          p.vy = 0.5;
+          if (p.airDashT <= 0) p.vel.multiplyScalar(0.4);
+        } else {
+          p.vy -= 22 * dt;
+          if (!sweeping && !p.flipStyle && move.lengthSq() > 0.05) {
+            const k = 1 - Math.exp(-1.7 * dt);
+            p.vel.x += (move.x * 6.4 - p.vel.x) * k;
+            p.vel.z += (move.z * 6.4 - p.vel.z) * k;
+          }
+        }
+        // somersault progress
+        if (p.flipV !== 0) {
+          p.flip += p.flipV * dt;
+          if ((p.flipV > 0 && p.flip >= p.flipEnd) || (p.flipV < 0 && p.flip <= p.flipEnd)) {
+            p.flip = p.flipEnd;
+            p.flipV = 0;
+          }
+        }
+        p.pos.y += p.vy * dt;
+        p.pos.x += p.vel.x * dt;
+        p.pos.z += p.vel.z * dt;
+        if (this.tryMountClimb(true)) {
+          break;
+        }
+        if (p.pos.y <= 0) {
+          this.landFromAir(p.vy);
+          break;
+        }
+        // in the air: a somersault opens up (blade out, arms wide), tucks in the middle, then opens again for the landing
+        if (Math.abs(p.flipV) > 0.1) {
+          const prog = clamp(1 - Math.abs(p.flipEnd - p.flip) / TAU, 0, 1);
+          const w = smooth01((prog - 0.12) / 0.18) * (1 - smooth01((prog - 0.68) / 0.22));
+          blendInto(T, FLIP_OPEN, P.tuck, w);
+        } else if (p.flipStyle === 'back') {
+          copyPose(T, FLIP_OPEN);
+        } else {
+          copyPose(T, P.jump);
+          T.torsoX += clamp(p.vy * 0.03, -0.2, 0.2);
+        }
+        rate = 24;
+        break;
+      }
+      case 'impale': {
+        const a = p.anim!;
+        const e = p.impTarget;
+        sampleFrames(a.frames, p.t, T);
+        applyArcs(a, p.t, T);
+        p.trailOn = a.trail.some(([s, en]) => p.t >= s && p.t <= en);
+        rate = 34;
+        const alive = !!e && e.state !== 'dead';
+        if (alive) {
+          p.look = e!.pos;
+          if (p.t < 0.24) p.yaw = turnToward(p.yaw, Math.atan2(e!.pos.x - p.pos.x, e!.pos.z - p.pos.z), 14 * dt);
+          p.aim = p.yaw;
+          // drive forward onto him
+          const d = Math.hypot(e!.pos.x - p.pos.x, e!.pos.z - p.pos.z);
+          if (p.t >= 0.18 && p.t < 0.27 && d > 1.4) p.pos.addScaledVector(fwd(p.aim), Math.min(d - 1.4, 14 * dt));
+        }
+        if (!p.impStab && p.t >= 0.26) {
+          p.impStab = true;
+          if (alive && this.alive(e!)) this.impaleHit(e!);
+        }
+        // he hangs on the blade, dragged along in front of the player
+        if (p.impStab && !p.impKick && alive && e!.state === 'impaled') {
+          const f = fwd(p.aim);
+          e!.pos.x = p.pos.x + f.x * (1.25 * e!.scale);
+          e!.pos.z = p.pos.z + f.z * (1.25 * e!.scale);
+          e!.yaw = p.aim + Math.PI;
+          e!.aim = e!.yaw;
+          if (Math.random() < 0.5) {
+            this.bloodBurst(this.tmpV2.set(e!.pos.x, 1.1 * e!.scale, e!.pos.z), this.tmpV.set(0, -1, 0), 1, 1.6);
+          }
+        }
+        if (!p.impKick && p.t >= 0.97) {
+          p.impKick = true;
+          if (alive && e!.state === 'impaled') this.impaleKick(e!);
+          else {
+            this.sfx.kickSwing();
+            this.dustBurst(p.pos.clone().setY(0.1), 6, 2);
+          }
+        }
+        p.vel.multiplyScalar(Math.exp(-7 * dt));
+        if (p.t >= a.dur) {
+          p.state = 'idle';
+          p.t = 0;
+          p.trailOn = false;
+          p.impTarget = null;
+          p.settle = 0.3;
+        }
+        break;
+      }
+      case 'climb': {
+        // SHADOW-OF-THE-COLOSSUS CLIMB: the player is glued to the route and slides along it smoothly.
+        const e = p.climbOn;
+        if (!e || !this.alive(e) || e.stuck <= 0) {
+          this.dismountClimb(false);
+          break;
+        }
+        const fwdIn =
+          (this.keys.has('KeyW') || this.keys.has('ArrowUp') ? 1 : 0) -
+          (this.keys.has('KeyS') || this.keys.has('ArrowDown') ? 1 : 0);
+        const sprint = this.keys.has('ShiftLeft') || this.keys.has('ShiftRight');
+        // Faster climbing, especially when sprinting up the colossal blade ramp
+        const climbRate = (sprint ? 0.38 : 0.24) * (p.climbT < 0.72 ? 1.0 : 1.3);
+        p.climbT = clamp(p.climbT + fwdIn * climbRate * dt, 0.02, 1);
+        const here = new THREE.Vector3();
+        const ahead = new THREE.Vector3();
+        this.climbPoint(e, p.climbT, here);
+        this.climbPoint(e, Math.min(1, p.climbT + 0.03), ahead);
+        // Smooth magnetic stick onto the colossus surface
+        const k = 1 - Math.exp(-18 * dt);
+        p.pos.lerp(here, k);
+        p.pos.y = here.y;
+        const dirUp = ahead.sub(here);
+        if (dirUp.lengthSq() > 1e-5) {
+          dirUp.normalize();
+          p.yaw = turnToward(p.yaw, Math.atan2(dirUp.x, dirUp.z), 10 * dt);
+        }
+        p.aim = p.yaw;
+        p.look = null;
+        // Braced Shadow of the Colossus climbing stance
+        copyPose(T, fwdIn !== 0 ? P.dodge : P.guard);
+        T.torsoX += 0.55;
+        T.headX -= 0.35;
+        T.dy -= 0.14;
+        rate = 18;
+        p.vel.set(0, 0, 0);
+        p.vy = 0;
+
+        // Plunging strike into the head optic or reactor core
+        if (p.climbT >= 0.68 && this.attackBuf > 0) {
+          this.attackBuf = 0;
+          e.rideHits++;
+          const dmg = 45;
+          e.hp -= dmg;
+          e.flash = 1;
+          const c = e.rig.chestObj.getWorldPosition(new THREE.Vector3());
+          this.bloodBurst(c, new THREE.Vector3(0, 1, 0), 45, 9);
+          this.sparkBurst(c, new THREE.Vector3(0, 1, 0), 38, 10, 1.2, new THREE.Color(3.2, 2.6, 1.5), 0.7);
+          this.sfx.hit(true);
+          this.hitstop(0.14);
+          this.shake(0.9);
+          this.addStyle(25);
+          this.addRage(15);
+          this.addEnemyPosture(e, 85);
+          this.onEvent({ type: 'cut', text: '斬 · Hantam Reaktor' });
+
+          // Boss flinches violently; after 4 critical hits, throws player off
+          if (e.rideHits % 4 === 0) {
+            this.dismountClimb(true);
+            e.stuck = Math.min(e.stuck, 0.4);
+          }
+          if (e.hp <= 0) {
+            e.hp = 0;
+            this.dismountClimb(true);
+            if (e.pips > 1) this.bossPipLoss(e);
+            else this.breakEnemy(e, true);
+          }
+        }
+        // Jump or dodge to voluntarily dismount
+        if (this.dodgeBuf > 0 || this.jumpBuf > 0) {
+          this.dodgeBuf = 0;
+          this.jumpBuf = 0;
+          this.dismountClimb(false);
+        }
+        break;
+      }
+      case 'dive': {
+        p.pos.x += p.vel.x * dt;
+        p.pos.z += p.vel.z * dt;
+        p.pos.y += p.vy * dt;
+        p.yaw = Math.atan2(p.vel.x, p.vel.z);
+        p.aim = p.yaw;
+        p.flip += (0.9 - p.flip) * (1 - Math.exp(-16 * dt));
+        p.look = null;
+        p.trailOn = true;
+        copyPose(T, P.dive);
+        rate = 34;
+        if (Math.random() < 0.6) {
+          this.sparkBurst(this.tmpV2.copy(p.pos).setY(p.pos.y + 0.9), p.vel.clone().multiplyScalar(-0.05), 1, 4, 0.6, new THREE.Color(1.4, 1.5, 2.2), 0.25);
+        }
+        let hitE: Enemy | null = null;
+        for (const e of this.enemies) {
+          if (!this.alive(e)) continue;
+          const dx = e.pos.x - p.pos.x;
+          const dz = e.pos.z - p.pos.z;
+          if (dx * dx + dz * dz < 2.1 * e.scale * e.scale && p.pos.y < 2.2 * e.scale) {
+            hitE = e;
+            break;
+          }
+        }
+        if (hitE) this.diveStrike(hitE);
+        else if (p.pos.y <= 0.02 || p.t > 1.2) this.diveLand();
+        break;
+      }
+      case 'stomp': {
+        p.vel.multiplyScalar(0.85);
+        copyPose(T, P.stomp);
+        rate = 30;
+        if (p.t > 0.6) {
+          p.state = 'idle';
+          p.t = 0;
+        }
+        break;
+      }
+      case 'hurt': {
+        copyPose(T, P.hurt);
+        rate = 30;
+        if (p.t > 0.34) {
+          p.state = 'idle';
+          p.t = 0;
+        }
+        break;
+      }
+      case 'recoil': {
+        copyPose(T, P.deflected);
+        rate = 28;
+        if (p.t > 0.42) {
+          p.state = 'idle';
+          p.t = 0;
+        }
+        break;
+      }
+      case 'broken': {
+        copyPose(T, P.broken);
+        T.torsoZ += Math.sin(this.time * 4) * 0.06;
+        rate = 10;
+        if (p.t > 2.3) {
+          p.state = 'idle';
+          p.t = 0;
+          p.posture = this.pEffMax() * 0.3;
+        }
+        break;
+      }
+      case 'heal': {
+        p.vel.multiplyScalar(0.9);
+        copyPose(T, P.heal);
+        rate = 12;
+        if (!p.healDone && p.t > 0.55) {
+          p.healDone = true;
+          p.gourds--;
+          const before = p.hp;
+          p.hp = Math.min(p.hpMax, p.hp + 42);
+          this.sfx.heal();
+          this.onEvent({ type: 'heal', n: Math.round(p.hp - before) });
+          const c = new THREE.Color(0.4, 1.8, 0.8);
+          this.glowBurst(p.pos.clone().setY(1.4), 28, 0.12, c, 2.5);
+          this.shocks.spawn(p.pos.clone().setY(0.1), 0x66ffaa, 2.2, 0.6);
+        }
+        if (p.t > 0.95) {
+          p.state = 'idle';
+          p.t = 0;
+        }
+        break;
+      }
+      case 'deathblow': {
+        const a = DEATHBLOW;
+        const e = p.dbTarget!;
+        // glide into position
+        const toE = this.tmpV.copy(e.pos).sub(p.pos).setY(0);
+        const d = toE.length();
+        const want = Math.atan2(toE.x, toE.z);
+        p.yaw = turnToward(p.yaw, want, 20 * dt);
+        if (d > 1.5 && p.t < 0.3) {
+          p.pos.addScaledVector(toE.normalize(), Math.min(d - 1.5, 14 * dt));
+        }
+        p.trailOn = p.t >= a.trail[0][0] && p.t <= a.trail[0][1];
+        sampleFrames(a.frames, p.t, T);
+        rate = 38;
+        if (!p.dbDone && p.t >= 0.4) this.executeDeathblow(e);
+        if (p.t >= a.dur) {
+          p.state = 'idle';
+          p.t = 0;
+          p.trailOn = false;
+          p.dbTarget = null;
+        }
+        break;
+      }
+      case 'dead': {
+        // sink to the knees first, then slump forward
+        copyPose(T, p.t < 0.6 ? P.broken : P.dead);
+        T.headX = p.t < 0.6 ? 0.5 : 0.1;
+        p.look = null;
+        rate = p.t < 0.6 ? 14 : 7;
+        this.deadT += dt;
+        const f = clamp((p.t - 0.5) / 0.9, 0, 1);
+        const e = f * f * (3 - 2 * f);
+        p.rig.root.rotation.x = 1.5 * e;
+        break;
+      }
+    }
+    // somersault angle: settle leftovers when we are no longer airborne, then apply it to the rig
+    if (p.state !== 'jump' && p.state !== 'dive') {
+      const tf = Math.round(p.flip / TAU) * TAU;
+      p.flip += (tf - p.flip) * (1 - Math.exp(-22 * dt));
+      if (Math.abs(p.flip - tf) < 0.02) p.flip = 0;
+      p.flipV = 0;
+    }
+    if (p.state !== 'dead') p.rig.root.rotation.x = p.flip;
+
+    // integrate generic velocity (knockback etc)
+    if (p.state !== 'idle' && p.state !== 'jump' && p.state !== 'dive' && p.state !== 'dead') {
+      p.pos.x += p.vel.x * dt;
+      p.pos.z += p.vel.z * dt;
+      p.vel.multiplyScalar(Math.exp(-6 * dt));
+    } else if (p.state === 'idle') {
+      p.pos.x += p.vel.x * dt;
+      p.pos.z += p.vel.z * dt;
+    }
+    if (p.state === 'idle' && p.pos.y > 0) p.pos.y = Math.max(0, p.pos.y - 20 * dt);
+    if (p.state !== 'attack' && p.state !== 'deathblow' && p.state !== 'cut' && p.state !== 'style' && p.state !== 'dive') p.trailOn = false;
+
+    // the evades are fully posed, so the run-cycle legs only drive normal locomotion
+    p.gaitOn = p.state === 'idle';
+    if (p.state !== 'idle') p.locoCarry = false;
+    p.sig =
+      p.state === 'attack'
+        ? 'attack' + (p.anim?.name ?? '')
+        : p.state === 'style'
+          ? 'style' + this.styleLast
+          : p.state === 'dodge' || p.state === 'land'
+            ? p.state + (p.anim?.name ?? '')
+            : p.state;
+    p.soft = p.state === 'idle' || p.state === 'heal' || p.state === 'stomp' || p.state === 'jump' || p.state === 'style';
+    this.finishPose(p, rate, dt);
+    if (p.state === 'dead') p.rig.root.position.y = 0.12 * clamp(p.t / 0.9, 0, 1);
+    void desiredSpeed;
+  }
+
+  private startAttack(special?: AnimDef) {
+    const p = this.player;
+    if (special) {
+      p.anim = special;
+      p.comboTimer = 0.7;
+    } else {
+      const idx = p.comboTimer > 0 ? p.comboIdx : 0;
+      p.anim = PLAYER_COMBO[idx];
+      p.comboIdx = (idx + 1) % PLAYER_COMBO.length;
+      p.comboTimer = 0.8;
+    }
+    p.state = 'attack';
+    p.t = 0;
+    p.hitIdx = 0;
+    p.swingPlayed = false;
+    // aim assist
+    const tgt = this.lockOn ? this.lockTarget : null;
+    const move = this.moveInput();
+    if (tgt) {
+      p.yaw = Math.atan2(tgt.pos.x - p.pos.x, tgt.pos.z - p.pos.z);
+    } else if (move.lengthSq() > 0.05) {
+      p.yaw = Math.atan2(move.x, move.z);
+    } else {
+      const n = this.nearestEnemy();
+      if (n && n.pos.distanceTo(p.pos) < 4.5) p.yaw = Math.atan2(n.pos.x - p.pos.x, n.pos.z - p.pos.z);
+    }
+    p.aim = p.yaw;
+    // --- enemies read the swing and answer it: step out of range, parry it, block it, or eat it ---
+    for (const e of this.enemies) {
+      if (e.state !== 'idle' || !this.alive(e)) continue;
+      const d = e.pos.distanceTo(p.pos);
+      if (d > 5.0) continue;
+      const ranged = e.kind === 'archer' || e.kind === 'gunner';
+      const r = Math.random();
+      // chance to simply hop out of the way (archers / gunners are skittish, the boss is slippery in phase 2)
+      const pEvade = ranged ? 0.5 : e.boss ? (e.phase2 ? 0.34 : 0.24) : 0.2;
+      if (e.evadeCD <= 0 && r < pEvade) {
+        this.startEvade(e, d < 2.6);
+        continue;
+      }
+      if (ranged) continue; // bow / matchlock can't parry a katana
+      // parry: punishes you hard, so it is rationed by a cooldown
+      const pParry = e.boss ? (e.phase2 ? 0.4 : 0.3) : 0.16;
+      const pBlock = e.boss ? 0.3 : 0.34;
+      const r2 = Math.random();
+      e.defense = e.parryCD <= 0 && r2 < pParry ? 'deflect' : r2 < pParry + pBlock ? 'block' : null;
+      e.defenseUntil = this.time + 0.6;
+    }
+  }
+
+  /** The enemy slides out of the blade's path (or hops straight back when you're right on top of him). */
+  private startEvade(e: Enemy, back: boolean) {
+    const p = this.player;
+    const toP = new THREE.Vector3(p.pos.x - e.pos.x, 0, p.pos.z - e.pos.z);
+    if (toP.lengthSq() < 1e-4) toP.set(0, 0, 1);
+    toP.normalize();
+    e.evadeSide = back ? 0 : Math.random() < 0.5 ? 1 : -1;
+    if (back) e.evadeDir.copy(toP).multiplyScalar(-1);
+    else e.evadeDir.set(-toP.z * e.evadeSide, 0, toP.x * e.evadeSide);
+    this.interruptEnemy(e);
+    e.state = 'evade';
+    e.stateT = 0;
+    e.stateDur = back ? 0.42 : 0.38;
+    e.evadeCD = e.boss ? rand(1.6, 2.6) : rand(2.6, 4.2);
+    e.yaw = Math.atan2(toP.x, toP.z);
+    e.aim = e.yaw;
+    // a dodge is a free opening to strike back
+    e.punish = e.boss ? 0.42 : 0.6;
+    this.sfx.dodge();
+    this.dustBurst(e.pos.clone().setY(0.12), 5, 1.8);
+  }
+
+  /** What is about to hit the player? A melee swing about to land, or an arrow / bullet on its way. */
+  private findThreat(): { kind: 'slash' | 'thrust' | 'sweep' | 'proj'; ang: number | null; from: THREE.Vector3 } | null {
+    const p = this.player;
+    let best: { kind: 'slash' | 'thrust' | 'sweep' | 'proj'; ang: number | null; from: THREE.Vector3 } | null = null;
+    let bt = 0.8;
+    for (const e of this.enemies) {
+      if (e.state !== 'attack' || !e.anim || e.anim.fire) continue;
+      const h = e.anim.hits[e.hitIdx];
+      if (!h) continue;
+      const rem = (h.t - e.t) / e.speedMul;
+      if (rem < bt && rem > -0.08 && e.pos.distanceTo(p.pos) < 6.5) {
+        bt = rem;
+        best = { kind: h.kind === 'kick' ? 'slash' : h.kind, ang: h.ang ?? null, from: e.pos };
+      }
+    }
+    if (best) return best;
+    const to = new THREE.Vector3();
+    for (const pr of this.proj.items) {
+      if (pr.stuck || pr.reflected) continue;
+      to.subVectors(p.pos, pr.pos);
+      const d = to.length();
+      const sp = pr.vel.length();
+      if (d < 18 && sp > 1 && pr.vel.dot(to) / (sp * d) > 0.9 && d / sp < 0.6) return { kind: 'proj', ang: null, from: pr.pos };
+    }
+    return null;
+  }
+
+  /**
+   * The dodge reads the incoming attack and answers it:
+   *  horizontal cut → duck under it · thrust / bullet → slide aside · forward input → slip through · backward → back-hop or a full backflip.
+   * The blade is held parallel to the slash line during the evade, so the pose "meets" the attack.
+   */
+  private startDodge(move: THREE.Vector3) {
+    const p = this.player;
+    const tgt = this.lockOn ? this.lockTarget : null;
+    const threat = this.findThreat();
+    if (move.lengthSq() > 0.05) {
+      p.dodgeDir.copy(move).normalize();
+    } else if (threat && (threat.kind === 'thrust' || threat.kind === 'proj')) {
+      // nothing held against a thrust / bullet → sidestep out of the line of fire
+      const toE = new THREE.Vector3(threat.from.x - p.pos.x, 0, threat.from.z - p.pos.z).normalize();
+      p.dodgeDir.set(-toE.z, 0, toE.x);
+      if (Math.random() < 0.5) p.dodgeDir.multiplyScalar(-1);
+    } else if (tgt) {
+      p.dodgeDir.set(p.pos.x - tgt.pos.x, 0, p.pos.z - tgt.pos.z).normalize();
+    } else {
+      p.dodgeDir.copy(fwd(p.yaw)).multiplyScalar(-1);
+    }
+    // always face the attacker so the evade reads as a reaction, not a run
+    const foe = tgt ?? this.nearestEnemy();
+    if (foe && foe.pos.distanceTo(p.pos) < 14) p.yaw = Math.atan2(foe.pos.x - p.pos.x, foe.pos.z - p.pos.z);
+    else p.yaw = Math.atan2(p.dodgeDir.x, p.dodgeDir.z);
+    p.aim = p.yaw;
+    const fv = fwd(p.yaw);
+    const left = new THREE.Vector3(Math.cos(p.yaw), 0, -Math.sin(p.yaw));
+    const backC = -p.dodgeDir.dot(fv);
+    const side = p.dodgeDir.dot(left) >= 0 ? 1 : -1;
+
+    let kind: DodgeKind = 'slip';
+    let flip = false;
+    if (backC > 0.6) {
+      if (Math.random() < 0.5 && threat?.kind !== 'sweep') flip = true;
+      else kind = 'hop';
+    } else if (backC < -0.6) kind = 'thru';
+    if (!flip && kind !== 'thru' && threat?.kind === 'slash' && threat.ang !== null) {
+      const a = ((threat.ang % Math.PI) + Math.PI) % Math.PI;
+      if (a < 0.45 || a > 2.7) kind = 'duck'; // a flat horizontal cut: get under it
+    }
+
+    p.trailOn = false;
+    this.shake(0.12);
+    this.kickV.addScaledVector(p.dodgeDir, 0.1);
+    p.vel.multiplyScalar(0.2); // the evade sets its own momentum — don't inherit the run
+    if (flip) {
+      // athletic backflip — a full rotation, blade out toward the enemy, i-frames the whole way up
+      p.state = 'jump';
+      p.t = 0;
+      p.anim = null;
+      p.vy = 6.8;
+      p.vel.copy(p.dodgeDir).multiplyScalar(9.6);
+      p.jumps = 1;
+      p.diveAvail = true;
+      p.dashAvail = true;
+      p.airDashT = 0;
+      p.jumpStart = -9;
+      p.flip = 0;
+      p.flipV = -TAU / 0.56;
+      p.flipEnd = -TAU;
+      p.flipStyle = 'back';
+      p.inv = 0.5;
+      this.sfx.flip();
+      this.shocks.spawn(p.pos.clone().setY(0.1), 0xcfe0ff, 2.6, 0.35);
+      this.dustBurst(p.pos.clone().setY(0.12), 10, 2.8);
+      return;
+    }
+    p.state = 'dodge';
+    p.t = 0;
+    p.anim = buildDodge(kind, side, threat?.ang ?? null);
+    p.dodgeKind = kind;
+    p.dodgeSide = side;
+    p.inv = 0.34;
+    this.sfx.dodge();
+    this.dustBurst(p.pos.clone().setY(0.15), 7, 2.2);
+  }
+
+  private startJump(move: THREE.Vector3) {
+    const p = this.player;
+    p.state = 'jump';
+    p.t = 0;
+    p.anim = null;
+    p.vy = 8.4;
+    p.jumpStart = this.time;
+    p.trailOn = false;
+    // moving jump = somersault; standing jump = a graceful leap (a second press in the air double-jumps)
+    const moving = move.lengthSq() > 0.05;
+    const front = !moving || move.dot(fwd(p.yaw)) > -0.2;
+    p.flip = 0;
+    p.flipV = moving ? (front ? 1 : -1) * 9.4 : 0;
+    p.flipEnd = moving ? (front ? 1 : -1) * TAU : 0;
+    p.flipStyle = '';
+    p.jumps = 1;
+    p.diveAvail = true;
+    p.dashAvail = true;
+    p.airDashT = 0;
+    // lean towards a sweeping enemy
+    const sw = this.enemies.find((e) => e.state === 'attack' && e.anim?.warn?.kind === 'sweep');
+    if (sw) {
+      const d = new THREE.Vector3().subVectors(sw.pos, p.pos).setY(0);
+      const len = d.length();
+      if (len > 1.2) p.vel.copy(d.normalize().multiplyScalar(Math.min(4.5, (len - 1.2) / 0.6)));
+      else p.vel.set(0, 0, 0);
+    } else {
+      p.vel.copy(move).multiplyScalar(4.2);
+    }
+    this.sfx.whoosh();
+    this.dustBurst(p.pos.clone().setY(0.15), 8, 2.5);
+  }
+
+  /**
+   * Touchdown. A real jump ends in a pose: hero landing (hand to the ground, blade swept behind) — or, after a backflip dodge,
+   * a skidding low ready stance with the blade on the enemy. Tiny hops just return to idle.
+   */
+  private landFromAir(impactVy: number) {
+    const p = this.player;
+    const back = p.flipStyle === 'back';
+    const airtime = p.t;
+    p.pos.y = 0;
+    p.jumps = 0;
+    p.diveAvail = true;
+    p.dashAvail = true;
+    p.airDashT = 0;
+    p.flipStyle = '';
+    const power = clamp(-impactVy / 12, 0.2, 1);
+    this.dustBurst(p.pos.clone().setY(0.1), 8 + Math.round(10 * power), 2.5 + 2 * power);
+    this.shake(0.12 + 0.28 * power);
+    if (airtime > 0.3 || impactVy < -6) {
+      p.state = 'land';
+      p.t = 0;
+      p.anim = back ? LAND_BACK_ANIM : LAND_HERO_ANIM;
+      p.landBack = back;
+      p.vel.multiplyScalar(back ? 0.62 : 0.12);
+      this.sfx.land(power);
+      this.shocks.spawn(p.pos.clone().setY(0.08), 0xffe2c0, 2.4 + 2.4 * power, 0.42);
+      this.kickV.set(0, -0.08 * power, 0);
+      if (!back) this.addStyle(3);
+    } else {
+      p.state = 'idle';
+      p.t = 0;
+      p.vel.multiplyScalar(0.25);
+    }
+  }
+
+  /**
+   * IMPALE → KICK-OFF (scroll-wheel click). Runs the katana through the nearest enemy in front of you, holds him on the
+   * steel for a beat, then plants a boot on his chest and tears the blade free — he is flung back and lands hard on his back.
+   */
+  private startImpale(): boolean {
+    const p = this.player;
+    let best: Enemy | null = null;
+    let bs = 1e9;
+    for (const e of this.enemies) {
+      if (!this.alive(e) || e.state === 'impaled') continue;
+      const dx = e.pos.x - p.pos.x;
+      const dz = e.pos.z - p.pos.z;
+      const d = Math.hypot(dx, dz);
+      if (d > 3.6) continue;
+      const ang = Math.abs(angDiff(p.yaw, Math.atan2(dx, dz)));
+      if (ang > 1.5) continue; // roughly in front of you
+      const s = d + ang * 1.5;
+      if (s < bs) {
+        bs = s;
+        best = e;
+      }
+    }
+    if (!best) return false;
+    p.state = 'impale';
+    p.t = 0;
+    p.anim = IMPALE;
+    p.impTarget = best;
+    p.impStab = false;
+    p.impKick = false;
+    p.vel.set(0, 0, 0);
+    p.yaw = Math.atan2(best.pos.x - p.pos.x, best.pos.z - p.pos.z);
+    p.aim = p.yaw;
+    p.look = best.pos;
+    this.sfx.swing(true);
+    return true;
+  }
+
+  /** The blade goes in. */
+  private impaleHit(e: Enemy) {
+    const p = this.player;
+    const dir = fwd(p.aim);
+    const chest = e.pos.clone().setY(1.15 * e.scale);
+    this.interruptEnemy(e);
+    e.state = 'impaled';
+    e.stateT = 0;
+    e.defense = null;
+    e.aiming = false;
+    e.vel.set(0, 0, 0);
+    e.hp -= 24 * e.dmgMul;
+    this.addEnemyPosture(e, 45);
+    this.sfx.impale();
+    this.bloodBurst(chest, dir, 60, 8);
+    this.bloodBurst(chest.clone().addScaledVector(dir, 0.45), dir, 40, 9); // spray out of his back
+    this.sparkBurst(chest, dir, 16, 7, 1, new THREE.Color(2.6, 1.2, 0.8), 0.4);
+    this.flashAt(chest, 0xffd0a0, 16);
+    this.hitstop(0.14);
+    this.slowmo(0.35, 0.4);
+    this.shake(0.5);
+    this.fovPunch = 5;
+    this.kickV.addScaledVector(dir, 0.22);
+    this.addRage(14);
+    this.addStyle(22);
+    e.flash = 1;
+  }
+
+  /** Boot on the chest: the blade rips out and he is launched. */
+  private impaleKick(e: Enemy) {
+    const p = this.player;
+    const dir = fwd(p.aim);
+    const chest = e.pos.clone().setY(1.1 * e.scale);
+    const weight = e.boss ? 0.55 : 1;
+    this.sfx.unsheathe();
+    this.sfx.kick();
+    this.bloodBurst(chest, dir.clone().multiplyScalar(-1), 50, 7);
+    this.bloodBurst(chest, dir, 40, 9);
+    this.shocks.spawn(chest, 0xff5a3a, 3.4, 0.4);
+    this.dustBurst(e.pos.clone().setY(0.08), 14, 3);
+    this.flashAt(chest, 0xffe0b0, 20);
+    this.hitstop(0.16);
+    this.shake(0.8);
+    this.fovPunch = 7;
+    this.aberr = 0.016;
+    p.vel.addScaledVector(dir, -2.4);
+    e.hp -= 26 * e.dmgMul;
+    this.addEnemyPosture(e, 55);
+    this.addRage(10);
+    this.addStyle(26);
+    e.flash = 1;
+    e.vel.copy(dir).multiplyScalar(15 * weight);
+    e.vel.y = 0;
+    if (e.hp <= 0 && e.state !== 'broken') {
+      e.hp = 0;
+      this.breakEnemy(e, true);
+      return;
+    }
+    // sent tumbling: spins backwards through the air and lands flat on his back
+    e.state = 'tumble';
+    e.stateT = 0;
+    e.stateDur = e.boss ? 1.0 : 1.5;
+    e.tumbleA = 0;
+    e.tumbleV = -(3.2 + Math.random() * 1.6) * weight;
+    e.punish = 0;
+  }
+
+  /** Flying Swallow: a hard dive at the locked target (or straight ahead if none). */
+  private startDive() {
+    const p = this.player;
+    let tgt = this.lockOn ? this.lockTarget : null;
+    if (!tgt || !this.alive(tgt) || tgt.pos.distanceTo(p.pos) > 16) tgt = this.nearestEnemy();
+    const from = this.tmpV.set(p.pos.x, p.pos.y + 0.9, p.pos.z);
+    const dir = new THREE.Vector3();
+    if (tgt && tgt.pos.distanceTo(p.pos) < 16) {
+      dir.set(tgt.pos.x - from.x, 1.0 * tgt.scale - from.y, tgt.pos.z - from.z).normalize();
+    } else {
+      dir.copy(fwd(p.yaw)).setY(-0.7).normalize();
+    }
+    const spd = 20;
+    p.vel.set(dir.x * spd, 0, dir.z * spd);
+    p.vy = Math.min(dir.y * spd, -3.5);
+    p.state = 'dive';
+    p.t = 0;
+    p.anim = null;
+    p.diveAvail = false;
+    p.airDashT = 0;
+    p.flipV = 0;
+    p.flipEnd = 0;
+    p.yaw = Math.atan2(dir.x, dir.z);
+    p.aim = p.yaw;
+    this.sfx.swing(true);
+    this.shake(0.15);
+    this.fovPunch = -3;
+    this.kickV.addScaledVector(dir, 0.2);
+  }
+
+  /** The dive connects: heavy cut, then the player rebounds off the target and can dive again. */
+  private diveStrike(e: Enemy) {
+    const p = this.player;
+    const h: HitDef = { t: 0, dmg: 34, post: 34, reach: 3, arc: 360, kind: 'slash', heavy: true, ang: 0.95 };
+    p.aim = Math.atan2(e.pos.x - p.pos.x, e.pos.z - p.pos.z);
+    p.yaw = p.aim;
+    this.onPlayerStrike(h);
+    this.applyPlayerHit(e, h);
+    this.addStyle(18);
+    this.shake(0.55);
+    this.fovPunch = 6;
+    this.shocks.spawn(this.tmpV.copy(e.pos).setY(1.1 * e.scale), 0xfff0c0, 3, 0.35);
+    // rebound: spring back up and away
+    const away = new THREE.Vector3(p.pos.x - e.pos.x, 0, p.pos.z - e.pos.z);
+    if (away.lengthSq() < 0.01) away.copy(fwd(p.yaw)).multiplyScalar(-1);
+    away.normalize();
+    p.state = 'jump';
+    p.t = 0;
+    p.vy = 9;
+    p.vel.copy(away).multiplyScalar(5);
+    p.jumps = 1;
+    p.diveAvail = true;
+    p.dashAvail = true;
+    p.airDashT = 0;
+    p.jumpStart = -9;
+    p.flipV = -10.5;
+    p.flipEnd = p.flip - TAU;
+  }
+
+  /** The dive hits the ground: shockwave that staggers anything close. */
+  private diveLand() {
+    const p = this.player;
+    p.pos.y = 0;
+    p.state = 'land';
+    p.t = 0;
+    p.anim = LAND_HERO_ANIM;
+    p.landBack = false;
+    p.flipStyle = '';
+    p.vel.multiplyScalar(0.1);
+    p.jumps = 0;
+    p.diveAvail = true;
+    p.dashAvail = true;
+    this.shocks.spawn(p.pos.clone().setY(0.1), 0xffd9b0, 5, 0.5);
+    this.dustBurst(p.pos.clone().setY(0.1), 18, 4);
+    this.shake(0.4);
+    this.sfx.kick();
+    for (const e of this.enemies.slice()) {
+      if (!this.alive(e)) continue;
+      if (e.pos.distanceTo(p.pos) < 2.8) {
+        this.applyPlayerHit(e, { t: 0, dmg: 14, post: 24, reach: 3, arc: 360, kind: 'slash', heavy: false, ang: 0.95 });
+      }
+    }
+  }
+
+  private startHeal() {
+    const p = this.player;
+    p.state = 'heal';
+    p.t = 0;
+    p.healDone = false;
+    p.anim = null;
+    this.sfx.gourd();
+  }
+
+  private tryMikiri(): boolean {
+    const p = this.player;
+    for (const e of this.enemies) {
+      if (e.state !== 'attack' || !e.anim || e.anim.warn?.kind !== 'thrust' || e.hitIdx > 0) continue;
+      const hitT = e.anim.hits[0].t;
+      const remaining = (hitT - e.t) / e.speedMul;
+      const d = e.pos.distanceTo(p.pos);
+      if (remaining < 0.34 && remaining > -0.05 && d < 5.5) {
+        // MIKIRI COUNTER
+        const away = new THREE.Vector3().subVectors(p.pos, e.pos).setY(0).normalize();
+        p.pos.copy(e.pos).addScaledVector(away, 1.55 * e.scale);
+        p.yaw = Math.atan2(-away.x, -away.z);
+        p.state = 'stomp';
+        p.t = 0;
+        p.anim = null;
+        p.vel.set(0, 0, 0);
+        e.state = 'stagger';
+        e.stateDur = 1.2;
+        e.stateT = 0;
+        e.t = 0;
+        e.anim = null;
+        e.trailOn = false;
+        e.yaw = Math.atan2(away.x * -1, away.z * -1) + Math.PI;
+        e.yaw = Math.atan2(p.pos.x - e.pos.x, p.pos.z - e.pos.z);
+        this.stats.mikiri++;
+        const pt = e.pos.clone().addScaledVector(away, 0.9).setY(0.4);
+        this.sfx.mikiri();
+        this.sparkBurst(pt, new THREE.Vector3(0, 0.6, 0), 60, 8, 1.2, new THREE.Color(3, 2.2, 1.0));
+        this.glowBurst(pt, 20, 0.2, new THREE.Color(2, 1.4, 0.6), 4);
+        this.shocks.spawn(pt, 0xffd890, 3.2, 0.45);
+        this.flashAt(pt.clone().setY(1), 0xffd9a0, 30);
+        this.hitstop(0.16);
+        this.slowmo(0.4, 0.3);
+        this.shake(0.7);
+        this.aberr = 0.02;
+        this.whiteFlash = 0.3;
+        this.addEnemyPosture(e, e.boss ? 62 : 90);
+        this.onEvent({ type: 'mikiri', text: '見切り' });
+        return true;
+      }
+    }
+    return false;
+  }
+
+  private findDeathblowTarget(): Enemy | null {
+    const p = this.player;
+    let best: Enemy | null = null;
+    let bd = 4.2;
+    for (const e of this.enemies) {
+      if (e.state !== 'broken') continue;
+      const d = e.pos.distanceTo(p.pos);
+      if (d < bd) {
+        bd = d;
+        best = e;
+      }
+    }
+    return best;
+  }
+
+  private startDeathblow(e: Enemy) {
+    const p = this.player;
+    p.state = 'deathblow';
+    p.t = 0;
+    p.dbTarget = e;
+    p.dbDone = false;
+    p.anim = DEATHBLOW;
+    p.vel.set(0, 0, 0);
+    e.brokenDur = 99; // freeze broken state
+    this.slowmo(0.6, 0.3);
+    this.sfx.whoosh();
+  }
+
+  private executeDeathblow(e: Enemy) {
+    const p = this.player;
+    p.dbDone = true;
+    this.stats.deathblows++;
+    const chest = e.pos.clone().setY(1.25 * e.scale);
+    const dir = fwd(p.yaw);
+    this.sfx.deathblow();
+    this.bloodBurst(chest, dir, 140, 11);
+    this.bloodBurst(chest, new THREE.Vector3(0, 1, 0), 60, 7);
+    this.sparkBurst(chest, dir, 50, 9, 1.3, new THREE.Color(3, 0.6, 0.35), 0.7);
+    this.glowBurst(chest, 20, 0.3, new THREE.Color(2.5, 0.3, 0.2), 5);
+    this.shocks.spawn(chest, 0xff3a2a, 5, 0.6);
+    this.shocks.spawn(chest, 0xffffff, 3, 0.35);
+    this.flashAt(chest, 0xff5a40, 45);
+    this.hitStop = 0.28;
+    this.slowmo(0.9, 0.22);
+    this.shake(1);
+    this.aberr = 0.035;
+    this.whiteFlash = 0.55;
+    this.fovPunch = 8;
+    p.glow = 1;
+    e.flash = 1;
+    e.react = 1;
+    e.reactPose = P.hurt;
+    e.pips--;
+    this.onEvent({ type: 'deathblow', text: '忍殺' });
+    if (e.pips > 0) {
+      e.hp = e.hpMax;
+      e.posture = 0;
+      e.lethal = false;
+      e.state = 'recoil';
+      e.stateT = 0;
+      e.stateDur = 1.5;
+      e.phase2 = true;
+      e.speedMul = 1.38;
+      e.dmgMul = 0.75;
+      e.rig.bladeMat.emissive.setHex(0xff2010);
+      e.glow = 0.4;
+      this.onEvent({ type: 'phase2', text: 'Jenderal mengamuk!' });
+    } else {
+      e.state = 'dying';
+      e.stateT = 0;
+      e.removeAt = this.time + (e.boss ? 3.5 : 2.2);
+      e.trailOn = false;
+      this.stats.kills++;
+      this.maybeKillCam(e);
+    }
+  }
+
+  /* ----- player strikes enemy ----- */
+  private playerStrike(h: HitDef) {
+    const p = this.player;
+    let best: Enemy | null = null;
+    let bs = 1e9;
+    for (const e of this.enemies) {
+      if (!this.alive(e)) continue;
+
+      // If bladehead is stuck in the ground, allow player to strike the embedded blade directly!
+      if (e.kind === 'bladehead' && e.stuck > 0) {
+        e.rig.root.updateMatrixWorld(true);
+        const tip = e.rig.swordTip.getWorldPosition(new THREE.Vector3());
+        const mount = e.rig.swordBase.getWorldPosition(new THREE.Vector3());
+        const seg = new THREE.Vector3().subVectors(mount, tip);
+        const pToTip = new THREE.Vector3().subVectors(p.pos, tip);
+        const tSeg = clamp(pToTip.dot(seg) / Math.max(1e-4, seg.lengthSq()), 0, 1);
+        const closest = new THREE.Vector3().copy(tip).addScaledVector(seg, tSeg);
+        const distToBlade = p.pos.distanceTo(closest);
+        if (distToBlade <= (h.reach + 2.5) * this.sizeK) {
+          best = e;
+          break;
+        }
+      }
+
+      const dx = e.pos.x - p.pos.x;
+      const dz = e.pos.z - p.pos.z;
+      const d = Math.hypot(dx, dz);
+      if (d > (h.reach + 0.6) * this.sizeK) continue;
+      const ang = Math.abs(angDiff(p.aim, Math.atan2(dx, dz)));
+      if (ang > (h.arc / 2) * (Math.PI / 180)) continue;
+      const s = d + ang * 2;
+      if (s < bs) {
+        bs = s;
+        best = e;
+      }
+    }
+    if (best) this.applyPlayerHit(best, h);
+  }
+
+  private applyPlayerHit(e: Enemy, h: HitDef) {
+    const p = this.player;
+    const dir = fwd(p.aim);
+    const impact =
+      e.kind === 'bladehead' && e.stuck > 0
+        ? p.pos.clone().addScaledVector(dir, 1.2).setY(1.0)
+        : e.pos.clone().setY(1.2 * e.scale).addScaledVector(dir, -0.35);
+    const heavy = !!h.heavy;
+    if (h.kind === 'kick') {
+      this.addRage(10);
+      this.addStyle(14);
+      this.applyKick(e, h);
+      return;
+    }
+    // the blade passes through empty air: he already slipped aside
+    if (e.state === 'evade' && e.stateT < e.stateDur * 0.8) {
+      this.sfx.whoosh();
+      this.sparkBurst(impact, dir, 6, 4, 1, new THREE.Color(1.6, 1.6, 2), 0.25);
+      this.addPlayerPosture(4); // whiffing costs you a little composure
+      this.streak = 0;
+      return;
+    }
+    const def =
+      !this.rage.on && e.state === 'idle' && e.defense && this.time < e.defenseUntil && e.kind !== 'archer' && e.kind !== 'gunner'
+        ? e.defense
+        : null;
+
+    if (def === 'deflect') {
+      // a real parry: your blade is thrown off, you stagger, and he is already swinging back
+      e.defense = null;
+      e.parryCD = e.boss ? rand(1.4, 2.4) : rand(3.0, 5.0);
+      this.interruptEnemy(e);
+      e.state = 'parry';
+      e.stateT = 0;
+      e.stateDur = 0.3;
+      e.punish = e.boss ? 0.12 : 0.3; // instant riposte
+      this.sfx.deflect(1);
+      this.sparkBurst(impact, dir.clone().multiplyScalar(-0.6).setY(0.4), 70, 9, 1.1, new THREE.Color(3, 2.4, 1.2));
+      this.glowBurst(impact, 12, 0.18, new THREE.Color(2, 1.6, 0.8), 3);
+      this.shocks.spawn(impact, 0xffe2a0, 2.8, 0.38);
+      this.flashAt(impact, 0xffe0a0, 24);
+      this.hitstop(0.11);
+      this.shake(0.55);
+      this.aberr = 0.016;
+      p.state = 'recoil';
+      p.t = 0;
+      p.anim = null;
+      p.trailOn = false;
+      p.vel.copy(dir).multiplyScalar(-6.5);
+      p.glow = 1;
+      p.comboIdx = 0;
+      p.comboTimer = 0;
+      this.addPlayerPosture(34);
+      this.streak = 0;
+      return;
+    }
+    if (def === 'block') {
+      this.sfx.block();
+      this.sparkBurst(impact, dir.clone().multiplyScalar(-0.5).setY(0.3), 25, 6, 1.0, new THREE.Color(2.2, 1.1, 0.4), 0.4);
+      this.flashAt(impact, 0xffb060, 10);
+      this.hitstop(heavy ? 0.09 : 0.055);
+      this.shake(heavy ? 0.4 : 0.22);
+      e.vel.addScaledVector(dir, heavy ? 3.5 : 2.2);
+      e.hp = Math.max(1, e.hp - h.dmg * e.dmgMul * 0.12);
+      e.react = 0.4;
+      e.reactPose = P.guard;
+      this.addEnemyPosture(e, h.post * 1.55);
+      return;
+    }
+
+    const wasVulnerable = e.state === 'broken' || e.state === 'stagger' || e.state === 'recoil' || e.state === 'kicked';
+    const dmg = h.dmg * e.dmgMul * (wasVulnerable ? 1.3 : 1) * (this.rage.on ? 1.7 : 1);
+    this.sfx.hit(heavy);
+    this.onPlayerHitFx(e, h, impact);
+    this.bloodBurst(impact, dir, heavy ? 36 : 18, heavy ? 8 : 6);
+    this.sparkBurst(impact, dir, heavy ? 22 : 12, 6, 1.0, new THREE.Color(2.6, 1.8, 0.9), 0.35);
+    this.flashAt(impact, 0xffd0a0, heavy ? 16 : 9);
+    this.hitstop(heavy ? 0.13 : 0.07);
+    this.shake(heavy ? 0.6 : 0.28);
+    this.fovPunch = heavy ? 4 : 1.5;
+    e.flash = 1;
+    e.react = 1;
+    e.reactPose = P.hurt;
+    e.vel.addScaledVector(dir, heavy ? 5 : 2.4);
+    e.hp -= dmg;
+    if (this.rage.on) {
+      // blade mode: the blow's momentum is stored (released as a burst when slow-mo ends)…
+      e.imp.addScaledVector(dir, heavy ? 7 : 4);
+      e.impDmg += dmg * 0.2;
+      e.impHits++;
+      // …but a plain slash never ends the fight in blade mode: the enemy hangs on at a sliver of health.
+      // Finish them with the final slash (right-click).
+      e.hp = Math.max(e.hpMax * 0.05, e.hp);
+    }
+    // in blade mode a flurry barely builds posture (so spamming can't break → deathblow by accident)
+    if (!wasVulnerable && e.state !== 'broken') this.addEnemyPosture(e, this.rage.on ? h.post * 0.3 : h.post);
+    if (e.hp <= 0 && e.state !== 'broken' && this.alive(e)) {
+      e.hp = 0;
+      this.breakEnemy(e, true);
+    } else if (e.hp < 0) e.hp = 0;
+    if (this.alive(e) && (e.state === 'idle' || (e.state === 'attack' && !e.boss))) {
+      if (e.state === 'attack') this.interruptEnemy(e);
+      e.state = 'flinch';
+      e.stateT = 0;
+      e.stateDur = heavy ? 0.5 : 0.3;
+    }
+  }
+
+  /** Boot to the chest: ignores block & deflect, hurls the enemy back, wrecks posture, cancels normal attacks. */
+  private applyKick(e: Enemy, h: HitDef) {
+    const p = this.player;
+    const dir = fwd(p.aim);
+    const weight = e.boss ? 0.6 : 1;
+    const impact = e.pos.clone().setY(1.0 * e.scale).addScaledVector(dir, -0.4);
+    const ground = e.pos.clone().setY(0.08);
+    this.sfx.kick();
+    this.dustBurst(ground, 26, 4.2);
+    this.dustBurst(impact.clone().setY(0.4), 12, 3);
+    this.sparkBurst(impact, dir, 26, 7, 1.1, new THREE.Color(2.4, 1.7, 0.9), 0.4);
+    this.glowBurst(impact, 10, 0.2, new THREE.Color(2, 1.5, 0.8), 3);
+    this.shocks.spawn(impact, 0xffffff, 3.6, 0.4);
+    this.shocks.spawn(ground, 0xffd9b0, 5.2, 0.55);
+    this.flashAt(impact, 0xffe0b0, 30);
+    this.hitstop(0.15);
+    this.slowmo(0.2, 0.35);
+    this.shake(0.85);
+    this.fovPunch = 7;
+    this.aberr = 0.016;
+    this.whiteFlash = 0.15;
+    p.vel.addScaledVector(dir, -3);
+    e.flash = 1;
+    e.react = 1;
+    e.reactPose = P.kicked;
+    e.vel.addScaledVector(dir, 17 * weight);
+    e.hp -= h.dmg * e.dmgMul;
+    if (e.hp <= 0 && e.state !== 'broken') {
+      e.hp = 0;
+      this.breakEnemy(e, true);
+      return;
+    }
+    if (e.hp < 0) e.hp = 0;
+    // perilous attacks can't be kicked out of — only softened
+    const perilous = e.state === 'attack' && !!e.anim?.warn;
+    if (!perilous && e.state !== 'broken' && this.alive(e)) {
+      if (e.state === 'attack') this.interruptEnemy(e);
+      e.state = 'kicked';
+      e.stateT = 0;
+      e.stateDur = e.boss ? 0.75 : 1.15;
+      e.defense = null;
+    }
+    this.addEnemyPosture(e, e.boss ? 30 : h.post * 1.5);
+    this.onEvent({ type: 'kick', text: '蹴' });
+  }
+
+  private interruptEnemy(e: Enemy) {
+    e.anim = null;
+    e.trailOn = false;
+  }
+
+  private addEnemyPosture(e: Enemy, amt: number) {
+    if (!this.alive(e) || e.state === 'broken') return;
+    e.posture += amt;
+    e.postureT = 0;
+    if (e.posture >= this.eEffMax(e)) this.breakEnemy(e, false);
+  }
+
+  private breakEnemy(e: Enemy, lethal: boolean) {
+    if (e.state === 'broken') return;
+    this.interruptEnemy(e);
+    e.state = 'broken';
+    e.stateT = 0;
+    e.lethal = lethal;
+    e.brokenDur = lethal ? 12 : e.boss ? 4.4 : 5.5;
+    e.posture = this.eEffMax(e);
+    e.defense = null;
+    e.rig.root.rotation.x = 0;
+    const c = e.pos.clone().setY(1.3 * e.scale);
+    this.sfx.postureBreak();
+    this.sparkBurst(c, new THREE.Vector3(0, 0.3, 0), 70, 7, 1.4, new THREE.Color(2.6, 2.6, 3));
+    this.glowBurst(c, 24, 0.22, new THREE.Color(1.6, 1.6, 2.4), 4);
+    this.shocks.spawn(c, 0xffffff, 3.6, 0.5);
+    this.flashAt(c, 0xffffff, 26);
+    this.hitstop(0.15);
+    this.slowmo(0.45, 0.35);
+    this.shake(0.65);
+    this.whiteFlash = 0.35;
+    this.aberr = 0.02;
+    this.onEvent({ type: 'enemyBreak', text: '体幹崩し' });
+  }
+
+  private addPlayerPosture(a: number) {
+    const p = this.player;
+    if (p.state === 'dead' || p.state === 'deathblow') return;
+    p.posture += a;
+    p.postureT = 0;
+    if (p.posture >= this.pEffMax() && p.state !== 'broken') this.breakPlayer();
+  }
+
+  private breakPlayer() {
+    const p = this.player;
+    p.state = 'broken';
+    p.t = 0;
+    p.anim = null;
+    p.trailOn = false;
+    p.posture = this.pEffMax();
+    this.sfx.postureBreak();
+    this.hitstop(0.14);
+    this.shake(0.8);
+    this.aberr = 0.025;
+    this.hurtFx = 0.6;
+    this.streak = 0;
+    this.onEvent({ type: 'playerBreak', text: 'Postur hancur!' });
+  }
+
+  private revive() {
+    const p = this.player;
+    if (p.state !== 'dead' || p.resurrect <= 0 || this.deadT < 1.2) return;
+    p.resurrect--;
+    p.hp = p.hpMax * 0.65;
+    p.posture = 0;
+    p.state = 'idle';
+    p.t = 0;
+    this.deadT = 0;
+    this.sat = 0.3;
+    this.sfx.revive();
+    this.shocks.spawn(p.pos.clone().setY(0.1), 0xffe8a0, 7, 0.9);
+    this.glowBurst(p.pos.clone().setY(1), 40, 0.2, new THREE.Color(2, 1.7, 0.8), 4);
+    this.whiteFlash = 0.5;
+    for (const e of this.enemies) {
+      if (!this.alive(e)) continue;
+      const d = new THREE.Vector3().subVectors(e.pos, p.pos).setY(0).normalize();
+      e.vel.addScaledVector(d, 12);
+      if (e.state !== 'broken') {
+        this.interruptEnemy(e);
+        e.state = 'recoil';
+        e.stateT = 0;
+        e.stateDur = 1.2;
+      }
+    }
+    this.onEvent({ type: 'resurrect', text: '復活' });
+  }
+
+  /* ================= enemy attacks player ================= */
+  private startEnemyAttack(e: Enemy, name: EnemyAttackName | RangedAttackName) {
+    e.aim = e.yaw;
+    e.fireIdx = 0;
+    e.anim =
+      name === 'shoot' || name === 'volley'
+        ? rangedAttack(name, e.kind === 'archer' ? 'bow' : 'gun')
+        : enemyAttack(name, e.boss);
+    e.state = 'attack';
+    e.t = 0;
+    e.stateT = 0;
+    e.hitIdx = 0;
+    e.swingIdx = 0;
+    e.warned = false;
+    e.lungeD = [];
+    e.lastAttack = name;
+    e.defense = null;
+  }
+
+  private chooseAttack(e: Enemy): EnemyAttackName {
+    const r = Math.random();
+    let n: EnemyAttackName;
+    // longer strings, more unblockables — soldiers now reach for combo3 and sweeps too
+    if (!e.boss) n = r < 0.26 ? 'slash' : r < 0.58 ? 'combo2' : r < 0.78 ? 'combo3' : r < 0.92 ? 'thrust' : 'sweep';
+    else if (!e.phase2) n = r < 0.16 ? 'slash' : r < 0.52 ? 'combo3' : r < 0.74 ? 'combo4' : r < 0.88 ? 'thrust' : 'sweep';
+    else n = r < 0.08 ? 'combo3' : r < 0.5 ? 'combo4' : r < 0.74 ? 'thrust' : 'sweep';
+    if ((n === 'thrust' || n === 'sweep') && e.lastAttack === n) n = e.boss ? 'combo3' : 'slash';
+    return n;
+  }
+
+  private resolveEnemyHit(e: Enemy, h: HitDef, isLast: boolean) {
+    const p = this.player;
+    if (p.state === 'dead' || p.state === 'deathblow') return;
+    const dx = p.pos.x - e.pos.x;
+    const dz = p.pos.z - e.pos.z;
+    const d = Math.hypot(dx, dz);
+    // HASHA sweeps a 25 m blade, but the hit box is kept to a readable arc you can actually dodge
+    if (d > (e.kind === 'bladehead' ? h.reach * 2.6 : h.reach * e.scale) + 0.3 * this.sizeK) return;
+    if (Math.abs(angDiff(e.aim, Math.atan2(dx, dz))) > (h.arc / 2) * (Math.PI / 180)) return;
+
+    // dodge i-frames (a Flying Swallow dive is untouchable too)
+    if (p.inv > 0 || p.state === 'dive' || (p.state === 'dodge' && p.t > 0.03 && p.t < 0.34)) {
+      this.sfx.whoosh();
+      return;
+    }
+    // airborne vs sweep
+    if (h.kind === 'sweep' && p.pos.y > 0.3) {
+      if (this.time - p.jumpStart < 0.6) this.doStomp(e);
+      else this.sfx.whoosh();
+      return;
+    }
+    const impact = p.pos.clone().setY(1.25);
+    const dirToP = new THREE.Vector3(dx, 0, dz).normalize();
+
+    if (h.kind === 'slash' && p.state === 'idle' && this.guardHeld) {
+      const dirE = fwd(p.yaw);
+      const contact = p.pos.clone().addScaledVector(dirE, 0.85).setY(1.35);
+      if (p.guardT <= DEFLECT_WINDOW) {
+        this.doDeflect(e, contact, dirToP, isLast);
+      } else {
+        // normal block
+        this.sfx.block();
+        this.sparkBurst(contact, dirToP.clone().setY(0.3), 30, 6.5, 1.0, new THREE.Color(2.2, 1.1, 0.4), 0.4);
+        this.flashAt(contact, 0xffb060, 10);
+        this.hitstop(0.06);
+        this.shake(0.3);
+        p.vel.addScaledVector(dirToP, 6.5);
+        p.react = 0.7;
+        p.reactPose = p.kickSide > 0 ? P.kickA : P.kickB;
+        p.kickSide *= -1;
+        p.hp = Math.max(1, p.hp - h.dmg * 0.1);
+        this.streak = 0;
+        this.addPlayerPosture(h.post * 1.4);
+      }
+      return;
+    }
+
+    // clean hit on player
+    const broken = p.state === 'broken';
+    const dmg = h.dmg * (broken ? 1.5 : 1);
+    p.hp -= dmg;
+    this.streak = 0;
+    this.sfx.hurt();
+    this.bloodBurst(impact, dirToP, 24, 7);
+    this.sparkBurst(impact, dirToP, 10, 5, 1, new THREE.Color(2.4, 0.8, 0.5), 0.3);
+    this.hitstop(h.heavy ? 0.14 : 0.09);
+    this.shake(h.heavy ? 0.9 : 0.6);
+    this.hurtFx = 0.9;
+    this.aberr = 0.015;
+    p.flash = 1;
+    p.vel.addScaledVector(dirToP, h.heavy ? 8 : 5);
+    p.anim = null;
+    p.trailOn = false;
+    if (p.hp <= 0) {
+      p.hp = 0;
+      this.killPlayer();
+      return;
+    }
+    if (!broken) {
+      p.state = 'hurt';
+      p.t = 0;
+    }
+    this.addPlayerPosture(h.post * 0.7);
+  }
+
+  private doDeflect(e: Enemy, contact: THREE.Vector3, dirToP: THREE.Vector3, isLast: boolean) {
+    const p = this.player;
+    this.streak++;
+    this.streakT = 0;
+    this.stats.deflects++;
+    const away = dirToP.clone().multiplyScalar(-1);
+    this.sfx.deflect(this.streak);
+    this.sparkBurst(contact, away.clone().multiplyScalar(0.4).setY(0.5), 110, 10, 1.2, new THREE.Color(3.2, 2.6, 1.4), 0.7);
+    this.sparkBurst(contact, dirToP.clone().multiplyScalar(0.4).setY(0.5), 40, 7, 1.0, new THREE.Color(3, 3, 3.4), 0.5);
+    this.glowBurst(contact, 16, 0.22, new THREE.Color(2.4, 1.9, 1.0), 3.5);
+    this.shocks.spawn(contact, 0xfff0c0, 3.0, 0.4);
+    this.shocks.spawn(contact, 0xffffff, 1.6, 0.22);
+    this.flashAt(contact, 0xffe8b0, 38);
+    this.hitstop(0.11);
+    this.shake(0.5);
+    this.aberr = 0.016;
+    this.whiteFlash = 0.22;
+    this.fovPunch = 4;
+    p.glow = 1;
+    p.react = 1;
+    p.reactPose = p.kickSide > 0 ? P.kickA : P.kickB;
+    p.kickSide *= -1;
+    p.vel.addScaledVector(dirToP, 3.2);
+    e.vel.addScaledVector(away, 3.0);
+    e.react = 0.7;
+    e.reactPose = P.deflected;
+    e.glow = 0.6;
+    this.addPlayerPosture(5);
+    this.addEnemyPosture(e, e.boss ? 27 : 40);
+    this.onEvent({ type: 'deflect', n: this.streak });
+    if (isLast && e.state === 'attack') {
+      this.interruptEnemy(e);
+      e.state = 'recoil';
+      e.stateT = 0;
+      e.stateDur = 0.7;
+    }
+  }
+
+  private doStomp(e: Enemy) {
+    const p = this.player;
+    this.interruptEnemy(e);
+    e.state = 'stagger';
+    e.stateT = 0;
+    e.stateDur = 1.1;
+    const pt = e.pos.clone().setY(2.0 * e.scale);
+    this.sfx.mikiri();
+    this.sparkBurst(pt, new THREE.Vector3(0, -0.2, 0), 60, 8, 1.2, new THREE.Color(3, 2.2, 1.0));
+    this.shocks.spawn(pt, 0xffd890, 3.2, 0.45);
+    this.flashAt(pt, 0xffd9a0, 28);
+    this.hitstop(0.13);
+    this.slowmo(0.35, 0.3);
+    this.shake(0.6);
+    this.aberr = 0.018;
+    const away = new THREE.Vector3().subVectors(p.pos, e.pos).setY(0).normalize();
+    p.vy = 8.5;
+    p.vel.copy(away).multiplyScalar(5);
+    p.jumpStart = -9;
+    this.stats.mikiri++;
+    this.addEnemyPosture(e, e.boss ? 52 : 80);
+    this.onEvent({ type: 'stomp', text: '踏み付け' });
+  }
+
+  private killPlayer() {
+    const p = this.player;
+    p.state = 'dead';
+    p.t = 0;
+    this.deadT = 0;
+    this.sfx.die();
+    this.slowmo(1.2, 0.25);
+    this.onEvent({ type: 'playerDeath', text: '死' });
+  }
+
+  /* ================= enemies ================= */
+  private updateEnemy(e: Enemy, dt: number) {
+    const p = this.player;
+    e.stateT += dt;
+    e.postureT += dt;
+    e.flash = Math.max(0, e.flash - dt * 6);
+    e.react = Math.max(0, e.react - dt * 5);
+    e.glow = Math.max(0, e.glow - dt * 2);
+    if (e.defense && this.time > e.defenseUntil) e.defense = null;
+    e.evadeCD = Math.max(0, e.evadeCD - dt);
+    e.parryCD = Math.max(0, e.parryCD - dt);
+    // the colossus only ever does one thing: raise the head-blade and bring it down like an axe
+    if (e.kind === 'bladehead') {
+      if (e.slamT > 0 || e.state === 'attack' || e.stuck > 0) {
+        this.slamTick(e, dt);
+        // Hips crouch down and torso pitches forward so the colossal frame stoops to the earth
+        const crouch = clamp((e.slamPitch + 0.6) / 2.65, 0, 1);
+        e.rig.hips.position.y = 1.52 - crouch * 0.42;
+        e.rig.torso.rotation.x = crouch * 0.45;
+        e.rig.head.rotation.set(e.slamPitch, 0, 0);
+        e.rig.root.position.copy(e.pos);
+        e.rig.root.rotation.y = e.yaw;
+        e.rig.update(dt);
+        e.look = null;
+        return;
+      }
+      if (e.attackTimer <= 0 && this.player.state !== 'dead' && this.alive(e)) {
+        this.startSlam(e);
+        return;
+      }
+    }
+    const T = e.target;
+    let rate = 12;
+    const toP = this.tmpV.set(p.pos.x - e.pos.x, 0, p.pos.z - e.pos.z);
+    const dist = toP.length();
+    const wantYaw = Math.atan2(toP.x, toP.z);
+    let speed = 0;
+
+    if (e.state !== 'broken' && e.state !== 'dying' && e.state !== 'dead' && e.state !== 'spawn' && e.postureT > 1.6) {
+      e.posture = Math.max(0, e.posture - 16 * (0.5 + 0.5 * (e.hp / e.hpMax)) * dt);
+    }
+
+    switch (e.state) {
+      case 'spawn': {
+        copyPose(T, P.idleE);
+        e.pose = clonePose(P.idleE);
+        e.look = p.pos;
+        if (e.stateT > 1.2) {
+          e.state = 'idle';
+          e.stateT = 0;
+        }
+        break;
+      }
+      case 'idle': {
+        e.yaw = turnToward(e.yaw, wantYaw, (e.boss ? 8 : 6) * dt);
+        e.circleT -= dt;
+        if (e.circleT <= 0) {
+          e.circleDir = Math.random() < 0.5 ? 1 : -1;
+          e.circleT = rand(1.4, 3.5);
+        }
+        const ranged = e.kind === 'archer' || e.kind === 'gunner';
+        // ranged enemies never block the melee queue — they snipe independently
+        // two blades may press you at once now (three used to take turns politely)
+        const busy =
+          !ranged &&
+          this.enemies.filter((o) => o !== e && o.state === 'attack' && o.kind !== 'archer' && o.kind !== 'gunner').length >= 2;
+        let fwdS = 0;
+        let side = 0;
+        // HASHA covers ground in huge, slow strides — few steps, but each one eats metres
+        const approach = e.kind === 'bladehead' ? 6.4 : (e.boss ? 4.4 : 3.7) * (0.45 + 0.55 * this.sizeK);
+        if (ranged) {
+          // keep a firing distance: back off fast when rushed, close in when too far, always sidestep
+          const lo = e.kind === 'archer' ? 8 : 6.5;
+          const hi = e.kind === 'archer' ? 13 : 10.5;
+          if (dist < lo - 1.5) fwdS = -4.2;
+          else if (dist < lo) fwdS = -2;
+          else if (dist > hi) fwdS = 3.6;
+          side = e.circleDir * (dist < lo + 2 ? 2.4 : 1.5);
+        } else if (busy) {
+          if (dist < 4.5) fwdS = -1.8;
+          else if (dist > 6) fwdS = approach * 0.6;
+          side = e.circleDir * 1.2;
+        } else if (dist > 3.4) {
+          fwdS = approach;
+          side = e.circleDir * 0.5;
+        } else if (dist < 1.9) {
+          fwdS = -1.6;
+          side = e.circleDir * 1.0;
+        } else {
+          side = e.circleDir * 1.3;
+        }
+        const f = fwd(e.yaw);
+        const r = new THREE.Vector3(-f.z, 0, f.x).multiplyScalar(-1);
+        const mv = f.multiplyScalar(fwdS).add(r.multiplyScalar(side));
+        e.pos.x += mv.x * dt;
+        e.pos.z += mv.z * dt;
+        speed = mv.length();
+        const guard = !ranged && e.defense && this.time < e.defenseUntil;
+        copyPose(T, ranged ? (e.kind === 'archer' ? IDLE_BOW : IDLE_GUN) : guard ? P.guard : P.idleE);
+        e.look = p.pos;
+        this.walkOverlay(T, e, speed, dt, 4.0, mv.x, mv.z, !guard && !ranged);
+        rate = guard ? 24 : 10;
+        e.attackTimer -= dt;
+        const playerAlive = p.state !== 'dead' && p.state !== 'deathblow';
+        if (ranged) {
+          if (e.attackTimer <= 0 && !e.disarmed && dist > 2.5 && dist < 18 && playerAlive && this.alive(e)) {
+            this.startEnemyAttack(e, e.kind === 'archer' && Math.random() < 0.38 ? 'volley' : 'shoot');
+          }
+        } else if (
+          e.attackTimer <= 0 &&
+          !e.disarmed &&
+          !busy &&
+          dist < (e.kind === 'bladehead' ? 26 : 4.3) &&
+          playerAlive &&
+          this.alive(e)
+        ) {
+          if (e.kind === 'bladehead') {
+            this.startSlam(e);
+          } else {
+            this.startEnemyAttack(e, this.chooseAttack(e));
+          }
+        }
+        break;
+      }
+      case 'attack': {
+        if (e.kind === 'bladehead') {
+          this.slamTick(e, dt);
+          e.rig.head.rotation.set(e.slamPitch, 0, 0);
+          e.rig.root.position.copy(e.pos);
+          e.rig.root.rotation.y = e.yaw;
+          e.rig.update(dt);
+          e.look = null;
+          break;
+        }
+        const a = e.anim;
+        if (!a) {
+          e.state = 'idle';
+          break;
+        }
+        const prev = e.t;
+        e.t += dt * e.speedMul;
+        // perilous warning
+        if (a.warn && !e.warned && e.t >= a.warn.t) {
+          e.warned = true;
+          e.rig.bladeMat.emissive.setHex(0xff2010);
+          e.perilId = ++this.perilCounter;
+          this.sfx.perilous();
+          this.shake(0.22);
+          e.glow = 1;
+          this.flashAt(e.pos.clone().setY(2 * e.scale), 0xff2010, 18);
+        }
+        if (a.warn && e.warned && e.hitIdx === 0) e.glow = 0.9 + Math.sin(this.time * 30) * 0.1;
+        // swing sound
+        if (e.swingIdx < a.hits.length && e.t >= a.hits[e.swingIdx].t - 0.1) {
+          this.sfx.swing(!!a.hits[e.swingIdx].heavy);
+          e.swingIdx++;
+        }
+        // track the player hard during the first wind-up, then gently re-aim between the hits of a combo
+        const inStrike = a.hits.some((h) => Math.abs(e.t - h.t) < 0.14) || !!a.spins?.some((s) => e.t > s.t0 - 0.05 && e.t < s.t1 + 0.1);
+        if (e.t < a.trackUntil) e.aim = turnToward(e.aim, wantYaw, (e.boss ? 6 : 5) * dt);
+        else if (a.name.startsWith('combo') && !inStrike && e.t < a.dur - 0.5) e.aim = turnToward(e.aim, wantYaw, 2.6 * dt * e.speedMul);
+        let eSpin = 0;
+        if (a.spins) {
+          for (const s of a.spins) {
+            const u = clamp((e.t - s.t0) / (s.t1 - s.t0), 0, 1);
+            eSpin += s.turns * Math.PI * 2 * (u * u * (3 - 2 * u));
+          }
+        }
+        e.yaw = e.aim + eSpin;
+        // lunge
+        a.lunge.forEach((l, i) => {
+          const a0 = Math.max(prev, l.t0);
+          const a1 = Math.min(e.t, l.t1);
+          if (a1 > a0) {
+            if (e.lungeD[i] === undefined) e.lungeD[i] = clamp(dist - 1.6, 0, l.dist);
+            const move = (e.lungeD[i] * (a1 - a0)) / (l.t1 - l.t0);
+            e.pos.addScaledVector(fwd(e.aim), move);
+          }
+        });
+        while (e.hitIdx < a.hits.length && e.t >= a.hits[e.hitIdx].t) {
+          const h = a.hits[e.hitIdx];
+          const last = e.hitIdx === a.hits.length - 1;
+          e.hitIdx++;
+          this.resolveEnemyHit(e, h, last);
+          if (e.state !== 'attack') break;
+        }
+        if (e.state !== 'attack') break;
+        e.trailOn = a.trail.some(([s, en]) => e.t >= s && e.t <= en);
+        sampleFrames(a.frames, e.t, T);
+        applyArcs(a, e.t, T);
+        if (a.fire) this.rangedTick(e, a);
+        rate = 36;
+        if (e.t >= a.dur) {
+          e.state = 'idle';
+          e.stateT = 0;
+          e.anim = null;
+          e.trailOn = false;
+          e.settle = 0.3;
+          e.attackTimer = e.boss
+            ? rand(e.phase2 ? 0.18 : 0.32, e.phase2 ? 0.5 : 0.8)
+            : e.kind === 'archer' || e.kind === 'gunner'
+              ? rand(0.8, 1.7)
+              : rand(0.35, 0.95);
+        }
+        break;
+      }
+      case 'flinch': {
+        copyPose(T, P.hurt);
+        rate = 30;
+        e.trailOn = false;
+        if (e.stateT > e.stateDur) {
+          e.state = 'idle';
+          e.stateT = 0;
+          e.attackTimer = Math.min(e.attackTimer, rand(0.3, 0.9));
+        }
+        break;
+      }
+      case 'recoil': {
+        copyPose(T, P.deflected);
+        rate = 24;
+        if (e.stateT > e.stateDur) {
+          e.state = 'idle';
+          e.stateT = 0;
+          e.attackTimer = rand(0.2, 0.6);
+        }
+        break;
+      }
+      case 'evade': {
+        // slide out of the blade's path — untouchable for most of it, then straight back into stance (often countering)
+        const u = clamp(e.stateT / e.stateDur, 0, 1);
+        const sp = (1 - u) * (e.evadeSide === 0 ? 11 : 13);
+        e.pos.addScaledVector(e.evadeDir, sp * dt);
+        if (e.evadeSide === 0) e.pos.y = 0.22 * Math.sin(Math.PI * u);
+        copyPose(T, e.evadeSide === 0 ? EVADE_BACK : EVADE_SIDE);
+        if (e.evadeSide < 0) {
+          T.torsoZ = -T.torsoZ;
+          T.hipZ = -T.hipZ;
+          T.torsoY = -T.torsoY;
+          T.headY = -T.headY;
+        }
+        rate = 30;
+        e.look = p.pos;
+        e.yaw = turnToward(e.yaw, wantYaw, 9 * dt);
+        e.aim = e.yaw;
+        if (u > 0.25 && Math.random() < 0.4) this.dustBurst(this.tmpV2.set(e.pos.x, 0.06, e.pos.z), 1, 1.4);
+        if (e.stateT > e.stateDur) {
+          e.pos.y = 0;
+          e.state = 'idle';
+          e.stateT = 0;
+          e.attackTimer = Math.min(e.attackTimer, e.punish > 0 ? e.punish : rand(0.4, 0.9));
+          e.punish = 0;
+        }
+        break;
+      }
+      case 'parry': {
+        // blade thrown up to catch the strike, then an instant riposte
+        copyPose(T, PARRY_POSE);
+        rate = 38;
+        e.look = p.pos;
+        e.yaw = turnToward(e.yaw, wantYaw, 12 * dt);
+        e.aim = e.yaw;
+        e.vel.multiplyScalar(Math.exp(-9 * dt));
+        if (e.stateT > e.stateDur) {
+          e.state = 'idle';
+          e.stateT = 0;
+          e.attackTimer = e.punish > 0 ? e.punish : rand(0.25, 0.5);
+          e.punish = 0;
+        }
+        break;
+      }
+      case 'impaled': {
+        // run through: hanging on the steel, head down, feet barely touching the ground
+        copyPose(T, IMPALED_POSE);
+        T.torsoZ += Math.sin(this.time * 9) * 0.05;
+        rate = 22;
+        e.look = null;
+        e.trailOn = false;
+        e.vel.set(0, 0, 0);
+        e.pos.y = 0.14;
+        if (e.stateT > 2.2) {
+          // the player's animation was cut short somehow — let him slide off
+          e.pos.y = 0;
+          e.state = 'kicked';
+          e.stateT = 0;
+          e.stateDur = 0.8;
+        }
+        break;
+      }
+      case 'tumble': {
+        // blasted off the blade: spins backwards, hits the ground, rolls, then drags himself up
+        copyPose(T, e.stateT < 0.75 ? TUMBLE_POSE : P.broken);
+        rate = e.stateT < 0.75 ? 20 : 10;
+        e.look = null;
+        e.trailOn = false;
+        const air = e.pos.y > 0.02 || e.stateT < 0.42;
+        if (air) {
+          e.vel.y = e.vel.y === 0 && e.stateT < 0.02 ? 5.2 : e.vel.y - 17 * dt;
+          e.pos.y = Math.max(0, e.pos.y + e.vel.y * dt);
+          e.tumbleA += e.tumbleV * dt;
+          if (e.pos.y <= 0 && e.vel.y < 0) {
+            // impact with the gravel
+            e.vel.y = 0;
+            e.vel.x *= 0.35;
+            e.vel.z *= 0.35;
+            this.dustBurst(e.pos.clone().setY(0.08), 16, 3);
+            this.sfx.land(0.9);
+            this.shake(0.3);
+            this.bloodBurst(e.pos.clone().setY(0.4), this.tmpV.set(0, 1, 0), 18, 4);
+          }
+        } else {
+          e.vel.multiplyScalar(Math.exp(-5 * dt));
+          // settle flat on his back, then roll upright again
+          const want = e.stateT > e.stateDur - 0.55 ? 0 : -Math.PI / 2;
+          e.tumbleA += (want - e.tumbleA) * (1 - Math.exp(-7 * dt));
+        }
+        e.rig.root.rotation.x = e.tumbleA;
+        if (e.stateT > e.stateDur) {
+          e.pos.y = 0;
+          e.tumbleA = 0;
+          e.state = 'idle';
+          e.stateT = 0;
+          e.attackTimer = rand(0.5, 1.1);
+        }
+        break;
+      }
+      case 'kicked': {
+        copyPose(T, P.kicked);
+        rate = 26;
+        e.trailOn = false;
+        // skid trail while flying back
+        if (e.vel.length() > 5) this.dustBurst(this.tmpV2.set(e.pos.x, 0.1, e.pos.z), 1, 1.6);
+        if (e.stateT > e.stateDur) {
+          e.state = 'idle';
+          e.stateT = 0;
+          e.attackTimer = rand(0.4, 0.9);
+        }
+        break;
+      }
+      case 'stagger': {
+        copyPose(T, P.stagger);
+        rate = 20;
+        if (e.stateT > e.stateDur) {
+          e.state = 'idle';
+          e.stateT = 0;
+          e.attackTimer = rand(0.5, 1.0);
+        }
+        break;
+      }
+      case 'broken': {
+        copyPose(T, P.broken);
+        T.torsoZ += Math.sin(this.time * 3 + e.id) * 0.08;
+        rate = 9;
+        e.yaw = turnToward(e.yaw, wantYaw, 3 * dt);
+        if (e.stateT > e.brokenDur && this.player.dbTarget !== e) {
+          e.state = 'idle';
+          e.stateT = 0;
+          e.posture = this.eEffMax(e) * 0.25;
+          if (e.lethal) {
+            e.lethal = false;
+            e.hp = e.hpMax * 0.3;
+          }
+          e.attackTimer = 0.8;
+        }
+        break;
+      }
+      case 'dying':
+      case 'dead': {
+        copyPose(T, e.stateT < 0.55 ? P.broken : P.dead);
+        T.headX = e.stateT < 0.55 ? 0.5 : 0.1;
+        e.look = null;
+        rate = e.stateT < 0.55 ? 14 : 7;
+        const f = clamp((e.stateT - 0.45) / (e.boss ? 1.3 : 0.9), 0, 1);
+        const ee = f * f * (3 - 2 * f);
+        e.rig.root.rotation.x = 1.5 * ee;
+        e.trailOn = false;
+        break;
+      }
+    }
+    if (e.state !== 'dying' && e.state !== 'dead' && e.state !== 'tumble') e.rig.root.rotation.x = 0;
+    if (e.state !== 'attack') {
+      e.aiming = false;
+      if (e.kind === 'archer' || e.kind === 'gunner') e.rig.setDraw(0, false);
+    }
+    // blood keeps spurting from every severed stump for a few seconds
+    if (e.bleedT > 0 && e.stumps.length && this.alive(e)) {
+      e.bleedT -= dt;
+      for (const s of e.stumps) {
+        if (Math.random() < 0.75) {
+          s.getWorldPosition(this.tmpV2);
+          this.bloodBurst(this.tmpV2, this.tmpV.set(Math.random() - 0.5, 0.5, Math.random() - 0.5), 1, 2.2 + Math.random() * 2.6);
+        }
+      }
+    }
+    this.updateAimLine(e);
+
+    // knockback
+    if (e.state !== 'idle') {
+      // idle handles its own motion; others use vel
+    }
+    e.pos.x += e.vel.x * dt;
+    e.pos.z += e.vel.z * dt;
+    e.vel.multiplyScalar(Math.exp(-7 * dt));
+    e.pos.y = 0;
+
+    e.gaitOn = e.state === 'idle';
+    if (e.state !== 'idle') e.locoCarry = false;
+    e.sig = e.state;
+    e.soft = e.state === 'idle' || e.state === 'spawn';
+    this.finishPose(e, rate, dt);
+    if (e.state === 'dying' || e.state === 'dead') {
+      e.rig.root.position.y = 0.12 * e.scale * clamp(e.stateT / 0.9, 0, 1);
+    }
+    if (e.state === 'dead' && this.time > e.removeAt + 1.5) {
+      e.rig.root.position.y -= (this.time - e.removeAt - 1.5) * 0.4;
+    }
+    if (e.state === 'spawn') {
+      const k = clamp(e.stateT / 1.0, 0, 1);
+      e.rig.root.scale.setScalar(e.scale * (0.6 + 0.4 * k));
+      e.rig.root.visible = true;
+    } else if (e.rig.root.scale.x !== e.scale) {
+      e.rig.root.scale.setScalar(e.scale);
+    }
+  }
+
+  /* ================= HUD snapshot ================= */
+  private project(v: THREE.Vector3) {
+    const p = v.clone().project(this.camera);
+    const w = this.container.clientWidth || window.innerWidth;
+    const h = this.container.clientHeight || window.innerHeight;
+    return {
+      x: (p.x * 0.5 + 0.5) * w,
+      y: (-p.y * 0.5 + 0.5) * h,
+      on: p.z < 1 && p.x > -1.1 && p.x < 1.1 && p.y > -1.1 && p.y < 1.1,
+    };
+  }
+
+  getSnapshot(): Snapshot {
+    const p = this.player;
+    const focus = (this.lockOn ? this.lockTarget : null) ?? this.nearestEnemy();
+    const enemies: EnemyView[] = this.enemies
+      .filter((e) => e.state !== 'dead')
+      .map((e) => {
+        const s = this.project(e.pos.clone().setY(2.35 * e.scale));
+        return {
+          id: e.id,
+          name: e.name,
+          hp: clamp(e.hp / e.hpMax, 0, 1),
+          posture: clamp(e.posture / this.eEffMax(e), 0, 1),
+          broken: e.state === 'broken',
+          lethal: e.lethal,
+          pips: e.pips,
+          maxPips: e.maxPips,
+          x: s.x,
+          y: s.y,
+          onScreen: s.on,
+          focus: e === focus,
+          boss: e.boss,
+          kind: e.kind,
+          aiming: e.aiming,
+          ang: Math.atan2(
+            (e.pos.x - p.pos.x) * -Math.cos(this.camYaw) + (e.pos.z - p.pos.z) * Math.sin(this.camYaw),
+            (e.pos.x - p.pos.x) * Math.sin(this.camYaw) + (e.pos.z - p.pos.z) * Math.cos(this.camYaw),
+          ),
+        };
+      });
+    let lock: Snapshot['lock'] = null;
+    if (this.lockOn && this.lockTarget && this.alive(this.lockTarget)) {
+      const s = this.project(this.lockTarget.pos.clone().setY(1.25 * this.lockTarget.scale));
+      if (s.on) lock = { x: s.x, y: s.y };
+    }
+    let perilous: Snapshot['perilous'] = null;
+    for (const e of this.enemies) {
+      if (e.kind === 'bladehead' && (e.slamT > 0 || e.state === 'attack') && e.slamT < 2.2 && e.warned) {
+        const s = this.project(e.pos.clone().setY(2.0 * e.scale));
+        perilous = { x: s.x, y: s.y, kind: 'sweep', id: e.perilId };
+      } else if (e.state === 'attack' && e.anim && e.anim.warn && e.warned && e.hitIdx === 0) {
+        const s = this.project(e.pos.clone().setY(2.0 * e.scale));
+        perilous = { x: s.x, y: s.y, kind: e.anim.warn.kind, id: e.perilId };
+      }
+    }
+    const hasStuckBoss = this.enemies.some((e) => e.kind === 'bladehead' && e.stuck > 0 && this.alive(e));
+    let prompt = '';
+    if (p.state === 'climb') {
+      prompt =
+        p.climbT > 0.68
+          ? '斬 · Klik Kiri = Hantam Inti Reaktor! · C / Spasi = Turun'
+          : '登 · W / Shift = Panjat Naik · S = Turun · C / Spasi = Turun';
+    } else if (p.state !== 'dead' && hasStuckBoss) {
+      prompt = '⚡ KEPALA BILAH MENANCAP KE TANAH! Dekati / Lompat ke bilah untuk memanjat bos!';
+    } else if (p.state !== 'dead' && !this.rage.on && this.findDeathblowTarget() && p.state !== 'deathblow') prompt = '忍殺 · Klik kiri / J untuk Deathblow';
+    else if (
+      this.rage.on &&
+      !this.rage.aiming &&
+      p.state !== 'dead' &&
+      (this.rage.keepAlive || this.enemies.some((e) => this.alive(e) && e.hp <= e.hpMax * 0.25))
+    ) {
+      prompt = '斬 · Klik kanan / F = tebasan terakhir (akhiri slow-mo)';
+    }
+    return {
+      hp: clamp(p.hp / p.hpMax, 0, 1),
+      hpMax: p.hpMax,
+      posture: clamp(p.posture / this.pEffMax(), 0, 1),
+      postureBroken: p.state === 'broken',
+      gourds: p.gourds,
+      resurrect: p.resurrect,
+      enemies,
+      lock,
+      perilous,
+      prompt,
+      stageName: this.stage >= 0 && this.stage < STAGES.length ? STAGES[this.stage].name : '',
+      stage: this.stage,
+      stats: { ...this.stats },
+      streak: this.streak,
+      dead: p.state === 'dead',
+      canRevive: p.state === 'dead' && p.resurrect > 0 && this.deadT > 1.2,
+      lockOn: this.lockOn,
+      rage: this.rageSnapshot(),
+      theme: this.theme,
+      cine: this.cineW,
+      style: { rank: this.styleRank(), pct: this.styleScore / 100, score: this.styleScore },
+      climbing: p.state === 'climb',
+      climbT: p.climbT,
+      bossBladeStuck: hasStuckBoss,
+    };
+  }
+
+  revivePlayer() {
+    this.revive();
+  }
+}
