@@ -125,7 +125,7 @@ export function sampleFrames(frames: Keyframe[], t: number, out: Pose) {
 /* ------------------------------------------------------------------ *
  *  RIG
  * ------------------------------------------------------------------ */
-export type RigKind = 'player' | 'soldier' | 'boss' | 'bladehead';
+export type RigKind = 'player' | 'soldier' | 'boss';
 export interface RigOpts {
   kind: RigKind;
   /** machine body: brushed metal "skin", glowing optic, exposed cabling */
@@ -411,6 +411,10 @@ function solveArm(a: Arm, T: THREE.Vector3, side: number, w: number) {
  * ------------------------------------------------------------------ */
 export function createHumanoid(o: RigOpts): Rig {
   const kind = o.kind;
+  const isP = kind === 'player';
+  const isB = kind === 'boss';
+  const bot = !!o.robot;
+  const robotSoldier = bot && !isB;
   const root = new THREE.Group();
   const flashMats: THREE.MeshStandardMaterial[] = [];
   const chains: Chain[] = [];
@@ -437,9 +441,10 @@ export function createHumanoid(o: RigOpts): Rig {
   ) => {
     const m = new THREE.Mesh(geo, mat);
     m.position.set(x, y, z);
-    m.castShadow = true;
+    m.castShadow = !robotSoldier || ol;
     parent.add(m);
-    if (ol) m.add(new THREE.Mesh(outlineGeo(geo), outlineMat));
+    // Metallic troops read more cleanly without a separate inverted-hull draw call on every armor segment.
+    if (ol && !robotSoldier) m.add(new THREE.Mesh(outlineGeo(geo), outlineMat));
     return m;
   };
   const grp = (parent: THREE.Object3D, x = 0, y = 0, z = 0) => {
@@ -544,244 +549,37 @@ export function createHumanoid(o: RigOpts): Rig {
   };
 
   /* ---------- materials ---------- */
-  const isP = kind === 'player';
-  const isB = kind === 'boss' || kind === 'bladehead';
-  const isBH = kind === 'bladehead';
-  const cloth = M(o.cloth, 0.88, 0.02, undefined, true);
-  const cloth2 = M(o.cloth2, 0.82, 0.04, undefined, true);
+  const cloth = M(robotSoldier ? 0x1c252f : o.cloth, robotSoldier ? 0.54 : 0.88, robotSoldier ? 0.48 : 0.02, undefined, !robotSoldier);
+  const cloth2 = M(robotSoldier ? 0x26313d : o.cloth2, robotSoldier ? 0.48 : 0.82, robotSoldier ? 0.56 : 0.04, undefined, !robotSoldier);
   const clothDS = M(o.cloth2, 0.85, 0.02, THREE.DoubleSide, true);
-  const bot = !!o.robot;
-  // machines have brushed-metal limbs instead of skin
+  // Ordinary troops expose brushed-metal joints and hard plates instead of fabric-covered samurai silhouettes.
   const skin = bot ? M(o.skin, 0.34, 0.85) : M(o.skin, 0.62, 0);
   const accent = M(o.accent, 0.55, 0.12, undefined, true);
   const accentDS = M(o.accent, 0.6, 0.05, THREE.DoubleSide, true);
   const dark = M(0x15131a, 0.8, 0.1);
-  const leather = M(0x3a281e, 0.7, 0.08);
-  const metal = M(isB ? 0x2e2f38 : 0x555966, 0.32, 0.85);
+  const leather = robotSoldier ? M(0x394552, 0.36, 0.78) : M(0x3a281e, 0.7, 0.08);
+  const metal = M(isB ? 0x2e2f38 : bot ? 0x657382 : 0x555966, 0.32, 0.85);
   const gold = M(0xc9a24a, 0.3, 0.9);
-  const inner = M(isP ? 0xb8b5c6 : isB ? 0x2a2024 : 0xcdbf9c, 0.9, 0, undefined, true);
-  const wrapMat = M(isP ? 0x3a3f58 : isB ? 0x2a2024 : 0x6d5a40, 0.9, 0, undefined, true);
-  const obiMat = M(isP ? 0x2a2832 : isB ? 0x8c6a1e : o.accent, 0.7, 0.1, undefined, true);
-  const laquer = M(isB ? 0x16141c : 0x2a2124, 0.32, 0.5);
+  const inner = M(robotSoldier ? 0x18212b : isP ? 0xb8b5c6 : isB ? 0x2a2024 : 0xcdbf9c, robotSoldier ? 0.58 : 0.9, robotSoldier ? 0.62 : 0, undefined, !robotSoldier);
+  const wrapMat = M(robotSoldier ? 0x293541 : isP ? 0x3a3f58 : isB ? 0x2a2024 : 0x6d5a40, robotSoldier ? 0.44 : 0.9, robotSoldier ? 0.72 : 0, undefined, !robotSoldier);
+  const obiMat = M(robotSoldier ? 0x26313d : isP ? 0x2a2832 : isB ? 0x8c6a1e : o.accent, robotSoldier ? 0.38 : 0.7, robotSoldier ? 0.76 : 0.1, undefined, !robotSoldier);
+  const laquer = M(isB ? 0x16141c : robotSoldier ? 0x202a36 : 0x2a2124, 0.32, robotSoldier ? 0.74 : 0.5);
   // robot optics burn cyan; humans have dark eyes
   const eyeMat = bot ? new THREE.MeshBasicMaterial({ color: new THREE.Color(0.35, 3.4, 4.2) }) : M(0x0a0608, 0.4, 0);
   const wireMat = M(0x101420, 0.6, 0.4);
-  const coreMat = new THREE.MeshBasicMaterial({ color: new THREE.Color(0.2, 2.6, 3.6) });
+  const coreMat = new THREE.MeshBasicMaterial({ color: isB ? new THREE.Color(3.8, 0.08, 0.04) : new THREE.Color(0.2, 2.6, 3.6) });
   const hairMat = o.hair !== undefined ? M(o.hair, 0.7, 0.05) : dark;
-
-  /* ================================================================
-   *  BLADE-HEAD: a Raiden-style machine. No head — a single enormous
-   *  blade is bolted where the skull should be. Two digitigrade legs,
-   *  a whipping segmented tail, stubby arms.
-   * ================================================================ */
-  if (isBH) {
-    const frame = M(o.skin, 0.3, 0.9);
-    const plate = M(o.cloth, 0.34, 0.75);
-    const dark2 = M(0x0d0f16, 0.6, 0.5);
-    const neon = new THREE.MeshBasicMaterial({ color: new THREE.Color(o.accent).multiplyScalar(3.2) });
-    const steel = M(0xdfe4ec, 0.16, 0.95);
-
-    const hipsB = grp(root, 0, 1.52, 0);
-    const legRootB = grp(hipsB, 0, 0, 0);
-    const pelvisB = grp(hipsB, 0, 0.04, 0);
-    pelvisB.rotation.order = 'YXZ';
-    // armoured pelvis block
-    add(pelvisB, new THREE.BoxGeometry(0.62, 0.3, 0.42), plate, 0, -0.06, 0);
-    add(pelvisB, new THREE.BoxGeometry(0.66, 0.07, 0.46), dark2, 0, 0.1, 0, false);
-
-    // --- torso: a lean armoured core, reactor burning in the chest ---
-    const torsoB = grp(pelvisB, 0, 0.08, 0);
-    torsoB.rotation.order = 'YXZ';
-    const spine = add(torsoB, new THREE.CylinderGeometry(0.17, 0.24, 0.52, 10), frame, 0, 0.26, 0);
-    spine.scale.z = 0.8;
-    add(torsoB, new THREE.BoxGeometry(0.52, 0.34, 0.34), plate, 0, 0.4, 0.02);
-    add(torsoB, new THREE.CylinderGeometry(0.1, 0.1, 0.05, 16), neon, 0, 0.4, 0.19, false).rotation.x = Math.PI / 2;
-    add(torsoB, new THREE.TorusGeometry(0.13, 0.022, 8, 20), steel, 0, 0.4, 0.185, false);
-    for (const s of [-1, 1]) {
-      const vent = add(torsoB, new THREE.BoxGeometry(0.07, 0.26, 0.1), dark2, s * 0.3, 0.38, -0.08);
-      vent.rotation.z = s * 0.2;
-      add(torsoB, new THREE.BoxGeometry(0.05, 0.2, 0.02), neon, s * 0.3, 0.38, -0.14, false);
-    }
-
-    // --- THE BLADE: a single colossal cleaver where a head should be ---
-    const headB = grp(torsoB, 0, 0.6, 0);
-    headB.rotation.order = 'YXZ';
-    add(headB, new THREE.CylinderGeometry(0.11, 0.15, 0.12, 10), steel, 0, 0.02, 0);
-    const mount = add(headB, new THREE.BoxGeometry(0.3, 0.16, 0.26), plate, 0, 0.13, 0);
-    mount.castShadow = true;
-    // one cyan slit optic set into the mount — the only "face" it has
-    add(headB, new THREE.BoxGeometry(0.2, 0.025, 0.02), neon, 0, 0.14, 0.14, false);
-    {
-      // the blade dwarfs the body it is bolted to — it is the whole silhouette
-      const Lb = 3.8;
-      const w0 = 1.05;
-      const sh = new THREE.Shape();
-      sh.moveTo(w0 * 0.5, 0);
-      sh.lineTo(w0 * 0.55, Lb * 0.42);
-      sh.lineTo(w0 * 0.44, Lb * 0.8);
-      sh.lineTo(0.02, Lb); // point
-      sh.lineTo(-w0 * 0.3, Lb * 0.78);
-      sh.lineTo(-w0 * 0.42, Lb * 0.4);
-      sh.lineTo(-w0 * 0.45, 0);
-      sh.closePath();
-      const g = new THREE.ExtrudeGeometry(sh, { depth: 0.16, bevelEnabled: true, bevelSize: 0.03, bevelThickness: 0.025, bevelSegments: 1 });
-      g.translate(0, 0, -0.08);
-      g.rotateY(-Math.PI / 2);
-      g.translate(0, 0.2, 0);
-      const bl = add(headB, g, steel, 0, 0, 0);
-      bl.castShadow = true;
-      // glowing edge line down the cutting side
-      const eg = new THREE.BoxGeometry(0.03, Lb * 0.9, 0.03);
-      eg.translate(0, Lb * 0.45 + 0.22, w0 * 0.49);
-      add(headB, eg, neon, 0, 0, 0, false);
-      add(headB, new THREE.BoxGeometry(0.22, 0.2, w0 * 1.06), dark2, 0, 0.24, 0, false);
-      // heavy collar bolts holding the slab on
-      for (const s of [-1, 1]) add(headB, new THREE.CylinderGeometry(0.06, 0.06, w0 * 1.1, 8), steel, 0, 0.24, s * 0.1, false).rotation.x = Math.PI / 2;
-    }
-
-    // --- stubby arms, blades for forearms ---
-    const mkArmB = (side: 1 | -1) => {
-      const sh2 = grp(torsoB, side * 0.33, 0.48, 0);
-      sh2.rotation.order = 'XYZ';
-      add(sh2, sph(0.11, 14, 10), frame, 0, 0, 0);
-      const pad = add(sh2, new THREE.BoxGeometry(0.2, 0.16, 0.24), plate, side * 0.05, 0.04, 0);
-      pad.rotation.z = side * -0.3;
-      add(sh2, tube(0.3, 0.075, 0.062, 12), frame);
-      const el2 = grp(sh2, 0, -0.3, 0);
-      add(el2, sph(0.07, 12, 9), frame, 0, 0, 0, false);
-      add(el2, tube(0.3, 0.062, 0.045, 12), frame);
-      add(el2, new THREE.BoxGeometry(0.03, 0.34, 0.1), steel, side * 0.06, -0.16, -0.02);
-      const wr2 = grp(el2, 0, -0.3, 0);
-      add(wr2, sph(0.058, 12, 9), steel, 0, 0, 0);
-      return { sh: sh2, el: el2, wr: wr2 };
-    };
-    const RB = mkArmB(-1);
-    const LB = mkArmB(1);
-
-    // --- digitigrade legs: thigh → reversed shin → long foot ---
-    const mkLegB = (side: 1 | -1) => {
-      const hp2 = grp(legRootB, side * 0.24, -0.08, 0);
-      add(hp2, sph(0.15, 14, 10), frame, 0, 0, 0);
-      add(hp2, limb(0.56, [[0.15, 0], [0.17, 0.2], [0.14, 0.6], [0.1, 1]]), plate);
-      const kn2 = grp(hp2, 0, -0.56, 0);
-      add(kn2, sph(0.11, 12, 9), frame, 0, 0, 0, false);
-      add(kn2, limb(0.54, [[0.11, 0], [0.12, 0.25], [0.08, 0.7], [0.06, 1]]), frame);
-      add(kn2, new THREE.BoxGeometry(0.05, 0.3, 0.14), steel, 0, -0.2, -0.1); // calf fin
-      const ank = grp(kn2, 0, -0.54, 0);
-      add(ank, sph(0.075, 12, 9), frame, 0, 0, 0, false);
-      // long back-swept foot that meets the ground on its toe
-      add(ank, new THREE.BoxGeometry(0.14, 0.09, 0.42), plate, 0, -0.03, 0.12);
-      add(ank, new THREE.ConeGeometry(0.06, 0.2, 6), steel, 0, -0.04, 0.34).rotation.x = Math.PI / 2;
-      add(ank, new THREE.BoxGeometry(0.1, 0.07, 0.16), dark2, 0, -0.03, -0.1, false);
-      add(ank, new THREE.BoxGeometry(0.1, 0.02, 0.3), neon, 0, -0.08, 0.1, false);
-      return { hp: hp2, kn: kn2, foot: ank };
-    };
-    const RLB = mkLegB(-1);
-    const LLB = mkLegB(1);
-
-    // --- the tail: a heavy segmented whip with a blade on the end ---
-    makeChain(pelvisB, 0, 0.0, -0.22, 7, 0.26, 0.19, 0.07, frame, {
-      rest: 0.42, droop: 0.12, k: 34, c: 3.4, gain: 0.3, flutter: 0.1, thick: 0.16, inert: 0.9, ol: true,
-    });
-    const tailRoot = chains[chains.length - 1];
-    const tip = tailRoot.segs[tailRoot.segs.length - 1];
-    add(tip, new THREE.ConeGeometry(0.08, 0.44, 6), steel, 0, -0.3, 0);
-    add(tip, new THREE.BoxGeometry(0.02, 0.3, 0.1), neon, 0, -0.28, 0, false);
-    for (const s of tailRoot.segs) add(s, new THREE.BoxGeometry(0.03, 0.05, 0.16), neon, 0, -0.1, 0, false);
-
-    root.scale.setScalar(o.scale ?? 1);
-    const glowB = (neon as THREE.MeshBasicMaterial).color.clone();
-    const dummyBlade = new THREE.MeshStandardMaterial();
-    let clock2 = Math.random() * 10;
-    const rigB: Rig = {
-      root,
-      hips: hipsB,
-      torso: torsoB,
-      head: headB,
-      swordBase: grp(headB, 0, 0.3, 0),
-      swordTip: grp(headB, 0, 4.0, 0),
-      bladeMat: dummyBlade,
-      headObj: grp(headB, 0, 1.2, 0),
-      chestObj: grp(torsoB, 0, 0.4, 0),
-      gait: { rx: 0, rz: 0, rl: 0, rp: 0, lx: 0, lz: 0, ll: 0, lp: 0, sway: 0, bob: 0 },
-      limbs: { rArm: RB.sh, lArm: LB.sh, rLeg: RLB.hp, lLeg: LLB.hp },
-      stumps: { rArm: headB, lArm: headB, rLeg: headB, lLeg: headB },
-      severed: new Set<LimbName>(),
-      weaponObj: headB,
-      sever() {},
-      dropWeapon() {},
-      legK: 1,
-      muzzle: grp(torsoB, 0, 0.4, 0.3),
-      setDraw() {},
-      bladeGlowBase: 1,
-      apply(p: Pose) {
-        // digitigrade solve: the "knee" bends backwards, so the ankle rides high and forward
-        const g = rigB.gait;
-        const hipY = 1.52 + p.dy * 1.4 + g.bob;
-        hipsB.position.y = hipY;
-        pelvisB.position.x = g.sway;
-        pelvisB.rotation.set(p.hipX, p.hipYaw, p.hipZ);
-        torsoB.rotation.set(p.torsoX * 0.8, p.torsoY, p.torsoZ);
-        // the blade-head tracks like a head would, but tilts far more — it IS the weapon
-        headB.rotation.set(p.headX * 1.4 + p.torsoX * 0.3, p.headY, p.torsoZ * 0.5);
-        const legs: [LegRig, number, number, number, number, number][] = [
-          [RLB, -0.24, p.rhX, p.rkX, p.rl + g.rl, g.rz],
-          [LLB, 0.24, p.lhX, p.lkX, p.ll + g.ll, g.lz],
-        ];
-        for (const [L, hx, hipA, kneeA, lift, zoff] of legs) {
-          const th = -hipA * 0.75 - 0.5; // thigh swings forward
-          const sh2 = kneeA * 1.15 + 1.1; // shin folds back hard
-          L.hp.rotation.set(th, 0, 0);
-          L.kn.rotation.x = sh2;
-          // place the toe: FK down the chain, then pitch the foot flat to the floor
-          const ky = -0.56 * Math.cos(th);
-          const kz = -0.56 * Math.sin(th);
-          const ay = ky - 0.54 * Math.cos(th + sh2);
-          const az = kz - 0.54 * Math.sin(th + sh2);
-          L.foot.rotation.x = -(th + sh2) - 0.35;
-          void hx;
-          void ay;
-          void az;
-          void zoff;
-          L.foot.position.y = -0.54 + lift * 0.4;
-        }
-        RB.sh.rotation.set(p.rsX * 0.7 - 0.2, p.rsY, p.rsZ * 0.6);
-        RB.el.rotation.x = p.reX * 0.7;
-        LB.sh.rotation.set(p.lsX * 0.7 - 0.2, p.lsY, p.lsZ * 0.6);
-        LB.el.rotation.x = p.leX * 0.7;
-      },
-      update(dt: number) {
-        if (dt <= 0) return;
-        clock2 += dt;
-        root.updateMatrixWorld(true);
-        const sc = root.scale.x || 1;
-        for (const c of chains) updateChain(c, dt, clock2, sc);
-      },
-      setFlash(v: number) {
-        for (const m of flashMats) {
-          m.emissive.setRGB(v * 0.25, v * 0.05, v * 0.05);
-          m.emissiveIntensity = 1;
-        }
-      },
-      setBladeGlow(v: number) {
-        (neon as THREE.MeshBasicMaterial).color.copy(glowB).multiplyScalar(1 + v * 1.5);
-      },
-    };
-    return rigB;
-  }
 
   /* ---------- body skeleton ---------- */
   const hips = grp(root, 0, 0.93, 0);
-  // Toon proportions shorten the leg assembly (and with it the hip spacing, so a chibi never straddles).
-  // The big toon head and torso sit high, so the legs need real length under them: 0.9 × 1.05 m ≈ 0.95 m of
-  // leg against 0.67 m of arm — clearly the longer, heavier pair of limbs, like Link.
-  const legK = o.chibi ? 0.9 : 1;
+  // Keep the toon legs compact and in proportion under the large head, rather than stretching the stride silhouette.
+  const legK = o.chibi ? 0.82 : 1;
   const legRoot = grp(hips, 0, 0, 0);
   legRoot.scale.setScalar(legK);
   const pelvis = grp(hips, 0, 0.04, 0);
   pelvis.rotation.order = 'YXZ';
 
-  // slim, fitted hips (no baggy skirt) — the long legs read clearly
+  // Compact, fitted hips keep the legs visually connected to the torso.
   const pm = add(pelvis, new THREE.CylinderGeometry(0.168, 0.2, 0.26, 22), cloth2, 0, -0.08, 0);
   pm.scale.z = 0.8;
   const obi = add(pelvis, new THREE.CylinderGeometry(0.168, 0.168, isB ? 0.11 : 0.09, 24), obiMat, 0, 0.065, 0);
@@ -826,7 +624,7 @@ export function createHumanoid(o: RigOpts): Rig {
     add(kn, tube(0.3, 0.072, 0.05, 14), wrapMat, 0, -0.25, 0);
     for (let i = 0; i < 4; i++) ring(kn, 0.07 - i * 0.0045, 0.004, -0.3 - i * 0.055, dark, 1);
     if (isB || kind === 'soldier') {
-      const gm = isB ? metal : leather;
+      const gm = isB || bot ? metal : leather;
       add(kn, tube(0.28, 0.088, 0.07, 14), gm, 0, -0.1, 0.0);
       add(kn, sph(0.078), gm, 0, 0, 0.03, false).scale.set(1, 0.8, 1);
     }
@@ -912,7 +710,7 @@ export function createHumanoid(o: RigOpts): Rig {
 
   if (kind !== 'player') {
     const ap: [number, number][] = [[0.158, 0.08], [0.178, 0.2], [0.205, 0.3], [0.236, 0.38], [0.246, 0.49], [0.232, 0.535]];
-    const dm = add(torso, lathe(ap, 28), laquer, 0, 0, 0);
+    const dm = add(torso, lathe(ap, 28), robotSoldier ? metal : laquer, 0, 0, 0);
     dm.scale.z = 0.68;
     [0.17, 0.25, 0.33, 0.41].forEach((y, i) => ring(torso, [0.178, 0.195, 0.222, 0.246][i], 0.0075, y, isB ? gold : accent, 0.68));
     // lacing diamonds
@@ -920,7 +718,17 @@ export function createHumanoid(o: RigOpts): Rig {
       const lz = add(torso, new THREE.BoxGeometry(0.03, 0.03, 0.006), isB ? gold : accent, (i - 2.5) * 0.04, 0.2 + (i % 2) * 0.09, 0.128 + (i % 2) * 0.014, false);
       lz.rotation.z = Math.PI / 4;
     }
-    if (isB) add(torso, new THREE.CylinderGeometry(0.045, 0.045, 0.012, 20), gold, 0, 0.36, 0.172, false).rotation.x = Math.PI / 2;
+    if (isB) {
+      add(torso, new THREE.CylinderGeometry(0.045, 0.045, 0.012, 20), gold, 0, 0.36, 0.172, false).rotation.x = Math.PI / 2;
+      for (const s of [-1, 1]) {
+        const ridge = add(torso, new THREE.BoxGeometry(0.05, 0.32, 0.022), metal, s * 0.12, 0.34, 0.164, false);
+        ridge.rotation.z = -s * 0.22;
+        const seam = add(torso, new THREE.BoxGeometry(0.014, 0.28, 0.01), M(0x9e1521, 0.28, 0.55), s * 0.16, 0.34, 0.17, false);
+        seam.rotation.z = -s * 0.22;
+      }
+      const heartRing = add(torso, new THREE.TorusGeometry(0.09, 0.012, 7, 24), gold, 0, 0.36, 0.19, false);
+      heartRing.rotation.x = Math.PI / 2;
+    }
   }
 
   // kusazuri / hip plates (soldier + boss)
@@ -928,7 +736,14 @@ export function createHumanoid(o: RigOpts): Rig {
     const n = isB ? 10 : 7;
     for (let i = 0; i < n; i++) {
       const a = (i / n) * Math.PI * 2;
-      const pl = add(pelvis, new THREE.BoxGeometry(isB ? 0.14 : 0.12, isB ? 0.26 : 0.2, 0.014), isB ? laquer : leather, Math.sin(a) * 0.238, -0.15, Math.cos(a) * 0.192);
+      const pl = add(
+        pelvis,
+        new THREE.BoxGeometry(isB ? 0.14 : 0.12, isB ? 0.26 : 0.2, 0.014),
+        isB ? laquer : robotSoldier ? metal : leather,
+        Math.sin(a) * 0.238,
+        -0.15,
+        Math.cos(a) * 0.192,
+      );
       pl.rotation.y = a;
       pl.rotation.x = -0.1;
       add(pl, new THREE.BoxGeometry(isB ? 0.14 : 0.12, 0.012, 0.018), isB ? gold : accent, 0, isB ? -0.12 : -0.09, 0, false);
@@ -954,8 +769,10 @@ export function createHumanoid(o: RigOpts): Rig {
   skull.scale.set(0.92, 1.1, 1.0);
   const jaw = add(head, sph(0.078, 16, 12), skin, 0, 0.108, 0.034);
   jaw.scale.set(0.95, 0.85, 1.0);
-  [-1, 1].forEach((s) => add(head, sph(0.022, 8, 6), skin, s * 0.098, 0.165, 0.0, false).scale.set(0.5, 1, 0.8));
-  if (!isB) {
+  if (!robotSoldier) {
+    [-1, 1].forEach((s) => add(head, sph(0.022, 8, 6), skin, s * 0.098, 0.165, 0.0, false).scale.set(0.5, 1, 0.8));
+  }
+  if (!isB && !robotSoldier) {
     [-1, 1].forEach((s) => {
       add(head, sph(0.0125, 8, 6), eyeMat, s * 0.04, 0.184, 0.096, false);
       const br = add(head, new THREE.BoxGeometry(0.048, 0.009, 0.012), dark, s * 0.043, 0.206, 0.093, false);
@@ -1031,24 +848,45 @@ export function createHumanoid(o: RigOpts): Rig {
     makeChain(torso, 0.05, 0.625, -0.1, 6, 0.13, 0.15, 0.08, accentDS, { rest: 0.14, droop: 0.04, k: 50, c: 6, gain: 0.14, flutter: 0.08, thick: 0.014 });
     makeChain(torso, -0.04, 0.625, -0.095, 5, 0.13, 0.12, 0.07, accentDS, { rest: 0.18, droop: 0.05, k: 56, c: 6, gain: 0.14, flutter: 0.09, phase: 1.9, thick: 0.014 });
   } else if (!isB) {
-    // soldier: topknot under a straw jingasa
-    const hr = M(o.hair ?? 0x1a1414, 0.8, 0);
-    const cap = add(head, new THREE.SphereGeometry(0.112, 20, 12, 0, Math.PI * 2, 0, Math.PI * 0.55), hr, 0, 0.18, -0.012);
-    cap.scale.set(1, 1.05, 1.05);
-    add(head, sph(0.03, 8, 6), hr, 0, 0.3, -0.04, false);
-    const kasa = add(head, new THREE.ConeGeometry(0.43, 0.21, 40), M(0xa88a52, 0.95, 0, undefined, true), 0, 0.33, 0);
-    kasa.castShadow = true;
-    ring(head, 0.425, 0.01, 0.228, M(0x5a4528, 0.9, 0), 1);
-    for (let i = 1; i < 4; i++) ring(head, 0.425 - i * 0.1, 0.004, 0.228 + i * 0.05, M(0x6f5832, 0.9, 0), 1);
-    add(head, sph(0.03, 8, 6), M(0x5a4528, 0.9, 0), 0, 0.445, 0, false);
-    [-1, 1].forEach((s) => {
-      const st = add(head, new THREE.BoxGeometry(0.008, 0.2, 0.008), dark, s * 0.095, 0.115, 0.05, false);
-      st.rotation.z = s * 0.15;
-    });
-    ring(head, 0.108, 0.011, 0.21, accent, 1.0);
-    // face wrap
-    const wrap = add(head, new THREE.CylinderGeometry(0.098, 0.088, 0.065, 16, 1, true, Math.PI * 0.12, Math.PI * 1.76), M(0x2a2830, 0.9, 0, THREE.DoubleSide, true), 0, 0.105, 0.0, false);
-    wrap.rotation.y = Math.PI;
+    if (robotSoldier) {
+      // Sealed mechanical helmet, horizontal sensor visor, ear actuators and a service antenna.
+      const dome = add(head, new THREE.SphereGeometry(0.122, 24, 16, 0, Math.PI * 2, 0, Math.PI * 0.66), metal, 0, 0.2, -0.008);
+      dome.scale.set(1.04, 1.1, 1.02);
+      const brow = add(head, new THREE.BoxGeometry(0.205, 0.038, 0.038), laquer, 0, 0.244, 0.11, false);
+      brow.rotation.x = -0.08;
+      add(head, new THREE.BoxGeometry(0.178, 0.078, 0.034), laquer, 0, 0.17, 0.098, false);
+      add(head, new THREE.BoxGeometry(0.15, 0.032, 0.012), dark, 0, 0.19, 0.12, false);
+      add(head, new THREE.BoxGeometry(0.12, 0.012, 0.008), eyeMat, 0, 0.19, 0.132, false);
+      [-1, 1].forEach((s) => {
+        add(head, new THREE.BoxGeometry(0.018, 0.014, 0.008), eyeMat, s * 0.043, 0.19, 0.136, false);
+        const actuator = add(head, new THREE.CylinderGeometry(0.042, 0.042, 0.032, 14), metal, s * 0.112, 0.16, -0.005, false);
+        actuator.rotation.z = Math.PI / 2;
+        add(head, new THREE.BoxGeometry(0.045, 0.036, 0.018), metal, s * 0.09, 0.095, 0.09, false);
+        add(head, new THREE.BoxGeometry(0.012, 0.02, 0.006), dark, s * 0.026, 0.095, 0.108, false);
+      });
+      add(head, new THREE.BoxGeometry(0.115, 0.022, 0.035), metal, 0, 0.286, -0.008, false);
+      add(head, new THREE.CylinderGeometry(0.006, 0.01, 0.07, 6), metal, 0.075, 0.326, -0.028, false);
+      add(head, sph(0.013, 8, 6), eyeMat, 0.075, 0.364, -0.028, false);
+    } else {
+      // human soldier: topknot under a straw jingasa
+      const hr = M(o.hair ?? 0x1a1414, 0.8, 0);
+      const cap = add(head, new THREE.SphereGeometry(0.112, 20, 12, 0, Math.PI * 2, 0, Math.PI * 0.55), hr, 0, 0.18, -0.012);
+      cap.scale.set(1, 1.05, 1.05);
+      add(head, sph(0.03, 8, 6), hr, 0, 0.3, -0.04, false);
+      const kasa = add(head, new THREE.ConeGeometry(0.43, 0.21, 40), M(0xa88a52, 0.95, 0, undefined, true), 0, 0.33, 0);
+      kasa.castShadow = true;
+      ring(head, 0.425, 0.01, 0.228, M(0x5a4528, 0.9, 0), 1);
+      for (let i = 1; i < 4; i++) ring(head, 0.425 - i * 0.1, 0.004, 0.228 + i * 0.05, M(0x6f5832, 0.9, 0), 1);
+      add(head, sph(0.03, 8, 6), M(0x5a4528, 0.9, 0), 0, 0.445, 0, false);
+      [-1, 1].forEach((s) => {
+        const st = add(head, new THREE.BoxGeometry(0.008, 0.2, 0.008), dark, s * 0.095, 0.115, 0.05, false);
+        st.rotation.z = s * 0.15;
+      });
+      ring(head, 0.108, 0.011, 0.21, accent, 1.0);
+      // face wrap
+      const wrap = add(head, new THREE.CylinderGeometry(0.098, 0.088, 0.065, 16, 1, true, Math.PI * 0.12, Math.PI * 1.76), M(0x2a2830, 0.9, 0, THREE.DoubleSide, true), 0, 0.105, 0.0, false);
+      wrap.rotation.y = Math.PI;
+    }
   } else {
     // boss: kabuto + demon mempo + crescent crest
     const bowl = add(head, new THREE.SphereGeometry(0.128, 24, 16, 0, Math.PI * 2, 0, Math.PI * 0.58), metal, 0, 0.2, 0);
@@ -1074,6 +912,13 @@ export function createHumanoid(o: RigOpts): Rig {
     const crest = add(head, new THREE.TorusGeometry(0.2, 0.017, 6, 28, Math.PI * 1.15), gold, 0, 0.36, 0.11, false);
     crest.rotation.z = Math.PI * 0.925;
     add(head, new THREE.CylinderGeometry(0.03, 0.03, 0.012, 14), gold, 0, 0.275, 0.135, false).rotation.x = Math.PI / 2;
+    // twin swept horns and a blade-like crest turn the kabuto into a much harsher war-helm silhouette
+    const hornMat = M(0x4d1118, 0.24, 0.82);
+    const hornTipMat = M(0xb4a890, 0.22, 0.86);
+    [-1, 1].forEach((s) => {
+      strand(head, new THREE.Vector3(s * 0.1, 0.28, -0.015), new THREE.Vector3(s * 0.72, 0.68, -0.04), 0.48, 0.06, hornMat);
+      strand(head, new THREE.Vector3(s * 0.42, 0.56, -0.04), new THREE.Vector3(s * 0.4, 0.92, -0.04), 0.22, 0.028, hornTipMat);
+    });
     // long white mane under the helm
     makeChain(head, 0, 0.16, -0.12, 5, 0.1, 0.16, 0.1, M(0xd8d4d0, 0.8, 0, THREE.DoubleSide), { rest: 0.12, droop: 0.02, k: 55, c: 6, gain: 0.13, flutter: 0.06, thick: 0.03 });
   }
@@ -1092,6 +937,20 @@ export function createHumanoid(o: RigOpts): Rig {
         pl.rotation.z = side * (-0.28 - i * 0.12);
         add(pl, new THREE.BoxGeometry(w, 0.016, 0.02), isB ? gold : accent, 0, 0, isB ? 0.1 : 0.08, false);
       }
+      if (isB) {
+        const shoulder = add(sh, new THREE.SphereGeometry(0.16, 16, 10), laquer, side * 0.035, 0.085, -0.015);
+        shoulder.scale.set(1.55, 0.78, 1.42);
+        const rim = add(sh, new THREE.TorusGeometry(0.17, 0.012, 6, 20), gold, side * 0.035, 0.09, 0.035, false);
+        rim.rotation.x = Math.PI / 2;
+        const spikeMat = M(0x68111a, 0.23, 0.8);
+        strand(sh, new THREE.Vector3(side * 0.06, 0.16, -0.02), new THREE.Vector3(side * 0.82, 0.48, -0.08), 0.36, 0.072, metal);
+        strand(sh, new THREE.Vector3(side * 0.1, 0.13, 0.08), new THREE.Vector3(side * 0.28, 0.88, 0.38), 0.28, 0.052, spikeMat);
+      } else if (robotSoldier) {
+        const shoulder = add(sh, new THREE.SphereGeometry(0.105, 16, 10), metal, side * 0.035, 0.055, 0.005);
+        shoulder.scale.set(1.35, 0.82, 1.15);
+        const seam = add(sh, new THREE.BoxGeometry(0.105, 0.012, 0.018), accent, side * 0.025, 0.025, 0.092, false);
+        seam.rotation.z = side * -0.28;
+      }
     } else {
       add(sh, sph(0.085, 14, 10), cloth2, side * 0.01, 0.03, 0, false).scale.set(1, 0.7, 1.05);
     }
@@ -1108,6 +967,10 @@ export function createHumanoid(o: RigOpts): Rig {
       ring(el, 0.058, 0.007, -0.1, gold, 1);
     } else if (isP) {
       for (let i = 0; i < 4; i++) ring(el, 0.056 - i * 0.003, 0.0045, -0.08 - i * 0.04, dark, 1);
+    } else if (robotSoldier) {
+      ring(el, 0.056, 0.008, -0.04, dark, 1);
+      ring(el, 0.051, 0.006, -0.1, metal, 1);
+      ring(el, 0.045, 0.005, -0.17, accent, 1);
     }
     const wr = grp(el, 0, -A2, 0);
     const hand = add(wr, sph(0.048, 14, 12), pros ? metal : skin, 0, 0, 0);
@@ -1129,6 +992,8 @@ export function createHumanoid(o: RigOpts): Rig {
     envMapIntensity: 1.5,
   });
   const sword = grp(torso, 0, 0, 0);
+  // Kurogane's blade is doubled; the player's and ordinary enemies' katanas keep their original length.
+  const bladeLength = isB ? 2.0 : 1.0;
   if (isB) sword.scale.set(1.08, 1.12, 1.08);
   const tsuka = add(sword, new THREE.CylinderGeometry(0.02, 0.022, 0.37, 12), M(0xd9d4c8, 0.7, 0), 0, -0.015, 0, false);
   tsuka.scale.x = 0.85;
@@ -1143,7 +1008,7 @@ export function createHumanoid(o: RigOpts): Rig {
   add(sword, new THREE.TorusGeometry(0.056, 0.004, 6, 24), gold, 0, 0.18, 0, false).rotation.x = Math.PI / 2;
   add(sword, new THREE.CylinderGeometry(0.02, 0.02, 0.04, 8), gold, 0, 0.205, 0, false).scale.x = 0.8;
   {
-    const Lb = 1.0;
+    const Lb = bladeLength;
     const N = 22;
     const edge: [number, number][] = [];
     const spine: [number, number][] = [];
@@ -1206,7 +1071,7 @@ export function createHumanoid(o: RigOpts): Rig {
     ridge.visible = false; // curved blade → straight ridge would drift; keep hidden, hamon carries the look
   }
   const swordBase = grp(sword, 0, 0.2, 0);
-  const swordTip = grp(sword, 0, 1.2, -0.055);
+  const swordTip = grp(sword, 0, 0.2 + bladeLength, -0.055);
 
   /* ---------- ranged weapons: yumi (bow) · tanegashima (matchlock) ---------- */
   const weapon = o.weapon ?? 'katana';
@@ -1304,7 +1169,11 @@ export function createHumanoid(o: RigOpts): Rig {
   }
 
   /* ---------- severable limbs: a wet red stump waits at every joint, hidden until the limb is cut off ---------- */
-  const stumpMat = M(0x8c1118, 0.3, 0.05);
+  const stumpMat = M(bot ? 0x263340 : 0x8c1118, bot ? 0.28 : 0.3, bot ? 0.88 : 0.05);
+  if (bot) {
+    stumpMat.emissive.setHex(0x08788c);
+    stumpMat.emissiveIntensity = 0.9;
+  }
   const mkStump = (parent: THREE.Object3D, at: THREE.Vector3, r: number) => {
     const s = add(parent, sph(r, 12, 9), stumpMat, at.x, at.y, at.z, false);
     s.visible = false;
@@ -1319,11 +1188,9 @@ export function createHumanoid(o: RigOpts): Rig {
   };
   const severedSet = new Set<LimbName>();
 
-  /* ---------- toon torso: a short, compact trunk under the big head ---------- */
-  // Everything parented to the torso is squashed vertically and pulled down — the chest / armour meshes get
-  // shorter, while the head and the shoulders simply sit lower. Arms and head keep their own full size, so the
-  // silhouette becomes: big head · stubby body · long limbs (the Link build).
-  const torsoK = o.chibi ? 0.68 : 1;
+  /* ---------- toon torso: compact, but long enough to balance the head and leg proportions ---------- */
+  // Subtle vertical compression preserves the chibi shape without making the legs dominate the silhouette.
+  const torsoK = o.chibi ? 0.74 : 1;
   if (torsoK !== 1) {
     for (const ch of torso.children) {
       if (ch === sword) continue; // the sword's position is written every frame by apply()

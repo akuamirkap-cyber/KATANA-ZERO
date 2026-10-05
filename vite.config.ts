@@ -19,6 +19,8 @@ export default defineConfig({
   server: {
     port: 3000,
     host: '0.0.0.0',
+    // Allow the Arena preview host while keeping Vite's host check enabled.
+    allowedHosts: ['.e2b.app'],
     // HMR is disabled in AI Studio via DISABLE_HMR env var.
     hmr: process.env.DISABLE_HMR !== 'true',
     watch: process.env.DISABLE_HMR === 'true' ? null : {},

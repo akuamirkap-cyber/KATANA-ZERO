@@ -1,7 +1,11 @@
+export type CombatMode = 'before' | 'after';
+export type GameMode = 'duel' | 'runner' | 'apartment';
+export type CombatTell = 'guard' | 'parry' | 'opening';
+
 export interface EnemyView {
   id: number;
   name: string;
-  kind: 'blade' | 'archer' | 'gunner' | 'boss' | 'bladehead';
+  kind: 'blade' | 'archer' | 'gunner' | 'boss';
   hp: number; // 0..1
   posture: number; // 0..1 (relative to effective max)
   broken: boolean;
@@ -14,6 +18,7 @@ export interface EnemyView {
   focus: boolean;
   boss: boolean;
   aiming: boolean; // a ranged enemy is lining up a shot at you
+  combatTell: CombatTell | null; // tactical mode teaches whether the enemy is guarding, parrying, or open
   ang: number; // direction to the enemy relative to the camera (0 = ahead, +π/2 = right)
 }
 
@@ -54,14 +59,12 @@ export interface Snapshot {
   dead: boolean;
   canRevive: boolean;
   lockOn: boolean;
+  combatMode: CombatMode;
   rage: RageView;
   /** 'white' = SUPERHOT void → the HUD must switch to dark ink to stay readable */
   theme: 'white' | 'neon';
   cine: number; // 0..1 cinematic shot weight (drives letterbox bars)
   style: { rank: string; pct: number; score: number };
-  climbing?: boolean;
-  climbT?: number;
-  bossBladeStuck?: boolean;
 }
 
 export interface GameEvent {
@@ -85,8 +88,7 @@ export interface GameEvent {
     | 'rage'
     | 'cut'
     | 'perfect'
-    | 'rageLow'
-    | 'mount';
+    | 'rageLow';
   text?: string;
   n?: number;
 }

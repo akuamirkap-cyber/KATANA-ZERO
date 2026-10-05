@@ -74,6 +74,17 @@ function Pips({ n, max }: { n: number; max: number }) {
   );
 }
 
+function CombatStateTag({ tell, compact = false }: { tell: EnemyView['combatTell']; compact?: boolean }) {
+  if (!tell) return null;
+  const label = tell === 'opening' ? 'CELAH · SERANG' : tell === 'parry' ? 'PARRY · V / TUNGGU' : 'GUARD · V / A5';
+  const color = tell === 'opening' ? 'border-emerald-300/45 bg-emerald-950/70 text-emerald-100' : tell === 'parry' ? 'border-red-300/45 bg-red-950/75 text-red-100' : 'border-amber-200/40 bg-amber-950/70 text-amber-100';
+  return (
+    <span className={`inline-flex items-center border ${color} ${compact ? 'px-1 py-0 text-[7px] tracking-[0.12em]' : 'px-2 py-0.5 text-[9px] tracking-[0.24em]'} font-title uppercase`}>
+      {label}
+    </span>
+  );
+}
+
 function EnemyTop({ e }: { e: EnemyView }) {
   return (
     <div className="pointer-events-none absolute top-6 left-1/2 -translate-x-1/2 text-center">
@@ -81,6 +92,7 @@ function EnemyTop({ e }: { e: EnemyView }) {
         <span className="font-title ink-text text-[13px] tracking-[0.25em] text-white/90 uppercase">{e.name}</span>
         <Pips n={e.pips} max={e.maxPips} />
       </div>
+      {e.combatTell && <div className="mb-1.5"><CombatStateTag tell={e.combatTell} /></div>}
       <PostureBar v={e.posture} broken={e.broken} width={e.boss ? 560 : 420} h={9} />
       <div className="mt-1.5 flex justify-center">
         <HealthBar v={e.hp} width={e.boss ? 560 : 420} h={9} />
@@ -239,7 +251,7 @@ function RageUI({ r }: { r: RageView }) {
       )}
       {r.on && !r.aim && (
         <div className="absolute top-28 left-1/2 -translate-x-1/2 text-center">
-          <div className="font-jp kanji-red anim-break text-sm tracking-[0.6em]">怒 · RAGE</div>
+          <div className="font-jp kanji-red anim-break text-sm tracking-[0.6em]">怒 · RAIDEN / RAGE</div>
           <div className="font-title text-[10px] tracking-[0.28em] text-white/50 uppercase">
             Geser mouse = arahkan sudut · ketuk klik kiri = tebas
           </div>
@@ -311,6 +323,11 @@ export function Hud({ s }: { s: Snapshot }) {
         .filter((e) => !e.focus && e.onScreen && e.hp > 0)
         .map((e) => (
           <div key={e.id} className="absolute -translate-x-1/2" style={{ left: e.x, top: e.y }}>
+            {e.combatTell && (
+              <div className="absolute bottom-full left-1/2 mb-1 -translate-x-1/2 whitespace-nowrap">
+                <CombatStateTag tell={e.combatTell} compact />
+              </div>
+            )}
             <PostureBar v={e.posture} broken={e.broken} width={80} h={5} />
             <div className="mt-1">
               <HealthBar v={e.hp} width={80} h={5} />
@@ -347,13 +364,7 @@ export function Hud({ s }: { s: Snapshot }) {
       {/* prompt */}
       {s.prompt && (
         <div
-          className={`font-title absolute bottom-36 left-1/2 -translate-x-1/2 rounded-lg border px-6 py-2.5 text-sm sm:text-base tracking-wider text-center backdrop-blur-md shadow-2xl transition-all select-none ${
-            s.climbing
-              ? 'border-cyan-400/80 bg-cyan-950/85 text-cyan-100 shadow-[0_0_35px_rgba(6,182,212,.6)] ring-1 ring-cyan-400/50'
-              : s.bossBladeStuck
-              ? 'border-amber-400/80 bg-slate-950/90 text-amber-300 shadow-[0_0_35px_rgba(245,158,11,.5)] ring-1 ring-amber-400/50 animate-pulse'
-              : 'border-red-500/40 bg-black/75 text-red-100 shadow-[0_0_24px_rgba(200,0,0,.35)]'
-          }`}
+          className="font-title absolute bottom-36 left-1/2 -translate-x-1/2 rounded-lg border border-red-500/40 bg-black/75 px-6 py-2.5 text-center text-sm tracking-wider text-red-100 shadow-[0_0_24px_rgba(200,0,0,.35)] backdrop-blur-md transition-all select-none sm:text-base"
         >
           {s.prompt}
         </div>
@@ -405,6 +416,9 @@ export function Hud({ s }: { s: Snapshot }) {
 
       {/* top-right stats */}
       <div className="font-title absolute top-7 right-9 space-y-1 text-right text-[9px] tracking-[0.28em] text-white/30 uppercase">
+        <div className={s.combatMode === 'after' ? 'text-amber-200/70' : 'text-white/45'}>
+          {s.combatMode === 'after' ? 'AFTER UPDATE · TAKTIS' : 'BEFORE UPDATE · KLASIK'}
+        </div>
         {([
           ['Deflect', s.stats.deflects],
           ['Deathblow', s.stats.deathblows],
@@ -460,10 +474,11 @@ export function Hud({ s }: { s: Snapshot }) {
           </>
         ) : (
           <>
-            <div>Klik kanan tap · Deflect</div>
-            <div>C · Dodge · V · Tendang</div>
-            <div>Klik tengah · Tancap + tendang</div>
-            <div className={s.rage.ready ? 'text-red-200/55' : ''}>Space · Rage</div>
+            <div>Klik kanan tahan · guard depan</div>
+            <div>Ketuk saat benturan · Deflect</div>
+            <div>C · Dodge/Mikiri · E · lompat</div>
+            <div>V · Tendang pecah guard</div>
+            <div className={s.rage.ready ? 'text-red-200/55' : ''}>Space · Raiden / Rage</div>
           </>
         )}
       </div>
