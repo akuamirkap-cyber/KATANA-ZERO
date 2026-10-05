@@ -1,7 +1,7 @@
 import { useCallback, useEffect, useRef, useState } from 'react';
 import { Game } from './game/Game';
 import type { SizeMode, FxStyle } from './game/Game';
-import type { GameEvent, Snapshot } from './game/types';
+import type { CombatMode, GameEvent, GameMode, Snapshot } from './game/types';
 import type { Theme } from './game/world';
 import { Hud } from './components/Hud';
 
@@ -112,7 +112,7 @@ function CenterItem({ t }: { t: Toast }) {
             怒
           </div>
           <div className="font-title anim-side text-xs tracking-[0.5em] text-red-200 uppercase" style={s}>
-            Rage Mode
+            Raiden · Rage Mode
           </div>
         </div>
       );
@@ -199,32 +199,80 @@ const CONTROLS: [string, string][] = [
   ['W A S D', 'Bergerak · Shift sprint'],
   ['Mouse', 'Kamera'],
   ['Klik kiri', 'Tebas — combo 5 serangan'],
-  ['Klik kanan', 'Tangkis · TAP tepat = Deflect'],
-  ['C', 'Dodge (membaca serangan) · mundur = backflip'],
+  ['Klik kanan tahan', 'Guard depan · ketuk saat benturan = Deflect'],
+  ['C', 'Dodge / Mikiri saat tusukan · mundur = backflip'],
   ['E', 'Lompat · tekan 2× = double jump'],
   ['C / Klik di udara', 'Air dash · Flying Swallow'],
   ['V', 'Tendangan keras — tembus tangkisan'],
   ['Klik tengah', 'Tancap pedang → tendang lepas, musuh terjungkal'],
+  ['F / K', 'Tahan = guard · Rage: tebasan terakhir'],
   ['H', 'Gourd penyembuh · R bangkit'],
   ['Q / Tab', 'Lock-on · ganti target'],
   ['G', 'Freestyle bilah'],
-  ['P / Esc', 'Jeda'],
+  ['P / Esc', 'Jeda · pilih BEFORE / AFTER untuk membandingkan combat'],
 ];
 
 const RAGE_HELP: [string, string][] = [
-  ['Space', 'Rage Mode — waktu melambat'],
+  ['Space', 'Mode Raiden / Rage — waktu melambat'],
   ['Ketuk klik kiri', 'Slice: membelah tubuh sesuai arah tebasan'],
   ['Klik kanan', 'Tebasan terakhir — garis kuning, slow-mo usai'],
 ];
 
 const RULES: [string, string][] = [
-  ['一', 'Bos Robot Raksasa (HASHA): Mengayunkan kepala bilah raksasa seperti kapak besar ke tanah.'],
-  ['二', 'Saat bilah menancap ke tanah: Lari atau lompat ke atas bilah untuk auto-nempel memanjat (ala Shadow of the Colossus)!'],
-  ['三', 'Panjat bilah dengan W (Shift untuk sprint), capai reaktor di kepala/dada lalu klik kiri untuk menghantam inti!'],
-  ['四', 'Kamera bebas: Gerakkan mouse ke atas/bawah untuk melihat ke langit dan memandangi raksasa dari semua sudut.'],
-  ['五', '危 merah: Saat bos mengayunkan kapak bilah, lompat atau dodge ke samping sebelum bilah menghantam tanah!'],
-  ['六', 'Tap tangkis tepat sebelum pedang mendarat musuh biasa: Deflect. Postur musuh hancur.'],
+  ['一', 'Kurogane adalah bos pembuka Stage I: baca ayunan pedang panjangnya. Duel ini dimenangkan lewat timing, bukan memanjat bos.'],
+  ['二', 'AFTER: guard dari depan menahan tebasan; ketuk dekat benturan untuk Deflect. Serangan dari belakang melewati guard.'],
+  ['三', 'Tusukan: Deflect tepat atau Mikiri (C). Sapuan rendah: lompat (E) atau dodge. Guard tidak menghentikan keduanya.'],
+  ['四', 'Tebasan mengikuti arah hadap/lock-on dan hanya efektif dari jarak dekat. Musuh menampilkan GUARD, PARRY, atau CELAH saat mode AFTER aktif.'],
+  ['五', 'Pecah GUARD dengan tendang (V) atau tebas berat A5; jangan spam slash ke PARRY—tunggu CELAH atau tendang. Pemanah/penembak menekan dari jauh, jadi terus bergerak mendekat.'],
+  ['六', 'Deflect, Mikiri, Deathblow, dan kill mengisi Rage; tenangkan postur dengan guard saat aman. Rage tetap mode slow-motion terpisah.'],
 ];
+
+const SIDE_MODE_CONTROLS: Record<'runner' | 'apartment', [string, string][]> = {
+  runner: [
+    ['W / S', 'Lari otomatis · W mempercepat · S mengerem tanpa berhenti'],
+    ['A / D', 'Pindah jalur kedalaman · A menjauh · D mendekat'],
+    ['Shift', 'Sprint tambahan'],
+    ['Klik kiri / J', 'Tebas · combo 5 serangan · Deathblow saat terbuka'],
+    ['Klik kanan tahan · F / K', 'Guard depan · ketuk saat benturan untuk Deflect'],
+    ['C · E', 'Dodge / Mikiri · lompat (tekan dua kali untuk double jump)'],
+    ['V · Klik tengah', 'Tendang pemecah guard · tancap lalu lepas'],
+    ['Space', 'Raiden / Rage · slow-motion dan tebasan terarah'],
+    ['Q / Tab · H · R', 'Lock-on / ganti target · heal · bangkit'],
+    ['P / Esc', 'Jeda · G freestyle bilah'],
+  ],
+  apartment: [
+    ['A / D', 'Bergerak kiri / kanan sepanjang koridor di layar'],
+    ['W / S', 'W maju menjauh dari kamera · S mundur mendekat ke kamera'],
+    ['Klik kiri / J', 'Tebas · combo 5 serangan · Deathblow saat terbuka'],
+    ['Klik kanan tahan · F / K', 'Guard depan · ketuk saat benturan untuk Deflect'],
+    ['C · E', 'Dodge / Mikiri · lompat (tekan dua kali untuk double jump)'],
+    ['V · Klik tengah', 'Tendang pemecah guard · tancap lalu lepas'],
+    ['Space', 'Raiden / Rage · slow-motion dan tebasan terarah'],
+    ['Q / Tab · H · R', 'Lock-on / ganti target · heal · bangkit'],
+    ['P / Esc', 'Jeda · G freestyle bilah'],
+  ],
+};
+
+const SIDE_MODE_RULES: Record<'runner' | 'apartment', [string, string][]> = {
+  runner: [
+    ['一', 'Lari tanpa akhir di atap kota 3D; W menambah laju, S mengerem tetapi auto-run tidak berhenti.'],
+    ['二', 'A/D mengubah jalur kedalaman (A menjauh, D mendekat); kecepatan dan kepadatan ancaman naik seiring jarak.'],
+    ['三', 'Lompat atau dodge melewati rintangan; mendarat di beam/crate akan mengurangi HP dan postur.'],
+    ['四', 'Drone bersenjata memakai pola serang dan pertahanan Sekiro yang sama: baca GUARD, PARRY, celah, dan perilaku perilous.'],
+    ['五', 'Lock-on, Deflect, Mikiri, Deathblow, heal, Rage, serta posture management tetap aktif seperti di duel.'],
+  ],
+  apartment: [
+    ['一', 'Bersihkan lima hostile di koridor apartemen sebelum elevator terbuka. Captain terakhir lebih tahan pukul; Kurogane tidak muncul di misi ini.'],
+    ['二', 'Musuh bertanda GUARD menahan slash dari depan; gunakan V atau combo slash berat untuk memecahnya.'],
+    ['三', 'Baca kilatan merah: tahan guard dari depan, ketuk dekat benturan untuk Deflect, Mikiri thrust, lompat/dodge sweep.'],
+    ['四', 'Lock-on, Deathblow, Rage, gourd heal, serta posture management memakai sistem inti duel yang sama.'],
+  ],
+};
+
+const SIDE_MODE_SPECIAL: Record<'runner' | 'apartment', [string, string][]> = {
+  runner: [['Rage', 'Space mengaktifkan slow-motion; tebasan terakhir tetap diarahkan dengan mouse / klik kanan.']],
+  apartment: [['Rage', 'Space mengaktifkan slow-motion; Rage tetap mode terpisah dan bisa dipakai kapan saja.']],
+};
 
 /** Slow-drifting embers behind the title. */
 function Embers() {
@@ -269,6 +317,74 @@ function KeyRow({ k, v }: { k: string; v: string }) {
   );
 }
 
+function CombatModePicker({ mode, onChange }: { mode: CombatMode; onChange: (mode: CombatMode) => void }) {
+  const options: [CombatMode, string][] = [
+    ['before', 'BEFORE · Klasik'],
+    ['after', 'AFTER · Taktis'],
+  ];
+  return (
+    <div className="flex flex-col items-center gap-2">
+      <div className="font-title text-[9px] tracking-[0.38em] text-white/35 uppercase">Mode Update · Bandingkan Before / After</div>
+      <div className="flex flex-wrap justify-center gap-2">
+        {options.map(([id, label]) => (
+          <button
+            key={id}
+            type="button"
+            aria-pressed={mode === id}
+            onClick={() => onChange(id)}
+            className={`border px-3 py-1.5 font-title text-[9px] tracking-[0.22em] uppercase transition-colors ${
+              mode === id
+                ? 'border-red-400/70 bg-red-950/40 text-red-100'
+                : 'border-white/10 text-white/40 hover:border-white/30 hover:text-white/75'
+            }`}
+          >
+            {label}
+          </button>
+        ))}
+      </div>
+      <div className="max-w-[min(92vw,440px)] text-center text-[10px] leading-relaxed text-white/40">
+        {mode === 'before'
+          ? 'BEFORE: auto-aim dekat, respons acak, guard dasar.'
+          : 'AFTER: aim disengaja, counter per ancaman, celah dan guard terbaca.'}
+      </div>
+    </div>
+  );
+}
+
+function GameModePicker({ mode, onChange }: { mode: GameMode; onChange: (mode: GameMode) => void }) {
+  const options: [GameMode, string, string][] = [
+    ['duel', '⚔', 'DUEL 3D'],
+    ['runner', '忍', 'NINJA RUN'],
+    ['apartment', '04F', 'APARTMENT'],
+  ];
+  return (
+    <div className="mt-4 flex flex-col items-center gap-2">
+      <div className="font-title text-[8px] tracking-[0.42em] text-white/35 uppercase">Pilih Mode Permainan</div>
+      <div className="flex flex-wrap justify-center gap-2">
+        {options.map(([id, icon, label]) => (
+          <button
+            key={id}
+            type="button"
+            aria-pressed={mode === id}
+            onClick={() => onChange(id)}
+            className={`flex min-w-[100px] items-center justify-center gap-2 border px-3 py-1.5 transition-colors ${
+              mode === id
+                ? 'border-red-400/70 bg-red-950/45 text-white'
+                : 'border-white/10 bg-black/20 text-white/40 hover:border-white/30 hover:text-white/75'
+            }`}
+          >
+            <span className="font-jp text-xs text-red-200/85">{icon}</span>
+            <span className="font-title text-[8px] tracking-[0.19em] uppercase">{label}</span>
+          </button>
+        ))}
+      </div>
+      <div className="font-title text-[9px] tracking-[0.16em] text-white/35">
+        {mode === 'duel' ? 'Kurogane · duel 3D taktis' : mode === 'runner' ? 'Combat Sekiro · runner rooftop endless 3D' : 'Combat Sekiro · misi apartemen side-view 3D'}
+      </div>
+    </div>
+  );
+}
+
 function Menu({
   onStart,
   error,
@@ -278,6 +394,10 @@ function Menu({
   setSize,
   fx,
   setFx,
+  combatMode,
+  setCombatMode,
+  gameMode,
+  setGameMode,
 }: {
   onStart: () => void;
   error: string;
@@ -287,8 +407,15 @@ function Menu({
   setSize: (s: SizeMode) => void;
   fx: FxStyle;
   setFx: (f: FxStyle) => void;
+  combatMode: CombatMode;
+  setCombatMode: (mode: CombatMode) => void;
+  gameMode: GameMode;
+  setGameMode: (mode: GameMode) => void;
 }) {
   const [sheet, setSheet] = useState<null | 'controls' | 'rules'>(null);
+  const controls = gameMode === 'duel' ? CONTROLS : SIDE_MODE_CONTROLS[gameMode];
+  const rules = gameMode === 'duel' ? RULES : SIDE_MODE_RULES[gameMode];
+  const specialHelp = gameMode === 'duel' ? RAGE_HELP : SIDE_MODE_SPECIAL[gameMode];
   return (
     <div className="absolute inset-0 z-30 overflow-hidden bg-[#05040a]">
       {/* dusk haze + ink vignette */}
@@ -322,12 +449,13 @@ function Menu({
             className="font-title anim-soft mt-2 text-[10px] tracking-[0.42em] text-white/28 uppercase"
             style={{ animationDelay: '1.05s' }}
           >
-            Duel pedang shinobi
+            {gameMode === 'duel' ? 'Duel pedang shinobi' : gameMode === 'runner' ? 'Ninja runner endless · rooftop' : 'Sideview · misi apartemen'}
           </div>
+          <GameModePicker mode={gameMode} onChange={setGameMode} />
         </div>
 
         {/* actions */}
-        <div className="anim-soft mt-14 flex flex-col items-center gap-6" style={{ animationDelay: '1.25s' }}>
+        <div className="anim-soft mt-10 flex flex-col items-center gap-5" style={{ animationDelay: '1.25s' }}>
           <button
             onClick={onStart}
             className="group relative px-10 py-2 transition-transform duration-300 active:scale-95"
@@ -336,13 +464,15 @@ function Menu({
               始
             </span>
             <span className="font-title anim-breathe text-[15px] tracking-[0.55em] text-white/85 uppercase transition-colors duration-300 group-hover:text-white">
-              Mulai Duel
+              {gameMode === 'duel' ? 'Mulai Duel' : gameMode === 'runner' ? 'Mulai Runner' : 'Masuk Apartemen'}
             </span>
             <span className="absolute inset-x-0 bottom-0 h-px origin-center scale-x-50 bg-gradient-to-r from-transparent via-red-400/90 to-transparent transition-transform duration-500 group-hover:scale-x-100" />
           </button>
 
-          {/* fx picker */}
-          <div className="flex flex-col items-center gap-2">
+          {gameMode === 'duel' && (
+            <>
+              {/* fx picker */}
+              <div className="flex flex-col items-center gap-2">
             <div className="font-title text-[9px] tracking-[0.45em] text-white/22 uppercase">Efek</div>
             <div className="flex items-center gap-6">
               {([
@@ -370,8 +500,8 @@ function Menu({
             </div>
           </div>
 
-          {/* size picker */}
-          <div className="flex flex-col items-center gap-2">
+              {/* size picker */}
+              <div className="flex flex-col items-center gap-2">
             <div className="font-title text-[9px] tracking-[0.45em] text-white/22 uppercase">Ukuran</div>
             <div className="flex items-center gap-6">
               {([
@@ -404,7 +534,7 @@ function Menu({
             <div className="font-title text-[9px] tracking-[0.45em] text-white/22 uppercase">Arena</div>
             <div className="flex items-center gap-6">
               {([
-                ['white', '白', 'Void Putih'],
+                ['white', '白', 'Kota Putih'],
                 ['neon', '夜', 'Kuil Neon'],
               ] as const).map(([id, jp, label]) => (
                 <button key={id} onClick={() => setTheme(id)} className="group relative flex items-center gap-2 pb-1.5">
@@ -427,6 +557,10 @@ function Menu({
               ))}
             </div>
           </div>
+
+              <CombatModePicker mode={combatMode} onChange={setCombatMode} />
+            </>
+          )}
 
           <div className="flex items-center gap-7">
             {([
@@ -464,7 +598,7 @@ function Menu({
       </div>
 
       <div className="font-title absolute inset-x-0 bottom-[9vh] text-center text-[9px] tracking-[0.4em] text-white/20 uppercase">
-        Kursor terkunci saat mulai · Esc untuk jeda
+        {gameMode === 'duel' ? 'Kursor terkunci saat mulai · Esc untuk jeda' : 'Kamera side-view · input dan combat Sekiro tetap aktif · Esc untuk jeda'}
       </div>
 
       {/* slide-up sheet */}
@@ -488,19 +622,21 @@ function Menu({
             {sheet === 'controls' ? (
               <div className="grid gap-x-10 md:grid-cols-2">
                 <ul>
-                  {CONTROLS.slice(0, 6).map(([k, v]) => (
+                  {controls.slice(0, 6).map(([k, v]) => (
                     <KeyRow key={k} k={k} v={v} />
                   ))}
                 </ul>
                 <ul>
-                  {CONTROLS.slice(6).map(([k, v]) => (
+                  {controls.slice(6).map(([k, v]) => (
                     <KeyRow key={k} k={k} v={v} />
                   ))}
                 </ul>
                 <div className="mt-5 md:col-span-2">
-                  <div className="font-jp mb-2 text-xs tracking-[0.4em] text-red-400/80">怒 · RAGE MODE</div>
+                  <div className="font-jp mb-2 text-xs tracking-[0.4em] text-red-400/80">
+                    {gameMode === 'duel' ? '怒 · RAIDEN / RAGE' : gameMode === 'runner' ? '忍 · RUNNER' : '04F · APARTMENT'}
+                  </div>
                   <ul>
-                    {RAGE_HELP.map(([k, v]) => (
+                    {specialHelp.map(([k, v]) => (
                       <KeyRow key={k} k={k} v={v} />
                     ))}
                   </ul>
@@ -508,7 +644,7 @@ function Menu({
               </div>
             ) : (
               <ul className="space-y-3">
-                {RULES.map(([n, v]) => (
+                {rules.map(([n, v]) => (
                   <li key={n} className="flex gap-4">
                     <span className="font-jp text-base text-red-400/70">{n}</span>
                     <span className="text-[13px] leading-relaxed text-white/60">{v}</span>
@@ -540,7 +676,11 @@ export default function App() {
   sizeRef.current = size;
   const [fx, setFx] = useState<FxStyle>('kz');
   const fxRef = useRef<FxStyle>('kz');
+  const [combatMode, setCombatMode] = useState<CombatMode>('after');
+  const combatModeRef = useRef<CombatMode>('after');
+  const [gameMode, setGameMode] = useState<GameMode>('duel');
   fxRef.current = fx;
+  combatModeRef.current = combatMode;
   const [shakeLvl, setShakeLvl] = useState(1);
   const shakeRef = useRef(1);
   shakeRef.current = shakeLvl;
@@ -548,6 +688,11 @@ export default function App() {
   const gameRef = useRef<Game | null>(null);
   const snapRef = useRef<Snapshot | null>(null);
   const idRef = useRef(1);
+  const chooseCombatMode = useCallback((mode: CombatMode) => {
+    combatModeRef.current = mode;
+    setCombatMode(mode);
+    gameRef.current?.setCombatMode(mode);
+  }, []);
 
   const onEvent = useCallback((e: GameEvent) => {
     if (e.type === 'pause') {
@@ -577,7 +722,7 @@ export default function App() {
     if (!started || !containerRef.current) return;
     let g: Game;
     try {
-      g = new Game(containerRef.current, onEvent, themeRef.current, sizeRef.current, fxRef.current);
+      g = new Game(containerRef.current, onEvent, themeRef.current, sizeRef.current, fxRef.current, combatModeRef.current, gameMode);
     } catch (err) {
       setError('WebGL tidak tersedia di perangkat ini: ' + String(err));
       setStarted(false);
@@ -596,13 +741,14 @@ export default function App() {
       g.dispose();
       gameRef.current = null;
     };
-  }, [started, gameKey, onEvent]);
+  }, [started, gameKey, gameMode, onEvent]);
 
   const restart = useCallback(() => {
     setToasts([]);
     setVictory(false);
     setPaused(false);
     setSnap(null);
+    snapRef.current = null;
     setGameKey((k) => k + 1);
   }, []);
 
@@ -612,22 +758,31 @@ export default function App() {
     };
     window.addEventListener('keydown', h);
     return () => window.removeEventListener('keydown', h);
-  }, [restart]);
+  }, [restart, gameMode]);
 
   const resume = () => {
     setPaused(false);
     gameRef.current?.setPaused(false);
   };
 
+  const exitSideMode = useCallback(() => {
+    setStarted(false);
+    setPaused(false);
+    setVictory(false);
+    setSnap(null);
+    snapRef.current = null;
+    setToasts([]);
+  }, []);
+
   const dead = !!snap?.dead;
 
   return (
     <div className="relative h-full w-full overflow-hidden bg-black">
-      <div ref={containerRef} className="absolute inset-0" />
+      {started && <div ref={containerRef} className="absolute inset-0" />}
 
       {started && snap && <Hud s={snap} />}
 
-      {/* event callouts */}
+      {/* Shared combat callouts for duel and side-view modes. */}
       {started && <Callouts toasts={toasts} />}
 
       {/* death */}
@@ -651,6 +806,7 @@ export default function App() {
               Ulangi
             </button>
           )}
+          <button onClick={exitSideMode} className="font-title pointer-events-auto mt-4 text-[10px] tracking-[0.3em] text-white/45 uppercase hover:text-white/85">Kembali ke Menu</button>
         </div>
       )}
 
@@ -660,7 +816,9 @@ export default function App() {
           <div className="font-jp text-[clamp(100px,20vw,240px)] leading-none font-extrabold text-amber-100 drop-shadow-[0_0_40px_rgba(255,200,100,.7)]">
             勝利
           </div>
-          <div className="font-title mt-3 text-lg tracking-[0.5em] text-white/90 uppercase">Sang jenderal telah tumbang</div>
+          <div className="font-title mt-3 text-lg tracking-[0.5em] text-white/90 uppercase">
+            {gameMode === 'duel' ? 'Sang jenderal telah tumbang' : gameMode === 'apartment' ? 'Koridor aman · misi selesai' : 'Runner selesai'}
+          </div>
           {snap && (
             <div className="font-title mt-6 grid grid-cols-2 gap-x-10 gap-y-1 text-sm tracking-[0.2em] text-white/70 uppercase">
               <span>Deflect</span>
@@ -679,8 +837,9 @@ export default function App() {
             onClick={restart}
             className="font-title mt-8 border border-amber-300/60 bg-amber-900/30 px-10 py-3 text-sm font-bold tracking-[0.4em] text-amber-100 uppercase hover:bg-amber-700/40"
           >
-            Duel Lagi
+            {gameMode === 'duel' ? 'Duel Lagi' : 'Main Lagi'}
           </button>
+          <button onClick={exitSideMode} className="font-title mt-4 text-[10px] tracking-[0.3em] text-white/45 uppercase hover:text-white/85">Kembali ke Menu</button>
         </div>
       )}
 
@@ -729,7 +888,11 @@ export default function App() {
             </div>
           </div>
 
-          <div className="anim-soft pointer-events-auto mt-14 flex flex-col items-center gap-5" style={{ animationDelay: '.2s' }}>
+          <div className="anim-soft pointer-events-auto mt-8" style={{ animationDelay: '.16s' }}>
+            <CombatModePicker mode={combatMode} onChange={chooseCombatMode} />
+          </div>
+
+          <div className="anim-soft pointer-events-auto mt-8 flex flex-col items-center gap-5" style={{ animationDelay: '.2s' }}>
             <button onClick={resume} className="group relative px-8 py-1.5">
               <span className="font-title text-[13px] tracking-[0.5em] text-white/85 uppercase transition-colors group-hover:text-white">
                 Lanjutkan
@@ -738,6 +901,9 @@ export default function App() {
             </button>
             <button onClick={restart} className="font-title text-[9px] tracking-[0.35em] text-white/25 uppercase transition-colors hover:text-white/60">
               Mulai ulang
+            </button>
+            <button onClick={exitSideMode} className="font-title text-[9px] tracking-[0.35em] text-white/25 uppercase transition-colors hover:text-white/60">
+              Kembali ke Menu
             </button>
           </div>
         </div>
@@ -752,6 +918,10 @@ export default function App() {
           setSize={setSize}
           fx={fx}
           setFx={setFx}
+          combatMode={combatMode}
+          setCombatMode={chooseCombatMode}
+          gameMode={gameMode}
+          setGameMode={setGameMode}
           onStart={() => {
             setError('');
             setStarted(true);

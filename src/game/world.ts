@@ -1,6 +1,8 @@
 import * as THREE from 'three';
+import type { GameMode } from './types';
 
-export const ARENA_R = 48;
+export const ARENA_HALF_EXTENT = 240;
+const FIELD_SIZE = 1200;
 
 function canvasTex(size: number, draw: (g: CanvasRenderingContext2D, s: number) => void) {
   const c = document.createElement('canvas');
@@ -46,22 +48,78 @@ export function applyEnvironment(renderer: THREE.WebGLRenderer, scene: THREE.Sce
   pm.dispose();
 }
 
+export interface ParkourSurface {
+  x: number;
+  z: number;
+  width: number;
+  depth: number;
+  top: number;
+}
+
 export interface World {
   petals: THREE.Points;
+  parkourSurfaces: ParkourSurface[];
   flames: THREE.PointLight[];
-  update(t: number, dt: number): void;
+  update(t: number, dt: number, focus?: THREE.Vector3): void;
   moon: THREE.DirectionalLight;
 }
 
 export type Theme = 'white' | 'neon';
 
-/** Flat, shadowless white void for the SUPERHOT arena — everything reads as silhouette and colour. */
+/** Low, broad white rooftop steps sized for the existing jump, double-jump and air-dash moves. */
+const PARKOUR_COURSE: ParkourSurface[] = [
+  { x: 17, z: 18, width: 5.8, depth: 5, top: 0.7 },
+  { x: 22, z: 25, width: 5, depth: 5, top: 1.35 },
+  { x: 28, z: 32, width: 5, depth: 5, top: 2.0 },
+  { x: 35, z: 39, width: 5.5, depth: 5.5, top: 2.65 },
+  { x: 43, z: 45, width: 7, depth: 6, top: 3.3 },
+];
+
+function addParkourCourse(
+  scene: THREE.Scene,
+  sideMaterial: THREE.Material,
+  topMaterial: THREE.Material,
+  trimMaterial: THREE.Material,
+) {
+  for (const surface of PARKOUR_COURSE) {
+    const bodyHeight = Math.max(0.15, surface.top - 0.12);
+    const body = new THREE.Mesh(
+      new THREE.BoxGeometry(surface.width, bodyHeight, surface.depth),
+      sideMaterial,
+    );
+    body.position.set(surface.x, bodyHeight / 2, surface.z);
+    body.castShadow = true;
+    body.receiveShadow = true;
+    scene.add(body);
+
+    const cap = new THREE.Mesh(
+      new THREE.BoxGeometry(surface.width + 0.08, 0.12, surface.depth + 0.08),
+      topMaterial,
+    );
+    cap.position.set(surface.x, surface.top - 0.06, surface.z);
+    cap.castShadow = true;
+    cap.receiveShadow = true;
+    scene.add(cap);
+
+    // Pale-gray landing marks define the edge while keeping the monochrome-white treatment.
+    const mark = new THREE.Mesh(
+      new THREE.PlaneGeometry(surface.width - 0.8, 0.14),
+      trimMaterial,
+    );
+    mark.rotation.x = -Math.PI / 2;
+    mark.position.set(surface.x, surface.top + 0.003, surface.z + surface.depth / 2 - 0.38);
+    scene.add(mark);
+  }
+  return PARKOUR_COURSE.map((surface) => ({ ...surface }));
+}
+
+/** Neutral-white daylight reflections for the monochrome city, kept below mirror-bright levels. */
 export function applyWhiteEnvironment(renderer: THREE.WebGLRenderer, scene: THREE.Scene) {
   const env = new THREE.Scene();
   env.add(
     new THREE.Mesh(
       new THREE.SphereGeometry(220, 16, 10),
-      new THREE.MeshBasicMaterial({ color: new THREE.Color(0.62, 0.63, 0.68), side: THREE.BackSide }),
+      new THREE.MeshBasicMaterial({ color: new THREE.Color(0.76, 0.77, 0.78), side: THREE.BackSide }),
     ),
   );
   const pm = new THREE.PMREMGenerator(renderer);
@@ -72,18 +130,17 @@ export function applyWhiteEnvironment(renderer: THREE.WebGLRenderer, scene: THRE
 }
 
 /**
- * SUPERHOT arena: a blinding white void. The floor is bare white with faint grid seams, the only scenery is a
- * handful of low polygonal blocks, and everything else is light. Blue sparks and black silhouettes pop hard against it.
+ * High-key monochrome city plaza with white rooftops, subtle gray windows, and a traversable parkour route.
  */
 export function buildWhiteWorld(scene: THREE.Scene): World {
-  scene.background = new THREE.Color(0xd9dce3);
+  scene.background = new THREE.Color(0xdfe2e4);
 
-  // ---------- light: broad and flat, with one soft key so shapes still read ----------
-  scene.add(new THREE.HemisphereLight(0xdfe3ea, 0xaeb4c0, 0.75));
-  const moon = new THREE.DirectionalLight(0xf2f4f8, 0.75);
+  // Neutral daylight, soft shadows and a restrained exposure keep the all-white city easy on the eyes.
+  scene.add(new THREE.HemisphereLight(0xf0f1f2, 0xbfc3c6, 0.72));
+  const moon = new THREE.DirectionalLight(0xf7f7f7, 0.78);
   moon.position.set(-25, 45, -15);
   moon.castShadow = true;
-  moon.shadow.mapSize.set(2048, 2048);
+  moon.shadow.mapSize.set(1024, 1024);
   const sc = moon.shadow.camera as THREE.OrthographicCamera;
   sc.left = -50;
   sc.right = 50;
@@ -94,15 +151,15 @@ export function buildWhiteWorld(scene: THREE.Scene): World {
   moon.shadow.bias = -0.0004;
   moon.shadow.normalBias = 0.03;
   scene.add(moon);
-  const fill = new THREE.DirectionalLight(0xdfe6f5, 0.3);
+  const fill = new THREE.DirectionalLight(0xe7e9eb, 0.3);
   fill.position.set(14, 7, 16);
   scene.add(fill);
 
   // ---------- floor ----------
   const floorTex = canvasTex(1024, (g, s) => {
-    g.fillStyle = '#c9cdd6';
+    g.fillStyle = '#dfe2e4';
     g.fillRect(0, 0, s, s);
-    g.strokeStyle = 'rgba(90,100,120,0.22)';
+    g.strokeStyle = 'rgba(112,118,123,0.16)';
     g.lineWidth = 2;
     const step = s / 8;
     for (let i = 0; i <= 8; i++) {
@@ -117,84 +174,99 @@ export function buildWhiteWorld(scene: THREE.Scene): World {
     }
   });
   floorTex.wrapS = floorTex.wrapT = THREE.RepeatWrapping;
-  floorTex.repeat.set(3, 3);
+  floorTex.repeat.set(12, 12);
   const ground = new THREE.Mesh(
-    new THREE.CircleGeometry(ARENA_R + 1.5, 64),
-    new THREE.MeshStandardMaterial({ map: floorTex, roughness: 0.82, metalness: 0.02 }),
+    new THREE.PlaneGeometry(FIELD_SIZE, FIELD_SIZE),
+    new THREE.MeshStandardMaterial({ map: floorTex, roughness: 0.9, metalness: 0 }),
   );
   ground.rotation.x = -Math.PI / 2;
   ground.receiveShadow = true;
   scene.add(ground);
 
-  const outer = new THREE.Mesh(
-    new THREE.CircleGeometry(160, 48),
-    new THREE.MeshStandardMaterial({ color: 0xcfd3db, roughness: 1 }),
-  );
-  outer.rotation.x = -Math.PI / 2;
-  outer.position.y = -0.03;
-  outer.receiveShadow = true;
-  scene.add(outer);
+  // ---------- white city blocks around an open central plaza ----------
+  const facadeM = new THREE.MeshStandardMaterial({ color: 0xe1e3e5, roughness: 0.9 });
+  const roofM = new THREE.MeshStandardMaterial({ color: 0xe9ebed, roughness: 0.9 });
+  const ledgeM = new THREE.MeshStandardMaterial({ color: 0xd1d5d8, roughness: 0.9 });
+  const windowM = new THREE.MeshStandardMaterial({ color: 0xcbd0d4, roughness: 0.72, metalness: 0 });
 
-  // ---------- scenery: plain white blocks, a few red accents ----------
-  const whiteM = new THREE.MeshStandardMaterial({ color: 0xe6e9ef, roughness: 0.7, metalness: 0.04 });
-  const edgeM = new THREE.MeshStandardMaterial({ color: 0xb2b8c4, roughness: 0.75 });
-  const redM = new THREE.MeshStandardMaterial({ color: 0xd42424, roughness: 0.5, emissive: 0x2a0000, emissiveIntensity: 0.3 });
-
-  const block = (x: number, z: number, w: number, h: number, d: number, ry: number, red = false) => {
-    const m = new THREE.Mesh(new THREE.BoxGeometry(w, h, d), red ? redM : whiteM);
-    m.position.set(x, h / 2, z);
-    m.rotation.y = ry;
-    m.castShadow = true;
-    m.receiveShadow = true;
-    scene.add(m);
-    // thin seam cap so the silhouette reads against the white sky
-    const cap = new THREE.Mesh(new THREE.BoxGeometry(w * 1.02, 0.03, d * 1.02), edgeM);
-    cap.position.set(x, h, z);
-    cap.rotation.y = ry;
-    scene.add(cap);
-    return m;
-  };
-
-  // low cover scattered around the ring
-  const spots: [number, number, number, number, number][] = [
-    [-9, -7, 1.6, 1.1, 1.6],
-    [8, -9, 2.2, 0.8, 1.2],
-    [11, 4, 1.2, 1.6, 1.2],
-    [-11, 6, 2.6, 0.7, 1.0],
-    [0, -13, 3.2, 1.3, 1.0],
-    [-5, 12, 1.4, 0.9, 1.4],
-    [6, 12, 1.0, 1.9, 1.0],
+  const cityBlocks: [number, number, number, number, number, number][] = [
+    [-54, -44, 16, 18, 24, 0.04], [-20, -66, 18, 15, 18, -0.08],
+    [18, -65, 17, 18, 31, 0.06], [54, -51, 17, 17, 26, -0.07],
+    [-68, -3, 20, 17, 34, 0.12], [-61, 40, 18, 18, 23, 0.04],
+    [68, 0, 20, 18, 31, 0.08], [71, 50, 18, 17, 31, -0.1],
+    [24, 78, 17, 20, 28, 0.04], [-22, 78, 20, 16, 32, -0.08],
+    [105, 10, 22, 24, 45, 0.1], [-103, -24, 24, 18, 42, 0.18],
+    [103, 84, 24, 20, 37, 0.12], [-95, 87, 24, 22, 46, -0.08],
+    [43, -110, 22, 20, 38, -0.12], [-45, -116, 24, 22, 36, 0.14],
+    [139, -42, 28, 24, 52, 0.12], [-143, 44, 30, 26, 48, -0.12],
   ];
-  spots.forEach(([x, z, w, h, d], i) => block(x, z, w, h, d, (i * 0.7) % Math.PI, i === 2 || i === 5));
 
-  // tall slabs far out, like the empty galleries of SUPERHOT
-  for (let i = 0; i < 10; i++) {
-    const a = (i / 10) * Math.PI * 2 + 0.3;
-    const r = 26 + (i % 3) * 7;
-    const h = 7 + (i % 4) * 4;
-    const m = new THREE.Mesh(new THREE.BoxGeometry(5 + (i % 2) * 4, h, 5), whiteM);
-    m.position.set(Math.cos(a) * r, h / 2, Math.sin(a) * r);
-    m.rotation.y = a;
-    m.castShadow = true;
-    scene.add(m);
-  }
+  cityBlocks.forEach(([x, z, width, depth, height, rotation], index) => {
+    const building = new THREE.Group();
+    const body = new THREE.Mesh(new THREE.BoxGeometry(width, height, depth), index % 3 === 0 ? roofM : facadeM);
+    body.position.y = height / 2;
+    body.castShadow = true;
+    body.receiveShadow = true;
+    building.add(body);
 
-  // arena rim: a clean white kerb with red marker posts
-  const kerb = new THREE.Mesh(new THREE.TorusGeometry(ARENA_R + 1.3, 0.16, 8, 72), edgeM);
-  kerb.rotation.x = Math.PI / 2;
-  kerb.position.y = 0.16;
-  kerb.receiveShadow = true;
-  scene.add(kerb);
+    // Thin roof lips and a raised white penthouse give each tower a readable silhouette.
+    const roofLip = new THREE.Mesh(new THREE.BoxGeometry(width + 0.6, 0.32, depth + 0.6), ledgeM);
+    roofLip.position.y = height + 0.16;
+    roofLip.castShadow = true;
+    roofLip.receiveShadow = true;
+    building.add(roofLip);
+    const penthouse = new THREE.Mesh(new THREE.BoxGeometry(width * 0.42, 2.2, depth * 0.44), roofM);
+    penthouse.position.set(-width * 0.12, height + 1.42, -depth * 0.1);
+    penthouse.castShadow = true;
+    penthouse.receiveShadow = true;
+    building.add(penthouse);
+
+    // Repeated matte, white-gray window bands signal a city facade without introducing color or glare.
+    const floors = Math.floor((height - 2.4) / 3.6);
+    const frontWindows = new THREE.InstancedMesh(
+      new THREE.BoxGeometry(width * 0.82, 0.72, 0.045), windowM, Math.max(1, floors),
+    );
+    const sideWindows = new THREE.InstancedMesh(
+      new THREE.BoxGeometry(0.045, 0.72, depth * 0.78), windowM, Math.max(1, floors),
+    );
+    const dummy = new THREE.Object3D();
+    for (let floor = 0; floor < floors; floor++) {
+      const y = 2.15 + floor * 3.6;
+      dummy.position.set(0, y, depth / 2 + 0.025);
+      dummy.updateMatrix();
+      frontWindows.setMatrixAt(floor, dummy.matrix);
+      dummy.position.set(width / 2 + 0.025, y, 0);
+      dummy.updateMatrix();
+      sideWindows.setMatrixAt(floor, dummy.matrix);
+    }
+    frontWindows.instanceMatrix.needsUpdate = true;
+    sideWindows.instanceMatrix.needsUpdate = true;
+    frontWindows.castShadow = false;
+    sideWindows.castShadow = false;
+    building.add(frontWindows, sideWindows);
+
+    // A few slim vertical mullions break the broad window bands into calm, legible city-scale panels.
+    const mullionGeometry = new THREE.BoxGeometry(0.08, height - 1.4, 0.07);
+    for (const mullionX of [-width * 0.25, width * 0.25]) {
+      const mullion = new THREE.Mesh(mullionGeometry, roofM);
+      mullion.position.set(mullionX, height / 2, depth / 2 + 0.06);
+      building.add(mullion);
+    }
+
+    building.position.set(x, 0, z);
+    building.rotation.y = rotation;
+    scene.add(building);
+  });
+
+  const parkourSurfaces = addParkourCourse(
+    scene,
+    new THREE.MeshStandardMaterial({ color: 0xcbd0d4, roughness: 0.92 }),
+    new THREE.MeshStandardMaterial({ color: 0xe9ebed, roughness: 0.9 }),
+    new THREE.MeshBasicMaterial({ color: 0xb8bdc1 }),
+  );
+
+  // No circular rim or posts: the battlefield continues as an open plane.
   const flames: THREE.PointLight[] = [];
-  for (let i = 0; i < 8; i++) {
-    const a = (i / 8) * Math.PI * 2 + 0.4;
-    const x = Math.cos(a) * (ARENA_R + 2.6);
-    const z = Math.sin(a) * (ARENA_R + 2.6);
-    const post = new THREE.Mesh(new THREE.BoxGeometry(0.22, 2.2, 0.22), i % 2 ? redM : whiteM);
-    post.position.set(x, 1.1, z);
-    post.castShadow = true;
-    scene.add(post);
-  }
 
   // ---------- drifting white motes (replaces the petals) ----------
   const N = 260;
@@ -210,13 +282,14 @@ export function buildWhiteWorld(scene: THREE.Scene): World {
   pg.setAttribute('position', new THREE.BufferAttribute(pos, 3));
   const petals = new THREE.Points(
     pg,
-    new THREE.PointsMaterial({ color: 0x9aa4b8, size: 0.07, transparent: true, opacity: 0.5, depthWrite: false }),
+    new THREE.PointsMaterial({ color: 0xbfc3c6, size: 0.045, transparent: true, opacity: 0.22, depthWrite: false }),
   );
   petals.frustumCulled = false;
   scene.add(petals);
 
   return {
     petals,
+    parkourSurfaces,
     flames,
     moon,
     update(t: number, dt: number) {
@@ -232,6 +305,219 @@ export function buildWhiteWorld(scene: THREE.Scene): World {
         }
       }
       a.needsUpdate = true;
+    },
+  };
+}
+
+/** 3D side-view environments for the Sekiro gameplay modes. The runner's scenery is tiled endlessly along +Z. */
+export function buildSideWorld(scene: THREE.Scene, mode: Exclude<GameMode, 'duel'>): World {
+  const runner = mode === 'runner';
+  scene.background = new THREE.Color(runner ? 0xdce1e4 : 0x171922);
+  scene.fog = new THREE.FogExp2(runner ? 0xdce1e4 : 0x171922, runner ? 0.006 : 0.012);
+
+  scene.add(new THREE.HemisphereLight(runner ? 0xffffff : 0xa2a8c0, runner ? 0x90979d : 0x201b27, runner ? 1.1 : 0.58));
+  const moon = new THREE.DirectionalLight(runner ? 0xffffff : 0xffc78e, runner ? 1.35 : 1.1);
+  moon.position.set(-16, 24, -12);
+  moon.castShadow = true;
+  moon.shadow.mapSize.set(1024, 1024);
+  const shadowCamera = moon.shadow.camera as THREE.OrthographicCamera;
+  shadowCamera.left = -24;
+  shadowCamera.right = 24;
+  shadowCamera.top = 24;
+  shadowCamera.bottom = -24;
+  shadowCamera.near = 1;
+  shadowCamera.far = 70;
+  moon.shadow.bias = -0.0005;
+  scene.add(moon);
+  const fill = new THREE.DirectionalLight(runner ? 0xeaf4ff : 0x809bda, runner ? 0.55 : 0.48);
+  fill.position.set(10, 7, 12);
+  scene.add(fill);
+
+  const flames: THREE.PointLight[] = [];
+  const parkourSurfaces: ParkourSurface[] = [];
+  const movingGroups: THREE.Group[] = [];
+  const tileLength = 80;
+
+  if (runner) {
+    const road = new THREE.MeshStandardMaterial({ color: 0xc4c9cd, roughness: 0.9 });
+    const edge = new THREE.MeshStandardMaterial({ color: 0xe5e8ea, roughness: 0.82 });
+    const paint = new THREE.MeshStandardMaterial({ color: 0xaab1b6, roughness: 0.86 });
+    for (let i = -1; i <= 1; i++) {
+      const tile = new THREE.Group();
+      const slab = new THREE.Mesh(new THREE.BoxGeometry(6.2, 0.3, tileLength), road);
+      slab.position.y = -0.15;
+      slab.receiveShadow = true;
+      tile.add(slab);
+      for (const x of [-2.95, 2.95]) {
+        const curb = new THREE.Mesh(new THREE.BoxGeometry(0.22, 0.48, tileLength), edge);
+        curb.position.set(x, 0.12, 0);
+        curb.castShadow = true;
+        tile.add(curb);
+      }
+      for (const x of [-1.05, 1.05]) {
+        const stripe = new THREE.Mesh(new THREE.BoxGeometry(0.045, 0.012, tileLength), paint);
+        stripe.position.set(x, 0.006, 0);
+        tile.add(stripe);
+      }
+      tile.position.z = i * tileLength;
+      scene.add(tile);
+      movingGroups.push(tile);
+    }
+
+    // Repeating monochrome high-rises provide continuous parallax without ever reaching a level edge.
+    const facade = new THREE.MeshStandardMaterial({ color: 0xe6e9eb, roughness: 0.9 });
+    const shadowFacade = new THREE.MeshStandardMaterial({ color: 0xb8bec3, roughness: 0.94 });
+    const glass = new THREE.MeshStandardMaterial({ color: 0xaab7c0, roughness: 0.48, metalness: 0.08 });
+    for (let tileIndex = -1; tileIndex <= 1; tileIndex++) {
+      const tile = new THREE.Group();
+      for (let i = 0; i < 7; i++) {
+        const side = i % 2 === 0 ? -1 : 1;
+        const width = 5 + (i % 3) * 1.4;
+        const depth = 5 + ((i + 1) % 3) * 1.2;
+        const height = 11 + ((i * 7) % 19);
+        const x = side < 0 ? -17 - (i % 3) * 5 : 17 + (i % 2) * 5;
+        const z = -34 + i * 11;
+        const block = new THREE.Mesh(new THREE.BoxGeometry(width, height, depth), i % 3 === 0 ? shadowFacade : facade);
+        block.position.set(x, height / 2 - 1.8, z);
+        block.castShadow = true;
+        block.receiveShadow = true;
+        tile.add(block);
+        const roof = new THREE.Mesh(new THREE.BoxGeometry(width + 0.35, 0.22, depth + 0.35), edge);
+        roof.position.set(x, height - 1.69, z);
+        tile.add(roof);
+        const windowBand = new THREE.Mesh(new THREE.BoxGeometry(width * 0.76, 0.18, 0.04), glass);
+        windowBand.position.set(x, Math.max(2.6, height * 0.55 - 1.8), z + depth / 2 + 0.025);
+        tile.add(windowBand);
+      }
+      tile.position.z = tileIndex * tileLength;
+      scene.add(tile);
+      movingGroups.push(tile);
+    }
+  } else {
+    // Apartment: a long, readable corridor with door bays, windows and an elevator at the far end.
+    const floor = new THREE.Mesh(
+      new THREE.BoxGeometry(7.2, 0.28, 78),
+      new THREE.MeshStandardMaterial({ color: 0x33343a, roughness: 0.94 }),
+    );
+    floor.position.set(0, -0.14, 31);
+    floor.receiveShadow = true;
+    scene.add(floor);
+
+    const wall = new THREE.Mesh(
+      new THREE.BoxGeometry(0.42, 6.2, 82),
+      new THREE.MeshStandardMaterial({ color: 0x4b4645, roughness: 0.9 }),
+    );
+    wall.position.set(3.45, 3.1, 30);
+    wall.receiveShadow = true;
+    scene.add(wall);
+    const baseboard = new THREE.Mesh(new THREE.BoxGeometry(0.12, 0.32, 82), new THREE.MeshStandardMaterial({ color: 0x8b6655, roughness: 0.8 }));
+    baseboard.position.set(3.19, 0.18, 30);
+    scene.add(baseboard);
+    const floorLine = new THREE.Mesh(new THREE.BoxGeometry(5.9, 0.018, 78), new THREE.MeshStandardMaterial({ color: 0x656064, roughness: 0.85 }));
+    floorLine.position.set(0, 0.012, 31);
+    scene.add(floorLine);
+
+    const doorFrame = new THREE.MeshStandardMaterial({ color: 0xb27e55, roughness: 0.72, metalness: 0.12 });
+    const doorMat = new THREE.MeshStandardMaterial({ color: 0x29272b, roughness: 0.76 });
+    const windowMat = new THREE.MeshStandardMaterial({ color: 0x68809b, emissive: 0x15253b, emissiveIntensity: 0.55, roughness: 0.32 });
+    for (const z of [7, 20, 33, 46]) {
+      const door = new THREE.Group();
+      const panel = new THREE.Mesh(new THREE.BoxGeometry(0.12, 2.55, 1.42), doorMat);
+      panel.position.y = 1.29;
+      const left = new THREE.Mesh(new THREE.BoxGeometry(0.16, 2.75, 0.12), doorFrame);
+      left.position.set(-0.08, 1.38, -0.8);
+      const right = left.clone();
+      right.position.z = 0.8;
+      const header = new THREE.Mesh(new THREE.BoxGeometry(0.16, 0.12, 1.72), doorFrame);
+      header.position.set(-0.08, 2.76, 0);
+      door.add(panel, left, right, header);
+      door.position.set(3.05, 0, z);
+      door.traverse((o) => { if (o instanceof THREE.Mesh) { o.castShadow = true; o.receiveShadow = true; } });
+      scene.add(door);
+      const number = new THREE.Mesh(new THREE.BoxGeometry(0.07, 0.2, 0.42), windowMat);
+      number.position.set(2.94, 2.34, z - 0.55);
+      scene.add(number);
+    }
+
+    for (const z of [13.5, 39.5]) {
+      const window = new THREE.Mesh(new THREE.BoxGeometry(0.06, 2.15, 3.1), windowMat);
+      window.position.set(3.16, 3.65, z);
+      window.castShadow = false;
+      scene.add(window);
+      const sill = new THREE.Mesh(new THREE.BoxGeometry(0.3, 0.12, 3.3), doorFrame);
+      sill.position.set(3.04, 2.5, z);
+      scene.add(sill);
+    }
+
+    const ceilingBeam = new THREE.MeshStandardMaterial({ color: 0x282a31, roughness: 0.84 });
+    for (const z of [4, 17, 30, 43, 56]) {
+      const beam = new THREE.Mesh(new THREE.BoxGeometry(6.8, 0.28, 0.35), ceilingBeam);
+      beam.position.set(0, 6.0, z);
+      scene.add(beam);
+      const lamp = new THREE.Mesh(
+        new THREE.BoxGeometry(0.35, 0.08, 2.2),
+        new THREE.MeshStandardMaterial({ color: 0xf7c77b, emissive: 0xe28c42, emissiveIntensity: 1.1 }),
+      );
+      lamp.position.set(0.5, 5.8, z + 0.3);
+      scene.add(lamp);
+      const light = new THREE.PointLight(0xffbd72, 1.8, 12, 1.8);
+      light.position.set(0.4, 5.25, z + 0.2);
+      scene.add(light);
+      flames.push(light);
+    }
+
+    // The elevator door and lit sign mark the mission exit beyond the final guard.
+    const elevator = new THREE.Group();
+    const elevatorFrame = new THREE.Mesh(new THREE.BoxGeometry(0.7, 4.8, 4.2), doorFrame);
+    elevatorFrame.position.set(2.6, 2.4, 57);
+    const elevatorDoor = new THREE.Mesh(new THREE.BoxGeometry(0.24, 4.3, 3.45), doorMat);
+    elevatorDoor.position.set(2.15, 2.15, 57);
+    const sign = new THREE.Mesh(new THREE.BoxGeometry(0.08, 0.45, 1.3), windowMat);
+    sign.position.set(1.75, 5.05, 57);
+    elevator.add(elevatorFrame, elevatorDoor, sign);
+    elevator.traverse((o) => { if (o instanceof THREE.Mesh) { o.castShadow = true; o.receiveShadow = true; } });
+    scene.add(elevator);
+  }
+
+  // Sparse floating dust catches the light, but the fighters and attack tells remain clear.
+  const moteCount = runner ? 90 : 42;
+  const motePositions = new Float32Array(moteCount * 3);
+  for (let i = 0; i < moteCount; i++) {
+    motePositions[i * 3] = (Math.random() - 0.5) * 7;
+    motePositions[i * 3 + 1] = 0.4 + Math.random() * 5;
+    motePositions[i * 3 + 2] = (Math.random() - 0.5) * (runner ? 80 : 64);
+  }
+  const moteGeometry = new THREE.BufferGeometry();
+  moteGeometry.setAttribute('position', new THREE.BufferAttribute(motePositions, 3));
+  const petals = new THREE.Points(
+    moteGeometry,
+    new THREE.PointsMaterial({ color: runner ? 0xffffff : 0xffcb8a, size: runner ? 0.055 : 0.035, transparent: true, opacity: runner ? 0.35 : 0.23, depthWrite: false }),
+  );
+  petals.frustumCulled = false;
+  scene.add(petals);
+
+  return {
+    petals,
+    parkourSurfaces,
+    flames,
+    moon,
+    update(t: number, dt: number, focus?: THREE.Vector3) {
+      if (runner && focus) {
+        const center = Math.floor(focus.z / tileLength) * tileLength;
+        let tileIndex = 0;
+        for (let i = -1; i <= 1; i++, tileIndex++) {
+          movingGroups[tileIndex].position.z = center + i * tileLength;
+          movingGroups[tileIndex + 3].position.z = center + i * tileLength;
+        }
+      }
+      const attr = moteGeometry.attributes.position as THREE.BufferAttribute;
+      for (let i = 0; i < moteCount; i++) {
+        motePositions[i * 3 + 1] += Math.sin(t * 0.8 + i) * dt * 0.035;
+        if (focus && Math.abs(motePositions[i * 3 + 2] + (runner ? focus.z : 0)) > (runner ? 42 : 40)) {
+          motePositions[i * 3 + 2] = (Math.random() - 0.5) * (runner ? 80 : 64) - (runner ? focus.z : 0);
+        }
+      }
+      attr.needsUpdate = true;
     },
   };
 }
@@ -294,7 +580,7 @@ export function buildWorld(scene: THREE.Scene): World {
   const moon = new THREE.DirectionalLight(0xff5aa8, 2.1); // magenta neon key light
   moon.position.set(-14, 16, -12);
   moon.castShadow = true;
-  moon.shadow.mapSize.set(2048, 2048);
+  moon.shadow.mapSize.set(1024, 1024);
   const sc = moon.shadow.camera as THREE.OrthographicCamera;
   sc.left = -20;
   sc.right = 20;
@@ -321,49 +607,31 @@ export function buildWorld(scene: THREE.Scene): World {
       img.data[i + 2] += n;
     }
     g.putImageData(img, 0, 0);
-    // raked concentric lines
-    g.strokeStyle = 'rgba(20,16,26,0.35)';
+    // Subtle straight inlays read as an open field, not a circular arena.
+    g.strokeStyle = 'rgba(20,16,26,0.22)';
     g.lineWidth = 2;
-    for (let r = 20; r < s * 0.5; r += 14) {
+    const step = s / 8;
+    for (let i = 0; i <= 8; i++) {
+      const p = i * step;
       g.beginPath();
-      g.arc(s / 2, s / 2, r, 0, Math.PI * 2);
+      g.moveTo(p, 0);
+      g.lineTo(p, s);
       g.stroke();
-    }
-    g.strokeStyle = 'rgba(255,230,210,0.07)';
-    for (let r = 27; r < s * 0.5; r += 14) {
       g.beginPath();
-      g.arc(s / 2, s / 2, r, 0, Math.PI * 2);
+      g.moveTo(0, p);
+      g.lineTo(s, p);
       g.stroke();
     }
   });
+  gravel.wrapS = gravel.wrapT = THREE.RepeatWrapping;
+  gravel.repeat.set(18, 18);
   const ground = new THREE.Mesh(
-    new THREE.CircleGeometry(ARENA_R + 1.5, 64),
+    new THREE.PlaneGeometry(FIELD_SIZE, FIELD_SIZE),
     new THREE.MeshStandardMaterial({ map: gravel, roughness: 0.95, metalness: 0 }),
   );
   ground.rotation.x = -Math.PI / 2;
   ground.receiveShadow = true;
   scene.add(ground);
-
-  const outer = new THREE.Mesh(
-    new THREE.CircleGeometry(160, 48),
-    new THREE.MeshStandardMaterial({ color: 0x1d1a24, roughness: 1 }),
-  );
-  outer.rotation.x = -Math.PI / 2;
-  outer.position.y = -0.03;
-  outer.receiveShadow = true;
-  scene.add(outer);
-
-  // stone ring edge
-  const stoneM = new THREE.MeshStandardMaterial({ color: 0x5b5560, roughness: 0.9 });
-  for (let i = 0; i < 56; i++) {
-    const a = (i / 56) * Math.PI * 2;
-    const s = new THREE.Mesh(new THREE.BoxGeometry(1.5, 0.35, 0.6), stoneM);
-    s.position.set(Math.cos(a) * (ARENA_R + 1.3), 0.15, Math.sin(a) * (ARENA_R + 1.3));
-    s.rotation.y = -a + Math.PI / 2;
-    s.castShadow = true;
-    s.receiveShadow = true;
-    scene.add(s);
-  }
 
   // ---------- torii gates ----------
   const red = new THREE.MeshStandardMaterial({ color: 0xa8231e, roughness: 0.6, metalness: 0.1 });
@@ -437,11 +705,9 @@ export function buildWorld(scene: THREE.Scene): World {
   const trunkM = new THREE.MeshStandardMaterial({ color: 0x2c1b17, roughness: 1 });
   const blossomM = new THREE.MeshStandardMaterial({ color: 0xff4f9e, roughness: 0.85, emissive: 0x8a1050, emissiveIntensity: 1.1 });
   for (let i = 0; i < 18; i++) {
-    const a = (i / 18) * Math.PI * 2 + Math.random() * 0.2;
-    const r = ARENA_R + 6 + Math.random() * 14;
-    const x = Math.cos(a) * r;
-    const z = Math.sin(a) * r;
-    if (z < -20 && Math.abs(x) < 20) continue;
+    const x = (Math.random() - 0.5) * 150;
+    const z = (Math.random() - 0.5) * 150;
+    if (Math.hypot(x, z) < 24 || (z < -20 && Math.abs(x) < 20)) continue;
     const g = new THREE.Group();
     const h = 4 + Math.random() * 2.5;
     const tr = new THREE.Mesh(new THREE.CylinderGeometry(0.28, 0.5, h, 7), trunkM);
@@ -500,10 +766,10 @@ export function buildWorld(scene: THREE.Scene): World {
   lantern(-10, -9, true);
   lantern(10, -9, true);
   lantern(0, 12.5, true);
-  for (let i = 0; i < 8; i++) {
-    const a = (i / 8) * Math.PI * 2 + 0.4;
-    lantern(Math.cos(a) * (ARENA_R + 3), Math.sin(a) * (ARENA_R + 3), false);
-  }
+  lantern(-26, 18, false);
+  lantern(26, 18, false);
+  lantern(-32, 38, false);
+  lantern(32, 38, false);
 
   // ---------- petals ----------
   const N = 500;
@@ -526,6 +792,7 @@ export function buildWorld(scene: THREE.Scene): World {
 
   return {
     petals,
+    parkourSurfaces: [],
     flames,
     moon,
     update(t: number, dt: number) {

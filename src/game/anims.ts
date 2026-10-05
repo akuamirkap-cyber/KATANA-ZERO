@@ -674,7 +674,7 @@ const SEQ3B: Variant[][] = [['diag', 'rise', 'spin'], ['ldiag', 'diag', 'over'],
 const SEQ4: Variant[][] = [['diag', 'ldiag', 'horz', 'spin'], ['horz', 'diag', 'rise', 'over'], ['ldiag', 'diag', 'ldiag', 'over']];
 
 export function enemyAttack(name: EnemyAttackName, boss: boolean): AnimDef {
-  const base = boss ? 0.88 : 1.0;
+  const base = boss ? 1.22 : 1.0;
   const from = IDLE_E;
   switch (name) {
     case 'slash':
