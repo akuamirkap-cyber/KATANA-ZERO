@@ -8,7 +8,7 @@ function postureColor(v: number, broken: boolean) {
 }
 
 /** Posture bar that grows from the center outward — the Sekiro look. Hairline frame, soft glow, tapered ends. */
-function PostureBar({ v, broken, width, h = 8 }: { v: number; broken: boolean; width: number; h?: number }) {
+export function PostureBar({ v, broken, width, h = 8 }: { v: number; broken: boolean; width: number | string; h?: number | string }) {
   const w = Math.max(0, Math.min(1, v)) * 100;
   return (
     <div
@@ -36,7 +36,7 @@ function PostureBar({ v, broken, width, h = 8 }: { v: number; broken: boolean; w
   );
 }
 
-function HealthBar({ v, width, h = 10 }: { v: number; width: number; h?: number }) {
+export function HealthBar({ v, width, h = 10 }: { v: number; width: number | string; h?: number | string }) {
   return (
     <div className="relative" style={{ width, height: h }}>
       <div
@@ -61,7 +61,7 @@ function HealthBar({ v, width, h = 10 }: { v: number; width: number; h?: number 
   );
 }
 
-function Pips({ n, max }: { n: number; max: number }) {
+export function Pips({ n, max }: { n: number; max: number }) {
   return (
     <div className="flex gap-1.5">
       {Array.from({ length: max }).map((_, i) => (
@@ -74,7 +74,7 @@ function Pips({ n, max }: { n: number; max: number }) {
   );
 }
 
-function CombatStateTag({ tell, compact = false }: { tell: EnemyView['combatTell']; compact?: boolean }) {
+export function CombatStateTag({ tell, compact = false }: { tell: EnemyView['combatTell']; compact?: boolean }) {
   if (!tell) return null;
   const label = tell === 'opening' ? 'CELAH · SERANG' : tell === 'parry' ? 'PARRY · V / TUNGGU' : 'GUARD · V / A5';
   const color = tell === 'opening' ? 'border-emerald-300/45 bg-emerald-950/70 text-emerald-100' : tell === 'parry' ? 'border-red-300/45 bg-red-950/75 text-red-100' : 'border-amber-200/40 bg-amber-950/70 text-amber-100';
@@ -106,11 +106,11 @@ function EnemyTop({ e }: { e: EnemyView }) {
 
 type RageView = Snapshot['rage'];
 
-function RageMeter({ r }: { r: RageView }) {
+function RageMeter({ r, w = 240 }: { r: RageView; w?: number }) {
   return (
     <div className="mt-2 flex items-center gap-2">
       <span className={`font-jp text-sm ${r.on ? 'kanji-red' : 'text-red-300/70'}`}>怒</span>
-      <div className={`relative h-[8px] ${r.on ? 'anim-break' : ''}`} style={{ width: 240 }}>
+      <div className={`relative h-[8px] ${r.on ? 'anim-break' : ''}`} style={{ width: w }}>
         <div className="absolute inset-0 border border-white/20 bg-black/60" />
         <div
           className="absolute top-0 bottom-0 left-0 transition-[width] duration-100"
@@ -218,7 +218,7 @@ function AimOverlay({ a }: { a: NonNullable<RageView['aim']> }) {
   );
 }
 
-function RageUI({ r }: { r: RageView }) {
+export function RageUI({ r }: { r: RageView }) {
   return (
     <>
       <div className="absolute inset-x-0 top-0 bg-black transition-[height] duration-300 ease-out" style={{ height: r.aim ? '9%' : 0 }} />
@@ -266,7 +266,7 @@ function RageUI({ r }: { r: RageView }) {
 }
 
 /** Warns about archers / gunners lining up a shot — on-screen marker, or an edge arrow when they're out of view. */
-function ThreatMarkers({ enemies }: { enemies: EnemyView[] }) {
+export function ThreatMarkers({ enemies }: { enemies: EnemyView[] }) {
   return (
     <>
       {enemies
@@ -301,9 +301,13 @@ function ThreatMarkers({ enemies }: { enemies: EnemyView[] }) {
   );
 }
 
-export function Hud({ s }: { s: Snapshot }) {
+/**
+ * The duel HUD. `touch` is set while the on-screen pad is up: the two bottom corners then belong to
+ * the thumbs, so vitality and posture move into the top-left column and the keyboard hints go away.
+ */
+export function Hud({ s, touch = false }: { s: Snapshot; touch?: boolean }) {
   const focus = s.enemies.find((e) => e.focus);
-  const barW = 300;
+  const barW = touch ? 210 : 300;
   const white = s.theme === 'white';
   return (
     <div className="pointer-events-none absolute inset-0 overflow-hidden">
@@ -370,8 +374,8 @@ export function Hud({ s }: { s: Snapshot }) {
         </div>
       )}
 
-      {/* bottom-left: vitality */}
-      <div className="absolute bottom-8 left-8">
+      {/* vitality: bottom-left with a mouse, top-left once the thumb pad owns the bottom corners */}
+      <div className={touch ? 'absolute top-[92px] left-9' : 'absolute bottom-8 left-8'}>
         <div className="mb-1 flex items-center gap-3">
           <span className="font-jp text-xs tracking-[0.3em] text-white/60">体力</span>
           <div className="flex items-center gap-1.5" title="Gourd penyembuh (H)">
@@ -393,14 +397,22 @@ export function Hud({ s }: { s: Snapshot }) {
           </div>
         </div>
         <HealthBar v={s.hp} width={barW} h={12} />
-        <RageMeter r={s.rage} />
+        {touch && (
+          <div className="mt-2">
+            <PostureBar v={s.posture} broken={s.postureBroken} width={barW} h={9} />
+            <div className="font-jp mt-1 text-[10px] tracking-[0.5em] text-white/40">体幹</div>
+          </div>
+        )}
+        <RageMeter r={s.rage} w={touch ? barW - 30 : 240} />
       </div>
 
-      {/* bottom center: posture */}
-      <div className="absolute bottom-12 left-1/2 -translate-x-1/2 text-center">
-        <PostureBar v={s.posture} broken={s.postureBroken} width={380} h={9} />
-        <div className="font-jp mt-1 text-[10px] tracking-[0.5em] text-white/40">体幹</div>
-      </div>
+      {/* bottom center: posture (with a mouse — the touch layout keeps it beside vitality) */}
+      {!touch && (
+        <div className="absolute bottom-12 left-1/2 -translate-x-1/2 text-center">
+          <PostureBar v={s.posture} broken={s.postureBroken} width={380} h={9} />
+          <div className="font-jp mt-1 text-[10px] tracking-[0.5em] text-white/40">体幹</div>
+        </div>
+      )}
 
       {/* top-left stage */}
       <div className="absolute top-7 left-9 flex items-start gap-3">
@@ -465,7 +477,8 @@ export function Hud({ s }: { s: Snapshot }) {
         </div>
       )}
 
-      {/* a short, contextual hint — never a wall of text */}
+      {/* a short, contextual hint — never a wall of text, and never under the thumb cluster */}
+      {!touch && (
       <div className="font-title absolute right-9 bottom-9 space-y-1 text-right text-[9px] tracking-[0.28em] text-white/22 uppercase">
         {s.rage.on ? (
           <>
@@ -482,6 +495,7 @@ export function Hud({ s }: { s: Snapshot }) {
           </>
         )}
       </div>
+      )}
     </div>
   );
 }

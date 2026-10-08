@@ -1,5 +1,4 @@
 export type CombatMode = 'before' | 'after';
-export type GameMode = 'duel' | 'runner' | 'apartment';
 export type CombatTell = 'guard' | 'parry' | 'opening';
 
 export interface EnemyView {

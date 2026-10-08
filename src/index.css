@@ -346,3 +346,16 @@ body,
 .hud-bar-red {
   background: linear-gradient(180deg, #e0302e 0%, #a1161a 55%, #6d0c10 100%);
 }
+
+/* ================= played with a thumb ================= */
+/* The duel fills the whole window and is driven by an on-screen stick and buttons on a phone, so the
+   browser must never scroll, pinch-zoom or rubber-band the frame while a control is being held. */
+canvas {
+  display: block;
+  touch-action: none;
+}
+html,
+body {
+  overscroll-behavior: none;
+  -webkit-tap-highlight-color: transparent;
+}

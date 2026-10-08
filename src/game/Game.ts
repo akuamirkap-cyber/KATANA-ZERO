@@ -10,11 +10,11 @@ import { AnimDef, HitDef, P, PLAYER_COMBO, DEATHBLOW, KICK, enemyAttack, EnemyAt
 import { Loco, LocoOut, newLoco, newOut, stepLoco } from './locomotion';
 import { Sfx } from './audio';
 import { Particles, Sparks, Trail, Shocks } from './fx';
-import { buildWorld, buildWhiteWorld, buildSideWorld, applyEnvironment, applyWhiteEnvironment, Theme, World, ARENA_HALF_EXTENT } from './world';
-import type { Snapshot, GameEvent, EnemyView, CombatMode, GameMode } from './types';
+import { buildWorld, buildWhiteWorld, applyEnvironment, applyWhiteEnvironment, Theme, World, ARENA_HALF_EXTENT } from './world';
+import type { Snapshot, GameEvent, EnemyView, CombatMode } from './types';
 import {
   applyArcs, buildCut, AIM_POSE, buildDodge, DodgeKind, FLIP_OPEN, LAND_HERO_ANIM, LAND_BACK_ANIM,
-  EVADE_SIDE, EVADE_BACK, PARRY_POSE, IMPALE, IMPALED_POSE, TUMBLE_POSE,
+  EVADE_SIDE, EVADE_BACK, PARRY_POSE, IMPALE, IMPALED_POSE, TUMBLE_POSE, MANTLE_PULL, MANTLE_OVER,
 } from './anims';
 import { Streaks } from './streaks';
 import { SliceWorld, Piece, setSliceFxStyle } from './slice';
@@ -26,13 +26,19 @@ import { IDLE_BOW, IDLE_GUN, rangedAttack, RangedAttackName } from './ranged';
 type EKind = 'blade' | 'archer' | 'gunner' | 'boss';
 import { RageShader } from './ragepass';
 
-interface RunnerHazard {
-  root: THREE.Group;
-  z: number;
-  hit: boolean;
-  clearance: number;
-  halfWidth: number;
-}
+/** Actions the on-screen mobile controls can fire. Mirrors the keyboard / mouse bindings. */
+export type TouchAction =
+  | 'attack'
+  | 'jump'
+  | 'dash'
+  | 'guard'
+  | 'finisher'
+  | 'kick'
+  | 'heal'
+  | 'rage'
+  | 'target'
+  | 'lock'
+  | 'pause';
 
 interface CutPlane {
   p0: THREE.Vector3;
@@ -96,7 +102,7 @@ type EnemyState =
   | 'spawn' | 'idle' | 'attack' | 'evade' | 'parry' | 'flinch' | 'recoil' | 'stagger' | 'kicked'
   | 'impaled' | 'tumble' | 'broken' | 'dying' | 'dead';
 type PlayerState =
-  | 'idle' | 'attack' | 'dodge' | 'jump' | 'hurt' | 'broken' | 'heal' | 'stomp' | 'deathblow' | 'recoil' | 'cutaim' | 'cut' | 'style' | 'dive' | 'land' | 'impale' | 'dead';
+  | 'idle' | 'attack' | 'dodge' | 'jump' | 'hurt' | 'broken' | 'heal' | 'stomp' | 'deathblow' | 'recoil' | 'cutaim' | 'cut' | 'style' | 'dive' | 'land' | 'impale' | 'mantle' | 'dead';
 
 interface Foot {
   wx: number;
@@ -111,9 +117,25 @@ interface Foot {
   lift: number;
   pitch: number;
   init: boolean;
+  /** smoothed ground height under this foot (world metres) */
+  gy: number;
+  /** terrain offset of that ground from the body's own floor, in metres (+ = the foot stands on something higher) */
+  tl: number;
 }
+/**
+ * Foot IK reach, in metres of ground offset from the body's own floor. The leg only has ~0.28 m of slack past
+ * a standing hip height, so these are deliberately near that: a heel sliding off a rooftop lip reaches down
+ * and straightens, a toe catching a low step bends the knee — and anything bigger (a whole storey of air under
+ * one foot) saturates into a straight leg instead of stretching the mesh or dragging the hips with it.
+ */
+const FOOT_REACH_UP = 0.3;
+const FOOT_REACH_DOWN = 0.45;
+/** Walk into a rooftop step this tall or lower and the body climbs it instead of bumping into it. */
+const STEP_UP_MAX = 0.95;
+
 const newFoot = (): Foot => ({
   wx: 0, wz: 0, stepping: false, t: 0, dur: 0.15, fx: 0, fz: 0, tx: 0, tz: 0, lift: 0, pitch: 0, init: false,
+  gy: 0, tl: 0,
 });
 
 interface Common {
@@ -319,13 +341,6 @@ export class Game {
   private player!: Player;
   private enemies: Enemy[] = [];
   private enemyId = 1;
-  private runnerDistance = 0;
-  private runnerNextEnemyZ = 14;
-  private runnerNextHazardZ = 8;
-  private runnerSpawnCount = 0;
-  private runnerHazardCount = 0;
-  private runnerHazards: RunnerHazard[] = [];
-
   private raf = 0;
   private lastT = 0;
   private time = 0;
@@ -351,6 +366,30 @@ export class Game {
 
   private keys = new Set<string>();
   private mouseGuard = false;
+  /** guard held down by the on-screen mobile button */
+  private touchGuard = false;
+  /** the on-screen stick + buttons are up → no pointer lock, and the HUD lifts its bars */
+  private touchControls = false;
+  /** on-screen stick vector, -1..1 per axis (0,0 = nobody touching it) */
+  private touchMove = { x: 0, y: 0 };
+  /** a swing pressed in mid-air with an enemy in reach: it is held and comes out the instant feet land */
+  private airSlashQueued = false;
+  /** how hard the last landing hit (0.2 = a small hop, 1 = a rooftop drop) — the landing pose is scaled by it */
+  private landPower = 0.6;
+  /** 1 = the camera is holding its lock, 0 = it has let go and swings behind the fighter (double jump) */
+  private lockW = 1;
+  /** rooftop step being walked up right now (index into world.parkourSurfaces), or -1 */
+  private stepSurf = -1;
+  private stepUpT = 0;
+  private stepDur = 0.3;
+  private stepFrom = new THREE.Vector3();
+  private stepTo = new THREE.Vector3();
+  /** air mantle bookkeeping */
+  private mantleCD = 0;
+  private mantleDur = 0.5;
+  private mantleFrom = new THREE.Vector3();
+  private mantleTo = new THREE.Vector3();
+  private mantleYaw = 0;
   private attackBuf = 0;
   private dodgeBuf = 0;
   private jumpBuf = 0;
@@ -376,6 +415,8 @@ export class Game {
   private skidT = 0;
   private camRoll = 0;
   private rollKick = 0;
+  /** a breath of camera roll locked to the stride phase, so the frame leans into each step while running */
+  private camStride = 0;
   private camBob = 0;
   private camSide = 0.65;
   private cineW = 0;
@@ -491,7 +532,6 @@ export class Game {
     private sizeMode: SizeMode = 'chibi',
     private fxStyle: FxStyle = 'kz',
     private combatMode: CombatMode = 'after',
-    private gameMode: GameMode = 'duel',
   ) {
     const w = container.clientWidth || window.innerWidth;
     const h = container.clientHeight || window.innerHeight;
@@ -504,7 +544,7 @@ export class Game {
     this.renderer.shadowMap.enabled = true;
     this.renderer.shadowMap.type = THREE.PCFSoftShadowMap;
     this.renderer.toneMapping = THREE.ACESFilmicToneMapping;
-    this.renderer.toneMappingExposure = this.gameMode !== 'duel' ? 1.02 : this.theme === 'white' ? 0.84 : 1.05;
+    this.renderer.toneMappingExposure = this.theme === 'white' ? 0.84 : 1.05;
     this.renderer.domElement.style.display = 'block';
     container.appendChild(this.renderer.domElement);
 
@@ -513,19 +553,15 @@ export class Game {
     this.chibi = this.sizeMode === 'chibi';
     this.sizeK = this.chibi ? CHIBI_K : 1;
     this.sprintSpd = 14.0 * (0.3 + 0.7 * (this.sizeK * (this.chibi ? 0.9 : 1)));
-    const white = this.gameMode === 'duel' && this.theme === 'white';
+    const white = this.theme === 'white';
     this.scene.fog = white ? new THREE.FogExp2(0xdfe2e4, 0.0095) : new THREE.FogExp2(0x2a1038, 0.015);
-    this.fov = this.gameMode === 'duel' ? 58 : 39;
+    this.fov = 58;
     this.camera = new THREE.PerspectiveCamera(this.fov, w / h, 0.03, 700);
     this.scene.add(this.camera);
 
-    if (this.gameMode === 'duel') {
-      this.world = white ? buildWhiteWorld(this.scene) : buildWorld(this.scene);
-      if (white) applyWhiteEnvironment(this.renderer, this.scene);
-      else applyEnvironment(this.renderer, this.scene);
-    } else {
-      this.world = buildSideWorld(this.scene, this.gameMode);
-    }
+    this.world = white ? buildWhiteWorld(this.scene) : buildWorld(this.scene);
+    if (white) applyWhiteEnvironment(this.renderer, this.scene);
+    else applyEnvironment(this.renderer, this.scene);
 
     this.blood = new Particles(this.scene, 700, false, 9, 0.6);
     this.dust = new Particles(this.scene, 300, false, -0.2, 2.2, 1.2);
@@ -564,35 +600,49 @@ export class Game {
     this.sfx.init();
     this.requestLock();
     this.initRage();
-    if (this.gameMode === 'runner') {
-      this.stage = 0;
-      this.stageCleared = false;
-      this.ended = false;
-      this.runnerNextEnemyZ = 14;
-      this.runnerNextHazardZ = 8;
-      this.onEvent({ type: 'stage', text: 'NINJA RUNNER · endless' });
-    } else {
-      this.nextStage();
-    }
-    // Keep the duel's opening crane shot; side modes begin directly in their fixed side-view camera.
-    if (this.gameMode === 'duel') {
-      const openingBoss = this.enemies.find((e) => this.isHeavyBoss(e)) ?? null;
-      const bossIntro = openingBoss !== null;
-      this.startCine('intro', this.player.pos.clone().setY(1.3), bossIntro ? 4.2 : 3.8);
-      if (bossIntro) {
-        this.cine.r0 = 24;
-        this.cine.r1 = 18;
-        this.cine.h0 = 12;
-        this.cine.h1 = 7;
-        this.cine.fov = 58;
-      }
+    this.airSlashQueued = false;
+    this.nextStage();
+    // the duel opens on a crane shot that settles into the fight
+    const openingBoss = this.enemies.find((e) => this.isHeavyBoss(e)) ?? null;
+    const bossIntro = openingBoss !== null;
+    this.startCine('intro', this.player.pos.clone().setY(1.3), bossIntro ? 4.2 : 3.8);
+    if (bossIntro) {
+      this.cine.r0 = 24;
+      this.cine.r1 = 18;
+      this.cine.h0 = 12;
+      this.cine.h1 = 7;
+      this.cine.fov = 58;
     }
     this.lastT = performance.now();
     this.raf = requestAnimationFrame(this.frame);
   }
 
+  /**
+   * The on-screen pad replaces the mouse. With it up we never take the pointer lock: a locked pointer
+   * would swallow every click aimed at a button, and the camera already rides the auto-lock. Turning
+   * it back off hands the mouse its camera again.
+   */
+  setTouchControls(on: boolean) {
+    if (this.touchControls === on) return;
+    this.touchControls = on;
+    if (on) {
+      this.touchGuard = false;
+      this.touchMove.x = 0;
+      this.touchMove.y = 0;
+      if (document.pointerLockElement) {
+        this.lockWasOn = false; // leaving the lock on purpose must never auto-pause the duel
+        document.exitPointerLock();
+      }
+    } else if (!this.paused && !this.disposed) {
+      this.requestLock();
+    }
+  }
+
   requestLock() {
-    if (this.gameMode !== 'duel') return;
+    // Pointer lock is how a mouse aims the duel camera; on a touch screen (or with the pad up) it
+    // does nothing useful, and the auto-lock camera plays the fight fine without it.
+    if (this.touchControls) return;
+    if (window.matchMedia?.('(pointer: coarse)').matches) return;
     try {
       const el = this.renderer.domElement;
       const r = el.requestPointerLock?.() as unknown as Promise<void> | undefined;
@@ -631,16 +681,6 @@ export class Game {
     if (document.pointerLockElement) document.exitPointerLock();
     this.sliceWorld?.dispose();
     this.ghosts?.dispose();
-    this.runnerHazards.forEach(({ root }) => {
-      this.scene.remove(root);
-      root.traverse((o) => {
-        if (!(o instanceof THREE.Mesh)) return;
-        o.geometry.dispose();
-        const mats = Array.isArray(o.material) ? o.material : [o.material];
-        mats.forEach((m) => m.dispose());
-      });
-    });
-    this.runnerHazards = [];
     this.renderer.dispose();
     this.composer.dispose();
     this.sfx.ctx?.close().catch(() => {});
@@ -704,7 +744,7 @@ export class Game {
     if (c === 'KeyQ') this.toggleLock();
     if (c === 'Tab' || c === 'KeyX') this.switchTarget();
     if (c === 'KeyR') this.revive();
-    if (c === 'KeyP' || (c === 'Escape' && this.gameMode !== 'duel')) {
+    if (c === 'KeyP' || (c === 'Escape' && !document.pointerLockElement)) {
       this.paused = true;
       this.onEvent({ type: 'pause', n: 1 });
     }
@@ -741,12 +781,6 @@ export class Game {
   private onMouseMove = (e: MouseEvent) => {
     if (this.paused) return;
     const pointerLocked = document.pointerLockElement === this.renderer.domElement;
-    // Side modes keep a fixed side camera; ordinary mouse movement is only used to aim Rage slashes.
-    if (this.gameMode !== 'duel') {
-      if (this.rage.aiming) this.aimMouse(e.movementX, e.movementY);
-      else if (this.rage.on) this.steerSlash(e.movementX, e.movementY);
-      return;
-    }
     if (!pointerLocked) return;
     if (this.rage.aiming) {
       this.aimMouse(e.movementX, e.movementY);
@@ -778,7 +812,10 @@ export class Game {
   private lockWasOn = false;
   private onBlur = () => {
     this.keys.clear();
+    this.touchMove.x = 0;
+    this.touchMove.y = 0;
     this.mouseGuard = false;
+    this.touchGuard = false;
   };
 
   private setupInput() {
@@ -803,7 +840,87 @@ export class Game {
   }
 
   private get guardHeld() {
-    return this.mouseGuard || this.keys.has('KeyK') || this.keys.has('KeyF');
+    return this.mouseGuard || this.touchGuard || this.keys.has('KeyK') || this.keys.has('KeyF');
+  }
+
+  /* =================== mobile / touch controls =================== */
+  /**
+   * The on-screen pad fires exactly the same intents as the keyboard and the mouse, so the duel is
+   * playable with two thumbs: the left stick walks the arena, the right cluster attacks, jumps,
+   * dashes, guards, kicks, heals, opens Rage and hops between targets. Guard is a hold-button with
+   * its own state in `touchGuard`. The camera auto-locks onto the target, so no thumb has to aim it.
+   */
+  pressTouch(action: TouchAction) {
+    if (this.disposed) return;
+    if (action === 'pause') {
+      if (this.paused) this.onEvent({ type: 'pause', n: 0 });
+      else {
+        this.paused = true;
+        this.onEvent({ type: 'pause', n: 1 });
+      }
+      return;
+    }
+    if (this.paused || this.player.state === 'dead') return;
+    this.sfx.init();
+    switch (action) {
+      case 'attack':
+        this.pressAttack();
+        break;
+      case 'jump':
+        this.jumpBuf = 0.2;
+        break;
+      case 'dash':
+        this.dodgeBuf = 0.2;
+        break;
+      case 'guard':
+        // identical to the right mouse button: a guard, except in Rage where it is the final slash
+        if (this.rage.on) this.pressFinisher();
+        else {
+          this.touchGuard = true;
+          this.guardBuf = 0.2;
+        }
+        break;
+      case 'finisher':
+        this.pressFinisher();
+        break;
+      case 'kick':
+        this.kickBuf = 0.2;
+        break;
+      case 'heal':
+        this.healBuf = 0.2;
+        break;
+      case 'rage':
+        this.toggleRage();
+        break;
+      case 'target':
+        this.switchTarget();
+        break;
+      case 'lock':
+        this.toggleLock();
+        break;
+    }
+  }
+
+  releaseTouch(action: TouchAction) {
+    if (action === 'guard') this.touchGuard = false;
+    if (action === 'attack') this.releaseAttack();
+    if (action === 'finisher') this.releaseFinisher();
+  }
+
+  /**
+   * The virtual stick. x = strafe, y = forward, both -1..1 (the pad dead-zones and normalises it).
+   * moveInput() sums it with WASD, so a keyboard and a thumb coexist without fighting.
+   */
+  setTouchMove(x: number, y: number) {
+    this.touchMove.x = clamp(x, -1, 1);
+    this.touchMove.y = clamp(y, -1, 1);
+  }
+
+  /** A drag over the play field steers the Rage cut angle, exactly like moving the mouse does. */
+  steerTouch(dx: number, dy: number) {
+    if (this.paused || this.disposed) return;
+    if (this.rage.aiming) this.aimMouse(dx, dy);
+    else if (this.rage.on) this.steerSlash(dx, dy);
   }
 
   private toggleLock() {
@@ -937,10 +1054,10 @@ export class Game {
   private makeEnemy(kind: EKind, angle: number): Enemy {
     const boss = kind === 'boss';
     const spec = {
-      blade: { name: 'Prajurit Robot', hp: 130, posture: 110, atk: 0.9, dist: 8.5, trail: 0xff9a60 },
-      archer: { name: 'Pemanah Robot', hp: 80, posture: 70, atk: 1.1, dist: 12.5, trail: 0x9acf60 },
-      gunner: { name: 'Penembak Robot', hp: 95, posture: 80, atk: 1.6, dist: 11.5, trail: 0xffb060 },
-      boss: { name: 'Kurogane, Panglima Baja', hp: 520, posture: 240, atk: 2.0, dist: 18, trail: 0xff241c },
+      blade: { name: 'Prajurit Robot', hp: 130, posture: 128, atk: 0.6, dist: 8.5, trail: 0xff9a60 },
+      archer: { name: 'Pemanah Robot', hp: 80, posture: 80, atk: 0.85, dist: 12.5, trail: 0x9acf60 },
+      gunner: { name: 'Penembak Robot', hp: 95, posture: 92, atk: 1.2, dist: 11.5, trail: 0xffb060 },
+      boss: { name: 'Kurogane, Panglima Baja', hp: 520, posture: 268, atk: 1.5, dist: 18, trail: 0xff241c },
     }[kind];
     const rig = createHumanoid(
       // every enemy is a machine: brushed-steel frame, cyan optics, neon trim
@@ -992,7 +1109,7 @@ export class Game {
       hitIdx: 0,
       swingIdx: 0,
       warned: false,
-      speedMul: boss ? 0.78 : 1.05,
+      speedMul: boss ? 0.86 : 1.16, // swings arrive quicker: less time to read them
       lungeD: [],
       pips: boss ? 2 : 1,
       maxPips: boss ? 2 : 1,
@@ -1005,7 +1122,7 @@ export class Game {
       defense: null,
       defenseUntil: 0,
       evadeCD: 0,
-      parryCD: this.combatMode === 'after' ? (boss ? 10 : kind === 'blade' ? 3.2 : 0) : 0,
+      parryCD: this.combatMode === 'after' ? (boss ? 6.5 : kind === 'blade' ? 2.2 : 0) : 0,
       evadeSide: 0,
       evadeDir: new THREE.Vector3(),
       punish: 0,
@@ -1040,46 +1157,6 @@ export class Game {
   }
 
   private nextStage() {
-    if (this.gameMode === 'runner') return;
-    if (this.gameMode === 'apartment') {
-      if (this.stage >= 0) {
-        this.ended = true;
-        this.sfx.victory();
-        this.pendingT = 0.9;
-        this.pendingIdx = STYLE_JODAN;
-        this.onEvent({ type: 'victory' });
-        return;
-      }
-      this.stage = 0;
-      this.stageCleared = false;
-      this.ended = false;
-      const encounter: { kind: EKind; z: number; captain?: boolean }[] = [
-        { kind: 'blade', z: 7.5 },
-        { kind: 'blade', z: 16 },
-        { kind: 'archer', z: 25 },
-        { kind: 'gunner', z: 34 },
-        { kind: 'blade', z: 43, captain: true },
-      ];
-      for (const { kind, z, captain } of encounter) {
-        const e = this.makeEnemy(kind, 0);
-        e.pos.set(0, 0, z);
-        e.yaw = Math.PI;
-        e.rig.root.position.copy(e.pos);
-        if (captain) {
-          e.name = 'Kapten Lantai Empat';
-          e.hpMax *= 1.35;
-          e.hp = e.hpMax;
-          e.postureMax *= 1.2;
-        }
-        this.enemies.push(e);
-      }
-      this.sfx.stage();
-      this.onEvent({ type: 'stage', text: 'APARTMENT · LANTAI 04' });
-      this.lockTarget = this.nearestEnemy();
-      this.lockOn = true;
-      return;
-    }
-
     this.stage++;
     if (this.stage >= STAGES.length) {
       this.ended = true;
@@ -1102,123 +1179,6 @@ export class Game {
     this.onEvent({ type: 'stage', text: st.name });
     this.lockTarget = this.nearestEnemy();
     this.lockOn = true;
-  }
-
-  private spawnRunnerEnemy(z: number) {
-    const sequence: EKind[] = ['blade', 'blade', 'gunner', 'blade', 'archer'];
-    const kind = sequence[this.runnerSpawnCount % sequence.length];
-    const lane = this.runnerSpawnCount % 3 === 1 ? -0.8 : this.runnerSpawnCount % 3 === 2 ? 0.8 : 0;
-    const e = this.makeEnemy(kind, 0);
-    e.pos.set(lane, 0, z);
-    e.yaw = Math.PI;
-    e.rig.root.position.copy(e.pos);
-    e.attackTimer = Math.min(e.attackTimer, 0.8 + (this.runnerSpawnCount % 3) * 0.2);
-    this.enemies.push(e);
-    if (!this.lockTarget || !this.alive(this.lockTarget)) this.lockTarget = e;
-    this.runnerSpawnCount++;
-  }
-
-  private spawnRunnerHazard(z: number) {
-    const beam = this.runnerHazardCount % 3 === 1;
-    const root = new THREE.Group();
-    const hazardMat = new THREE.MeshStandardMaterial({
-      color: beam ? 0xd94e44 : 0x59616a,
-      emissive: beam ? 0x671813 : 0x10151a,
-      emissiveIntensity: beam ? 0.75 : 0.12,
-      roughness: 0.72,
-    });
-    const trimMat = new THREE.MeshStandardMaterial({ color: 0xe6e8ea, roughness: 0.76 });
-    if (beam) {
-      const crossbar = new THREE.Mesh(new THREE.BoxGeometry(5.2, 0.24, 0.35), hazardMat);
-      crossbar.position.y = 1.12;
-      root.add(crossbar);
-      for (const x of [-2.35, 2.35]) {
-        const post = new THREE.Mesh(new THREE.BoxGeometry(0.24, 1.15, 0.32), trimMat);
-        post.position.set(x, 0.57, 0);
-        root.add(post);
-      }
-    } else {
-      const crate = new THREE.Mesh(new THREE.BoxGeometry(1.45, 0.82, 1.0), hazardMat);
-      crate.position.y = 0.41;
-      crate.castShadow = true;
-      crate.receiveShadow = true;
-      const band = new THREE.Mesh(new THREE.BoxGeometry(1.48, 0.1, 1.04), trimMat);
-      band.position.y = 0.55;
-      root.add(crate, band);
-    }
-    root.position.set(0, 0, z);
-    root.traverse((o) => { if (o instanceof THREE.Mesh) { o.castShadow = true; o.receiveShadow = true; } });
-    this.scene.add(root);
-    this.runnerHazards.push({ root, z, hit: false, clearance: beam ? 1.02 : 0.82, halfWidth: beam ? 2.25 : 0.85 });
-    this.runnerHazardCount++;
-  }
-
-  private updateRunnerMode() {
-    const p = this.player;
-    this.runnerDistance = Math.max(this.runnerDistance, p.pos.z);
-    while (this.runnerNextEnemyZ <= p.pos.z + 25) {
-      const spawnZ = Math.max(this.runnerNextEnemyZ, p.pos.z + 10);
-      this.spawnRunnerEnemy(spawnZ);
-      this.runnerNextEnemyZ = spawnZ + Math.max(10.5, 17 - this.runnerDistance * 0.006);
-    }
-    while (this.runnerNextHazardZ <= p.pos.z + 19) {
-      const spawnZ = Math.max(this.runnerNextHazardZ, p.pos.z + 7.5);
-      this.spawnRunnerHazard(spawnZ);
-      this.runnerNextHazardZ = spawnZ + Math.max(10, 13.5 - this.runnerDistance * 0.004);
-    }
-
-    for (const hazard of this.runnerHazards) {
-      if (
-        !hazard.hit &&
-        Math.abs(p.pos.z - hazard.z) < 0.6 &&
-        Math.abs(p.pos.x) < hazard.halfWidth &&
-        p.pos.y < hazard.clearance &&
-        p.inv <= 0 &&
-        p.state !== 'dodge' &&
-        p.state !== 'cut' &&
-        p.state !== 'dead'
-      ) {
-        hazard.hit = true;
-        p.hp = Math.max(0, p.hp - 18);
-        this.addPlayerPosture(14);
-        p.inv = 0.75;
-        p.flash = 1;
-        p.vel.z = Math.min(p.vel.z, -2.4);
-        p.anim = null;
-        p.trailOn = false;
-        this.sfx.hurt();
-        this.hurtFx = 0.7;
-        this.sparkBurst(p.pos.clone().setY(0.9), new THREE.Vector3(0, 0.35, -1), 20, 4, 0.9, new THREE.Color(2.4, 0.75, 0.45), 0.32);
-        this.shake(0.46);
-        if (p.hp <= 0) this.killPlayer();
-        else {
-          p.state = 'hurt';
-          p.t = 0;
-        }
-      }
-    }
-
-    this.runnerHazards = this.runnerHazards.filter((hazard) => {
-      if (p.pos.z > hazard.z + 5) {
-        this.scene.remove(hazard.root);
-        hazard.root.traverse((o) => {
-          if (!(o instanceof THREE.Mesh)) return;
-          o.geometry.dispose();
-          const mats = Array.isArray(o.material) ? o.material : [o.material];
-          mats.forEach((m) => m.dispose());
-        });
-        return false;
-      }
-      return true;
-    });
-
-    for (const e of this.enemies) {
-      if (e.pos.z < p.pos.z - 8 && this.alive(e)) {
-        e.state = 'dead';
-        e.rig.root.visible = false;
-        e.removeAt = this.time - 3;
-      }
-    }
   }
 
   /* ================= main loop ================= */
@@ -1325,7 +1285,6 @@ export class Game {
     }
 
     this.updatePlayer(pdt);
-    if (this.gameMode === 'runner' && this.player.state !== 'dead') this.updateRunnerMode();
 
     // afterimages: dodge dash, blade-cut dash and full sprint leave translucent echoes behind
     {
@@ -1335,10 +1294,10 @@ export class Game {
         pl.state === 'dodge' ||
         pl.state === 'dive' ||
         (pl.state === 'jump' && (pl.airDashT > 0 || pl.inv > 0)) ||
-        (pl.state === 'idle' && spd > this.sprintSpd * 0.78);
+        (pl.state === 'idle' && spd > this.sprintSpd * 0.6);
       this.ghostT -= real;
       if (dashing && this.ghostT <= 0) {
-        this.ghostT = pl.state === 'idle' ? 0.075 : 0.05;
+        this.ghostT = pl.state === 'idle' ? (spd > this.sprintSpd * 0.85 ? 0.042 : 0.07) : 0.05;
         const col = this.rage.on ? 0xff5a48 : 0x7fa6ff;
         this.ghosts.snap(pl.rig.root, col, this.rage.on ? 0.3 : 0.22, 0.34);
       }
@@ -1362,7 +1321,6 @@ export class Game {
 
     // stage progression
     if (
-      this.gameMode !== 'runner' &&
       !this.ended &&
       !this.stageCleared &&
       this.enemies.length > 0 &&
@@ -1386,15 +1344,7 @@ export class Game {
           this.player.hp = Math.min(this.player.hpMax, this.player.hp + 35);
           this.player.gourds = Math.min(3, this.player.gourds + 1);
         }
-        if (this.gameMode === 'apartment') {
-          this.ended = true;
-          this.sfx.victory();
-          this.pendingT = 0.9;
-          this.pendingIdx = STYLE_JODAN;
-          this.onEvent({ type: 'victory' });
-        } else {
-          this.nextStage();
-        }
+        this.nextStage();
       }
     }
     // cleanup dead
@@ -2862,50 +2812,45 @@ export class Game {
   /* ================= camera ================= */
   private updateCamera(dt: number, real: number) {
     const p = this.player;
-    if (this.gameMode !== 'duel') {
-      const lead = this.gameMode === 'runner' ? 3.4 : 3.0;
-      const look = this.tmpV.set(0, 1.22, p.pos.z + lead);
-      this.camera.position.set(-10.5, 2.95, p.pos.z + lead);
-      this.camera.up.set(0, 1, 0);
-      this.camera.lookAt(look);
-      this.camPos.copy(this.camera.position);
-      this.camLook.copy(look);
-      this.camYaw = 0;
-      const sideFov = this.gameMode === 'runner' ? 39 : 41;
-      if (Math.abs(this.camera.fov - sideFov) > 0.01) {
-        this.camera.fov = sideFov;
-        this.fov = sideFov;
-        this.camera.updateProjectionMatrix();
-        this.updatePointScale();
-      }
-      void dt;
-      void real;
-      return;
-    }
     const tgt = this.lockOn ? this.lockTarget : null;
     const arrow = (this.keys.has('ArrowLeft') ? 1 : 0) - (this.keys.has('ArrowRight') ? 1 : 0);
     if (!tgt) this.camYaw += arrow * 2.2 * real;
     // smaller fighters → pull the camera in so they still fill the frame
     let dist = 6.2 * (0.45 + 0.55 * this.sizeK);
     let pitch = this.camPitch;
-    // sense of speed: the lens widens when sprinting
-    let fovT = 58 + (p.state === 'idle' ? clamp((Math.hypot(p.vel.x, p.vel.z) - 6) * 1.7, 0, 8) : 0);
+    // sense of speed: the lens widens when sprinting — and through the air too, so an air dash (17.5 m/s)
+    // and a long rooftop leap stretch the frame instead of flying past at walking lens
+    const spdNow = Math.hypot(p.vel.x, p.vel.z);
+    const fastStates = p.state === 'idle' || p.state === 'jump' || p.state === 'dive';
+    let fovT = 58 + (fastStates ? clamp((spdNow - 5.5) * 2.1, 0, 11) : 0);
     const pivot = this.tmpV.copy(p.pos).add(new THREE.Vector3(0, 1.55 * this.sizeK, 0));
+    // A double jump is the player's own move, not part of the duel, so the camera lets go of the target for
+    // its length and swings behind the direction of travel, then eases back onto the lock once the feet are
+    // down. `lockW` is that blend: 1 reproduces the locked framing exactly, 0 is a free camera behind him.
+    const letGo = p.state === 'jump' && p.jumps >= 2;
+    this.lockW += ((letGo ? 0 : 1) - this.lockW) * (1 - Math.exp(-(letGo ? 7 : 5) * real));
+    if (this.lockW < 0.004) this.lockW = 0;
+    else if (this.lockW > 0.996) this.lockW = 1;
     if (tgt) {
       const dx = tgt.pos.x - p.pos.x;
       const dz = tgt.pos.z - p.pos.z;
       const d = Math.hypot(dx, dz);
       const want = Math.atan2(dx, dz);
-      this.camYaw += angDiff(this.camYaw, want) * (1 - Math.exp(-8 * real));
-      dist = clamp(5.0 + d * 0.38, 5.4, 8.6);
-      pivot.x += dx * 0.28;
-      pivot.z += dz * 0.28;
+      const lw = this.lockW;
+      const aim = want + angDiff(want, p.yaw + Math.PI) * (1 - lw); // released → frame from behind the fighter
+      this.camYaw += angDiff(this.camYaw, aim) * (1 - Math.exp(-(5 + 3 * lw) * real));
+      const lockDist = clamp(5.0 + d * 0.38, 5.4, 8.6);
+      dist += (lockDist - dist) * lw;
+      pivot.x += dx * 0.28 * lw;
+      pivot.z += dz * 0.28 * lw;
       if (this.isHeavyBoss(tgt)) {
-        dist = Math.max(dist, tgt.scale * 3.2);
-        pivot.y = Math.max(pivot.y, tgt.scale * 0.92);
-        fovT = Math.max(fovT, 62);
+        const bossDist = Math.max(tgt.scale * 3.2, 6.0);
+        dist += (Math.max(dist, bossDist) - dist) * lw;
+        const bossY = Math.max(pivot.y, tgt.scale * 0.92);
+        pivot.y += (bossY - pivot.y) * lw;
+        fovT = Math.max(fovT, 58 + 4 * lw);
       }
-    }
+    } else this.lockW = 1;
     if (p.state === 'deathblow') {
       dist = 3.8;
       fovT = 40;
@@ -2936,6 +2881,9 @@ export class Game {
         fovT -= 3;
       }
     }
+    // a sprint pulls the camera in as the lens widens: closer + wider reads as faster without touching movement
+    const sprintK = p.state === 'idle' ? clamp((spdNow - 8) / 6, 0, 1) : 0;
+    dist *= 1 - 0.1 * sprintK;
     if (this.kickV.lengthSq() > 1e-6) {
       this.camPos.add(this.kickV);
       this.kickV.multiplyScalar(Math.exp(-30 * real));
@@ -2999,13 +2947,15 @@ export class Game {
     this.camLook.lerp(lookT, 1 - Math.exp(-16 * real));
 
     // camera roll: banks into strafes and turns, kicked sideways by deflects
-    const spdNow = Math.hypot(p.vel.x, p.vel.z);
     const rollT = clamp(-lat * 0.0055, -0.05, 0.05) + clamp(-p.yawRate * 0.004 * Math.min(1, spdNow / 5), -0.04, 0.04);
     this.camRoll += (rollT - this.camRoll) * (1 - Math.exp(-6 * real));
     this.rollKick *= Math.exp(-7 * real);
-    // run bob: head-height rhythm locked to the footfalls (stronger when sprinting)
+    // run bob: head-height rhythm locked to the footfalls, growing with the sprint so the ground rushes past
     const bobAmt = p.state === 'idle' ? clamp((spdNow - 2.5) / 7, 0, 1) : 0;
-    this.camBob += ((Math.sin(p.loco.phase * Math.PI * 4) * 0.045 * bobAmt) - this.camBob) * (1 - Math.exp(-18 * real));
+    const bobAmp = (0.035 + 0.05 * sprintK) * bobAmt;
+    this.camBob += (Math.sin(p.loco.phase * Math.PI * 4) * bobAmp - this.camBob) * (1 - Math.exp(-18 * real));
+    // …and a breath of roll per stride, so the frame leans into each step instead of floating over them
+    this.camStride += (Math.cos(p.loco.phase * TAU) * 0.007 * bobAmt - this.camStride) * (1 - Math.exp(-16 * real));
 
     const tr = this.trauma * this.trauma;
     const tt = this.time * 40 + performance.now() * 0.03;
@@ -3016,7 +2966,7 @@ export class Game {
     this.camera.position.y += sy + this.camBob;
     this.camera.up.set(0, 1, 0);
     this.camera.lookAt(this.camLook);
-    this.camera.rotation.z += Math.sin(tt * 2.1) * tr * 0.03 + this.camRoll + this.rollKick;
+    this.camera.rotation.z += Math.sin(tt * 2.1) * tr * 0.03 + this.camRoll + this.rollKick + this.camStride;
     const f = this.fov - this.fovPunch;
     if (Math.abs(this.camera.fov - f) > 0.01) {
       this.camera.fov = f;
@@ -3048,6 +2998,32 @@ export class Game {
     T.sy += (br * 0.008 + Math.sin(this.time * 2.4 + ph) * 0.005) * idleW;
     T.hipZ += Math.sin(this.time * 0.9 + ph) * 0.022 * (1 - amp * 0.6);
     T.torsoZ -= Math.sin(this.time * 0.9 + ph) * 0.012;
+  }
+
+  /**
+   * Walking up a rooftop step. Layered over the walk so the climb keeps its footwork: the lead leg drives up,
+   * the torso leans in over the step, the free arm swings for balance, the sword arm trails, the hips dip on
+   * the way and the eyes go up to the lip. The feet are freed from the planted system for the length of it,
+   * otherwise the IK would pin them to the floor he is leaving.
+   */
+  private stepUpPose(T: Pose, f: Common) {
+    const u = clamp(this.stepUpT, 0, 1);
+    const drive = Math.sin(Math.PI * u); // strongest in the middle of the climb
+    const leadR = f.loco.phase < 0.5 ? 1 : 0.3; // whichever foot is forward leads, the other pushes
+    const leadL = 1.3 - leadR;
+    T.plant = 0;
+    T.dy -= 0.05 * drive;
+    T.torsoX += 0.2 * drive;
+    T.hipX += 0.1 * drive;
+    T.headX -= 0.16 * drive;
+    T.rhX += -0.72 * drive * leadR;
+    T.rkX += 1.35 * drive * leadR;
+    T.lhX += -0.72 * drive * leadL;
+    T.lkX += 1.35 * drive * leadL;
+    T.lsX += -0.6 * drive;
+    T.leX += -0.45 * drive;
+    T.rsX += 0.3 * drive;
+    T.sp += 0.06 * drive;
   }
 
   /**
@@ -3094,6 +3070,8 @@ export class Game {
         ft.lift = 0;
         ft.pitch = 0;
         ft.init = true;
+        ft.gy = f.pos.y; // no ankle snap after a teleport / revive / stage change
+        ft.tl = 0;
       } else if (ft.stepping) {
         ft.t += dt;
         const u = Math.min(1, ft.t / ft.dur);
@@ -3121,17 +3099,27 @@ export class Game {
       const lz = (ex * sy + ez * cy) / k;
       const ox = lx - st.x;
       const oz = lz - st.z;
+      // ---- per-foot terrain ----
+      // The pinned foot is sampled against the rooftop under it, so a foot that ends up on a step rests on that
+      // step and a foot that slides off a lip reaches down after the ground instead of floating at hip height.
+      // Player only: the duel's enemies never leave the gravel, so their footwork stays exactly as authored.
+      // Smoothed, which rolls the ankle over an edge rather than snapping it.
+      if (f === this.player) {
+        const gy = this.groundHeightAt(ft.wx, ft.wz, f.pos.y);
+        ft.gy += (gy - ft.gy) * (1 - Math.exp(-16 * Math.max(dt, 0.001)));
+        ft.tl = clamp(ft.gy - f.pos.y, -FOOT_REACH_DOWN, FOOT_REACH_UP);
+      } else ft.tl = 0;
       // when leaving locomotion (attack, hit…) offsets relax away instead of snapping to zero
       const dec = Math.exp(-15 * Math.max(dt, 0.001));
       if (i === 0) {
         g.rx = on ? ox : g.rx * dec;
         g.rz = on ? oz : g.rz * dec;
-        g.rl = on ? ft.lift : g.rl * dec;
+        g.rl = on ? ft.lift + ft.tl : g.rl * dec;
         g.rp = on ? ft.pitch : g.rp * dec;
       } else {
         g.lx = on ? ox : g.lx * dec;
         g.lz = on ? oz : g.lz * dec;
-        g.ll = on ? ft.lift : g.ll * dec;
+        g.ll = on ? ft.lift + ft.tl : g.ll * dec;
         g.lp = on ? ft.pitch : g.lp * dec;
       }
     }
@@ -3171,7 +3159,9 @@ export class Game {
 
     // pelvis shifts over the supporting leg, hips dip slightly on each step
     const tsway = on ? clamp((g.rl - g.ll) * 0.5, -0.04, 0.04) * (0.4 + sf) : 0;
-    const tbob = on ? -Math.max(g.rl, g.ll) * 0.22 : 0;
+    // one foot up on a rooftop step and the hips ride toward it; a foot hanging off a lip and they sink
+    const terrHip = clamp((f.feet[0].tl + f.feet[1].tl) * 0.3, -0.14, 0.16);
+    const tbob = on ? -Math.max(g.rl, g.ll) * 0.22 + terrHip : 0;
     const a = 1 - Math.exp(-18 * Math.max(dt, 0.001));
     g.sway += (tsway - g.sway) * a;
     g.bob += (tbob - g.bob) * a;
@@ -3251,7 +3241,7 @@ export class Game {
       const cp = i === 0 ? g.rp : g.lp;
       const nx = cx + (tgt.x / k - st.x - cx) * w;
       const nz = cz + (tgt.z / k - st.z - cz) * w;
-      const nl = cl + (tgt.lift / k - cl) * w;
+      const nl = cl + ((tgt.lift + ft.tl) / k - cl) * w;
       const np = cp + (tgt.pitch - cp) * w;
       if (i === 0) {
         g.rx = nx; g.rz = nz; g.rl = nl; g.rp = np;
@@ -3269,7 +3259,9 @@ export class Game {
       }
     }
     g.sway += (o.sway / k - g.sway) * w;
-    g.bob += (o.bob / k - g.bob) * w;
+    // the running hips answer the terrain as well, so jogging up onto a step lifts the whole body with it
+    const terrHipL = clamp((f.feet[0].tl + f.feet[1].tl) * 0.3, -0.14, 0.16) / k;
+    g.bob += (o.bob / k + terrHipL - g.bob) * w;
 
     // footfalls: gravel crunch (player only, so the mix stays clean) + dust puffs at speed
     if (want && L.sp > 0.9) {
@@ -3283,7 +3275,8 @@ export class Game {
           const ft = f.feet[i];
           if (f === this.player) {
             this.sfx.step(L.sp);
-            if (L.sp > this.sprintSpd * 0.72) this.shake(0.024); // sprinting: every footfall thumps the frame
+            // sprinting: every footfall thumps the frame, harder the faster he is going
+            if (L.sp > this.sprintSpd * 0.58) this.shake(0.02 + 0.02 * (L.sp / this.sprintSpd));
           }
           if (heavyBoss) {
             const foot = this.tmpV2.set(ft.wx, 0.04, ft.wz);
@@ -3292,11 +3285,11 @@ export class Game {
             this.shake(0.07);
           } else {
             const fs = L.sp / this.sprintSpd;
-            if (fs > 0.3) {
-              const big = fs > 0.62;
-              this.dustBurst(this.tmpV2.set(ft.wx, 0.05, ft.wz), big ? 5 : 2, big ? 2.2 : 1.2);
+            if (fs > 0.24) {
+              const big = fs > 0.55;
+              this.dustBurst(this.tmpV2.set(ft.wx, 0.05, ft.wz), big ? 7 : 3, big ? 2.6 : 1.4);
               if (big && f === this.player) {
-                this.shocks.spawn(this.tmpV2.set(ft.wx, 0.04, ft.wz), 0xffffff, 0.9, 0.22);
+                this.shocks.spawn(this.tmpV2.set(ft.wx, 0.04, ft.wz), 0xffffff, 0.9 + 0.5 * fs, 0.22);
               }
             }
           }
@@ -3320,48 +3313,79 @@ export class Game {
     out.headX -= 0.85 * lean;
     out.torsoZ += o.roll * lw * 0.7;
     out.hipZ += o.roll * lw * 0.3;
+    // the head rides out the bounce of the stride and answers speed with the chin — a stabilised head is what
+    // sells the weight of a run, and it sits on top of the lean so it survives every pose
+    out.headX += (o.headStab + o.chinLift) * lw;
+    // push-off stretches the body out; braking folds it back and drops the hips
+    out.hipX += (0.05 * o.burst - 0.07 * o.brake) * lw;
+    out.torsoX += (0.07 * o.burst - 0.1 * o.brake) * lw;
+    out.dy -= 0.03 * o.brake * lw;
     if (w <= 0.001) return;
     const ph = L.phase * TAU;
     out.hipYaw += o.pelvisYaw * w;
     out.torsoY += o.torsoYaw * w;
     out.hipZ += o.hipRoll * w;
     out.torsoZ += o.torsoRoll * w;
+    // a hard cut winds the shoulders up against the turn and lets them unwrap a beat later
+    out.torsoY += o.twist * w;
+    out.hipYaw -= o.twist * 0.4 * w;
     const carryW = f.locoCarryW;
+    // With the sword up in guard (or a bow in hand) the arms are locked to the weapon by IK, so the stride can
+    // only show in the shoulder line and the hips: a low, tight shuffle instead of a free-armed run.
+    const tightW = (1 - carryW) * smooth01((L.sp - 0.9) / 1.4) * w;
+    if (tightW > 0.001) {
+      out.torsoZ += o.arm * 0.035 * tightW; // the shoulder line rocks with the steps
+      out.hipZ += o.hipRoll * 0.7 * tightW;
+      out.dy -= 0.012 * o.bounce * tightW; // stays low: a guard shuffle does not bounce
+      out.headX += 0.02 * o.bounce * tightW; // ...and the head stays on the target
+      out.torsoX += 0.05 * tightW;
+    }
     if (carryW > 0.001) {
-      // The free arm trails back; keep the sword hand lower and close to the hip in a ready carry.
-      const c = smooth01((L.sp - 0.9) / 1.6) * carryW;
-      const amp = 0.24 + 0.34 * o.run + 0.1 * o.spr;
-      out.lsX += (-0.3 - o.arm * amp - out.lsX) * c;
-      out.lsZ += (0.12 + 0.08 * o.run - out.lsZ) * c;
-      out.leX += (-(0.7 + 0.75 * o.run) - 0.25 * Math.max(0, o.arm) * o.run - out.leX) * c;
+      // ---- the carry: sword LOW and TRAILING BEHIND the body ----
+      // This is the silhouette the whole run is built around. The right arm drops back and hangs long, the grip
+      // sits down at the hip and behind it, and the blade streams out back-and-down instead of being held ready
+      // in front — so it whips through the stride the way a carried staff does. The free arm swings wide to
+      // answer it, and the shoulder line rocks against the swing, which is most of what reads from behind.
+      // fully carried from a slow jog up: the blade is low and trailing at every running speed, not just a sprint
+      const c = smooth01((L.sp - 0.6) / 0.9) * carryW;
+      const amp = 0.3 + 0.5 * o.run + 0.26 * o.spr + 0.18 * o.burst; // wide swing, harder when driving off
+      out.lsX += (-0.14 - o.arm * amp - out.lsX) * c;
+      out.lsZ += (0.18 + 0.12 * o.run + 0.07 * o.arm - out.lsZ) * c;
+      out.leX += (-(0.5 + 0.5 * o.run + 0.22 * o.spr) - 0.3 * Math.max(0, o.arm) * o.run - out.leX) * c;
       out.two *= 1 - c;
-      out.sx += (-0.27 - out.sx) * c;
-      out.sy += (0.2 - out.sy) * c;
-      out.sz += (0.22 - out.sz) * c;
-      out.sp += (0.58 - out.sp) * c;
-      out.sw += (0.28 - out.sw) * c;
-      out.sr += (0.14 - out.sr) * c;
-      // The sword stays steady; only a small wrist follow-through answers the running rhythm.
-      out.sp += Math.sin(ph * 2) * 0.025 * c;
-      out.sw += -0.035 * o.arm * c;
+      // the right shoulder is IK-solved to this grip point, so it is what swings the sword arm: sweep it back
+      // and forward with the stride (opposite the free arm) and the arm follows, near-straight and hanging long
+      const swR = -o.arm;
+      out.sx += (-0.3 + 0.02 * swR - out.sx) * c;
+      out.sy += (0.11 - out.sy) * c; // low — the hilt rides at hip height, never raised
+      out.sz += (-0.05 + 0.12 * swR * (0.55 + 0.45 * o.spr) - out.sz) * c; // …and trailing behind the body
+      out.sp += (-0.3 - out.sp) * c; // tip down
+      out.sw += (2.78 - out.sw) * c; // …and streaming back behind the hip
+      out.sr += (0.5 - out.sr) * c;
+      // the blade lags the stride: it whips on the toe-off and settles through the flight
+      out.sp += Math.sin(ph * 2) * 0.05 * c;
+      out.sw += -0.08 * o.arm * c;
+      out.sr += 0.05 * Math.cos(ph * 2) * c;
+      out.torsoZ += -o.arm * (0.022 + 0.035 * o.run + 0.03 * o.spr) * c;
 
-      // Forward-running posture: the free arm trails while the right hand carries the katana ready to strike.
+      // ---- the folded sprint on top of the carry ----
+      // Deeper torso fold, head still up toward the path, the free arm swinging around a pinned-back centre, and
+      // the sword streaming further out behind: at a full sprint the blade is dragging in his wake.
       const n = o.ninja * carryW;
       if (n > 0.001) {
-        out.lsX += (0.82 + o.arm * 0.26 - out.lsX) * n;
-        out.lsZ += (0.3 - out.lsZ) * n;
-        out.leX += (-0.22 - 0.12 * Math.max(0, o.arm) - out.leX) * n;
+        out.lsX += (0.34 - o.arm * amp * 0.72 - out.lsX) * n;
+        out.lsZ += (0.34 - out.lsZ) * n;
+        out.leX += (-0.3 - 0.16 * Math.max(0, o.arm) - out.leX) * n;
         out.two *= 1 - n;
-        out.sx += (-0.27 - out.sx) * n;
-        out.sy += (0.16 - out.sy) * n;
-        out.sz += (0.28 - out.sz) * n;
-        out.sp += (0.52 - out.sp) * n;
-        out.sw += (0.34 - 0.04 * o.arm - out.sw) * n;
-        out.sr += (0.14 - out.sr) * n;
-        // The torso leans into the run; the head stays lifted toward the path ahead.
-        out.torsoX += 0.15 * n;
-        out.hipX += 0.05 * n;
-        out.headX -= 0.08 * n;
+        out.sx += (-0.32 - out.sx) * n;
+        out.sy += (0.12 - out.sy) * n;
+        out.sz += (-0.12 + 0.09 * swR * (0.5 + 0.5 * o.spr) - out.sz) * n;
+        out.sp += (-0.44 - out.sp) * n;
+        out.sw += (2.95 - 0.05 * o.arm - out.sw) * n;
+        out.sr += (0.62 - out.sr) * n;
+        out.torsoX += 0.2 * n;
+        out.hipX += 0.07 * n;
+        out.headX -= 0.12 * n; // the head stays up and level while the torso folds under it
       }
     }
   }
@@ -3408,31 +3432,15 @@ export class Game {
   /* ================= player ================= */
   private moveInput(): THREE.Vector3 {
     const k = this.keys;
-    if (this.gameMode === 'apartment') {
-      // The side camera looks from -X toward +X: A/D move left/right on screen,
-      // while W/S step forward into the corridor / back toward the camera.
-      let screen = 0;
-      let depth = 0;
-      if (k.has('KeyD')) screen += 1;
-      if (k.has('KeyA')) screen -= 1;
-      if (k.has('KeyW')) depth += 1;
-      if (k.has('KeyS')) depth -= 1;
-      const v = new THREE.Vector3(depth, 0, screen);
-      if (v.lengthSq() > 1) v.normalize();
-      return v;
-    }
-
     let mx = 0;
     let mz = 0;
-    if (this.gameMode === 'runner') {
-      // The runner keeps moving forward; A/D change rooftop lanes and W/S control its pace.
-      mz = 1;
-    } else {
-      if (k.has('KeyW')) mz += 1;
-      if (k.has('KeyS')) mz -= 1;
-    }
+    if (k.has('KeyW')) mz += 1;
+    if (k.has('KeyS')) mz -= 1;
     if (k.has('KeyD')) mx += 1;
     if (k.has('KeyA')) mx -= 1;
+    // the on-screen stick pushes the same axes; keyboard and thumb simply add up and re-normalise
+    mx += this.touchMove.x;
+    mz += this.touchMove.y;
     const dir = new THREE.Vector3(Math.sin(this.camYaw), 0, Math.cos(this.camYaw));
     const right = new THREE.Vector3(-Math.cos(this.camYaw), 0, Math.sin(this.camYaw));
     const v = dir.multiplyScalar(mz).add(right.multiplyScalar(mx));
@@ -3448,18 +3456,7 @@ export class Game {
   }
 
   private clampArena(v: THREE.Vector3, margin = 0.8) {
-    if (this.gameMode === 'runner') {
-      // Only the physical rooftop width is bounded; forward distance is unending.
-      v.x = clamp(v.x, -2.15, 2.15);
-      return;
-    }
-    if (this.gameMode === 'apartment') {
-      // Keep the fighter inside the corridor's walkable width and mission footprint.
-      v.x = clamp(v.x, -1.45, 1.45);
-      v.z = clamp(v.z, -1.5, 61);
-      return;
-    }
-    // The duel remains an open, wide rectangular battlefield with no circular arena wall.
+    // The duel is an open, wide rectangular battlefield with no circular arena wall.
     const limit = ARENA_HALF_EXTENT - margin;
     v.x = clamp(v.x, -limit, limit);
     v.z = clamp(v.z, -limit, limit);
@@ -3532,6 +3529,12 @@ export class Game {
   }
 
   /** Detect a downward crossing of the ground or one of the raised landing pads. */
+  /** Ground height under a point *for foot IK*: the parkour surface there, clamped to the leg's reach. */
+  private groundHeightAt(x: number, z: number, bodyY: number) {
+    const h = this.parkourFloorAt(x, z);
+    return h > bodyY + FOOT_REACH_UP ? bodyY + FOOT_REACH_UP : h < bodyY - FOOT_REACH_DOWN ? bodyY - FOOT_REACH_DOWN : h;
+  }
+
   private landingHeightAt(previousY: number, currentY: number, x: number, z: number): number | null {
     if (currentY > previousY) return null;
     let landing: number | null = null;
@@ -3570,6 +3573,135 @@ export class Game {
         p.vel.z = 0;
       }
     }
+  }
+
+  /**
+   * Which face of a surface a point is touching, plus that face's *inward* normal — the direction a body has
+   * to be travelling in to be pressing into it, as opposed to sliding past it or leaning away from it.
+   */
+  private pressedFace(px: number, pz: number, s: { x: number; z: number; width: number; depth: number }, radius: number) {
+    const dx = px - s.x;
+    const dz = pz - s.z;
+    const ox = s.width / 2 + radius - Math.abs(dx);
+    const oz = s.depth / 2 + radius - Math.abs(dz);
+    if (ox <= 0 || oz <= 0) return null;
+    const onX = ox < oz;
+    return { onX, dx, dz, nx: onX ? -(Math.sign(dx) || 1) : 0, nz: onX ? 0 : -(Math.sign(dz) || 1) };
+  }
+
+  /** Where a climb ends up standing: past the edge by `inward`, and kept inside the surface on the other axis. */
+  private climbTarget(s: { x: number; z: number; width: number; depth: number }, onX: boolean, dx: number, dz: number, px: number, pz: number, inward: number) {
+    return {
+      x: onX ? s.x + (Math.sign(dx) || 1) * (s.width / 2 - inward) : clamp(px, s.x - s.width / 2 + 0.45, s.x + s.width / 2 - 0.45),
+      z: onX ? clamp(pz, s.z - s.depth / 2 + 0.45, s.z + s.depth / 2 - 0.45) : s.z + (Math.sign(dz) || 1) * (s.depth / 2 - inward),
+    };
+  }
+
+  /**
+   * Walk into a rooftop step and the body climbs it instead of bumping into it — a real step-up: the lead leg
+   * drives, the hips ride up, the feet find the new floor (see the per-foot terrain IK). While the climb runs
+   * it owns the body position, so the side push-out and the floor snap are skipped for its length. Anything
+   * taller than STEP_UP_MAX still bumps, and jumping at that becomes an air mantle instead.
+   */
+  private stepUp(dt: number, move: THREE.Vector3): boolean {
+    const p = this.player;
+    if (this.stepSurf >= 0) {
+      const s = this.world.parkourSurfaces[this.stepSurf];
+      if (!s || p.state !== 'idle') {
+        this.stepSurf = -1; // hit or cancelled mid-climb: hand the body back to the normal systems
+        return false;
+      }
+      this.stepUpT = Math.min(1, this.stepUpT + dt / this.stepDur);
+      // rise up the face, then settle across the lip — never both at once, or the shins go through the step
+      const e = smooth01(this.stepUpT / 0.72);
+      const slide = smooth01((this.stepUpT - 0.72) / 0.28);
+      p.pos.y = this.stepFrom.y + (this.stepTo.y - this.stepFrom.y) * e;
+      p.pos.x = this.stepFrom.x + (this.stepTo.x - this.stepFrom.x) * slide;
+      p.pos.z = this.stepFrom.z + (this.stepTo.z - this.stepFrom.z) * slide;
+      if (this.stepUpT >= 1) {
+        this.stepSurf = -1;
+        p.pos.copy(this.stepTo);
+        this.sfx.step(2.2); // the trailing foot joins it up there
+        this.dustBurst(this.tmpV2.set(p.pos.x, p.pos.y + 0.05, p.pos.z), 4, 1.6);
+      }
+      return true;
+    }
+    const ml = move.length();
+    if (ml < 0.22) return false;
+    let best = -1;
+    let bestH = 99;
+    for (let i = 0; i < this.world.parkourSurfaces.length; i++) {
+      const s = this.world.parkourSurfaces[i];
+      const h = s.top - p.pos.y;
+      if (h <= 0.08 || h > STEP_UP_MAX) continue;
+      const face = this.pressedFace(p.pos.x, p.pos.z, s, 0.36);
+      if (!face) continue;
+      if ((move.x * face.nx + move.z * face.nz) / ml < 0.45) continue; // really walking into it, not grazing
+      if (h < bestH) {
+        bestH = h;
+        best = i;
+      }
+    }
+    if (best < 0) return false;
+    const s = this.world.parkourSurfaces[best];
+    const face = this.pressedFace(p.pos.x, p.pos.z, s, 0.36)!;
+    const to = this.climbTarget(s, face.onX, face.dx, face.dz, p.pos.x, p.pos.z, 0.5);
+    this.stepFrom.copy(p.pos);
+    this.stepTo.set(to.x, s.top, to.z);
+    this.stepSurf = best;
+    this.stepUpT = 0;
+    this.stepDur = 0.19 + 0.16 * bestH; // a knee-high step is quick, a hip-high one takes a beat longer
+    this.sfx.step(1.6);
+    return true;
+  }
+
+  /**
+   * Air mantle: brush a ledge while airborne and still pressing into it, and the hands catch it. Covers
+   * everything above the walk-up height and within arm reach, so a jump aimed at a rooftop becomes a climb
+   * instead of a bump and a fall. Ends standing on the ledge with both jumps refreshed.
+   */
+  private tryMantle(move: THREE.Vector3): boolean {
+    const p = this.player;
+    if (this.mantleCD > 0) return false;
+    const push = move.lengthSq() > 0.05 ? move : p.vel; // the stick, or the momentum when it is neutral
+    const pl = Math.hypot(push.x, push.z);
+    if (pl < 0.2) return false;
+    let best = -1;
+    let bestH = 99;
+    for (let i = 0; i < this.world.parkourSurfaces.length; i++) {
+      const s = this.world.parkourSurfaces[i];
+      const h = s.top - p.pos.y; // how far above the feet the lip is
+      if (h < 0.15 || h > 1.8) continue; // arm reach: from just below the feet to well overhead
+      const face = this.pressedFace(p.pos.x, p.pos.z, s, 0.44);
+      if (!face) continue;
+      if ((push.x * face.nx + push.z * face.nz) / pl < 0.3) continue;
+      if (h < bestH) {
+        bestH = h;
+        best = i;
+      }
+    }
+    if (best < 0) return false;
+    const s = this.world.parkourSurfaces[best];
+    const face = this.pressedFace(p.pos.x, p.pos.z, s, 0.44)!;
+    const to = this.climbTarget(s, face.onX, face.dx, face.dz, p.pos.x, p.pos.z, 0.62);
+    this.mantleFrom.copy(p.pos);
+    this.mantleTo.set(to.x, s.top, to.z);
+    this.mantleYaw = Math.atan2(s.x - p.pos.x, s.z - p.pos.z); // face the wall he is climbing
+    this.mantleDur = 0.4 + 0.14 * bestH;
+    this.mantleCD = 0.5;
+    p.state = 'mantle';
+    p.t = 0;
+    p.anim = null;
+    p.vel.set(0, 0, 0);
+    p.vy = 0;
+    p.flipStyle = '';
+    p.airDashT = 0;
+    p.trailOn = false;
+    this.airSlashQueued = false; // he never reached the ground, so a swing held in the air is dropped
+    this.sfx.flip();
+    this.shocks.spawn(p.pos.clone().setY(p.pos.y + 1.5), 0xdfeaff, 1.6, 0.24);
+    this.shake(0.05);
+    return true;
   }
 
   private updatePlayer(dt: number) {
@@ -3620,7 +3752,14 @@ export class Game {
       (p.state === 'heal' && p.t > 0.2 && !p.healDone);
 
     // ---- global actions ----
-    if (p.state !== 'dead' && p.state !== 'deathblow' && p.state !== 'jump' && p.state !== 'stomp' && p.state !== 'dive') {
+    if (
+      p.state !== 'dead' &&
+      p.state !== 'deathblow' &&
+      p.state !== 'jump' &&
+      p.state !== 'stomp' &&
+      p.state !== 'dive' &&
+      p.state !== 'mantle'
+    ) {
       if (this.dodgeBuf > 0 && dodgeFree()) {
         this.dodgeBuf = 0;
         if (!this.tryMikiri()) this.startDodge(move);
@@ -3686,19 +3825,17 @@ export class Game {
         // short legs cover less ground, so speed follows body size
         // speed is capped by what the legs can actually turn over — outrun your own stride and the feet skate
         const bodyK = this.sizeK * (this.chibi ? 0.9 : 1);
-        let spd = (guarding ? 2.4 : sprint ? 14.0 : 8.4) * (1 + 0.08 * this.flowLevel()) * (0.3 + 0.7 * bodyK);
-        if (this.gameMode === 'runner' && !guarding) {
-          spd += Math.min(4.5, this.runnerDistance * 0.012);
-          if (this.keys.has('KeyW')) spd *= 1.2;
-          else if (this.keys.has('KeyS')) spd = Math.max(3, spd * 0.58);
-        }
+        // A clear jog and a clear sprint: the jog sits a touch lower so letting go of Shift visibly settles the
+        // body, and the sprint bursts out of it instead of winding up.
+        let spd = (guarding ? 2.5 : sprint ? 14.0 : 8.0) * (1 + 0.08 * this.flowLevel()) * (0.3 + 0.7 * bodyK);
         if (move.lengthSq() > 0.01) desiredSpeed = spd;
-        // weighty acceleration: ~0.2 s to full run, firm braking — the lean in the animation comes from this
+        // snap into the sprint (~0.3 s), settle into the jog, and stop on a dime — the lean and the push-off
+        // transient in the gait are driven by this, so harder acceleration is also better animation
         const desVel = move.clone().multiplyScalar(spd);
         const dvx = desVel.x - p.vel.x;
         const dvz = desVel.z - p.vel.z;
         const dvl = Math.hypot(dvx, dvz);
-        const maxStep = (move.lengthSq() > 0.01 ? (sprint ? 30 : 36) : 46) * dt;
+        const maxStep = (move.lengthSq() > 0.01 ? (sprint ? 46 : 34) : 56) * dt;
         const k = dvl > maxStep ? maxStep / dvl : 1;
         p.vel.x += dvx * k;
         p.vel.z += dvz * k;
@@ -3725,6 +3862,7 @@ export class Game {
         copyPose(T, guarding ? P.guard : P.idle);
         p.look = tgt ? tgt.pos : (this.nearestEnemy()?.pos ?? null);
         this.walkOverlay(T, p, spd, dt, 7.6, p.vel.x, p.vel.z, !guarding);
+        if (this.stepSurf >= 0) this.stepUpPose(T, p);
         rate = guarding ? 26 : 12;
         break;
       }
@@ -3880,14 +4018,35 @@ export class Game {
         // anime hero landing: crouched, hand to the ground, eyes on the enemy; any input breaks out of it early
         const a = p.anim!;
         sampleFrames(a.frames, p.t, T);
-        rate = 30;
+        // Impact detail. Everything below is scaled by how hard the feet arrived (`landPower`, taken from the
+        // vertical speed at contact), so a small hop stays light while a rooftop drop folds the body deep,
+        // throws the free arm out for balance and holds the compression before it recovers. The feet stay
+        // planted (the landing poses are planted), so lowering the hips bends the knees through the leg IK.
+        const lp = this.landPower;
+        const hold = 1 - smooth01(p.t / (0.16 + 0.34 * lp));
+        const w = lp * hold;
+        T.dy -= 0.12 * w;
+        T.torsoX += 0.14 * w;
+        T.hipX += 0.14 * w;
+        T.headX -= 0.1 * w; // the body folds over the impact; the eyes stay up on the enemy
+        T.lsX += -0.5 * w; // free arm flares out and back to keep the balance
+        T.lsZ += 0.6 * w;
+        T.leX += -0.42 * w;
+        T.rsX += 0.12 * w;
+        T.sp += 0.09 * w; // the blade dips with the compression
+        rate = 26 + 14 * w; // snap into the compression, then settle out of it
         p.look = tgt ? tgt.pos : (this.nearestEnemy()?.pos ?? null);
         if (tgt) p.yaw = turnToward(p.yaw, Math.atan2(tgt.pos.x - p.pos.x, tgt.pos.z - p.pos.z), 9 * dt);
         p.aim = p.yaw;
         if (p.landBack && p.vel.lengthSq() > 4 && Math.random() < 0.7) {
           this.dustBurst(this.tmpV2.set(p.pos.x, 0.06, p.pos.z), 1, 2.4); // the skid throws gravel
         }
-        if ((p.t > 0.22 && move.lengthSq() > 0.05) || p.t >= a.dur) {
+        // a heavy landing keeps throwing dust while the body is still folding
+        if (lp > 0.6 && hold > 0.35 && Math.random() < 0.4) {
+          this.dustBurst(this.tmpV2.set(p.pos.x, p.pos.y + 0.08, p.pos.z), 2, 2 + 2 * lp);
+        }
+        // the recovery waits for the compression: the heavier the impact, the longer the landing owns him
+        if ((p.t > 0.2 + 0.16 * lp && move.lengthSq() > 0.05) || p.t >= a.dur * (0.86 + 0.5 * lp)) {
           p.state = 'idle';
           p.t = 0;
         }
@@ -3895,16 +4054,30 @@ export class Game {
       }
       case 'jump': {
         const sweeping = this.enemies.some((e) => e.state === 'attack' && e.anim?.warn?.kind === 'sweep');
+        // ---- the jump belongs to the stick, never to the lock ----
+        // Airborne, the fighter stops staring at the target (the camera keeps its own lock, so nothing is lost
+        // on screen) and turns toward where he is actually travelling. Head, body, somersault and kimono all
+        // commit to the movement direction, which is what makes a double jump read as a jump.
+        p.look = null;
+        const airSpd = Math.hypot(p.vel.x, p.vel.z);
+        if (airSpd > 0.9) p.yaw = turnToward(p.yaw, Math.atan2(p.vel.x, p.vel.z), 7 * dt);
+        p.aim = p.yaw;
         // ---- double jump: a second somersault, with a burst of air ----
         if (this.jumpBuf > 0 && p.jumps < 2) {
           this.jumpBuf = 0;
           p.jumps = 2;
           p.flipStyle = '';
           p.vy = 7.8;
-          const front = move.lengthSq() < 0.05 || move.dot(fwd(p.yaw)) > -0.2;
+          // the second press answers the stick, not the target: face the way you are pushing, flip that way
+          const pushing = move.lengthSq() > 0.05;
+          if (pushing) {
+            p.yaw = Math.atan2(move.x, move.z);
+            p.aim = p.yaw;
+          }
+          const front = !pushing || move.dot(fwd(p.yaw)) > -0.2;
           p.flipV = (front ? 1 : -1) * 10.5;
           p.flipEnd = p.flip + (front ? 1 : -1) * TAU;
-          if (move.lengthSq() > 0.05) p.vel.copy(move).multiplyScalar(6.4);
+          if (pushing) p.vel.copy(move).multiplyScalar(6.4);
           p.jumpStart = -9;
           p.airDashT = 0;
           this.sfx.whoosh();
@@ -3928,11 +4101,22 @@ export class Game {
           this.kickV.addScaledVector(dd, 0.14);
           this.shocks.spawn(p.pos.clone().setY(p.pos.y + 1), 0xbfd8ff, 2.2, 0.3);
         }
-        // ---- Flying Swallow (attack in mid-air): dive at the target, rebound off it, repeat ----
-        if (this.attackBuf > 0 && p.diveAvail && p.pos.y > 0.4) {
+        // ---- air attacks: you cannot fence from the sky any more ----
+        // Only two things are allowed up here:
+        //  1. after an air dash (roll depan, C) → ONE flying slash, kick-weight, then gravity finishes it
+        //  2. with an enemy already inside blade reach → the swing is HELD and comes out on landing
+        // Anything else is dropped: a jump is for jumping, not for pecking people out of the air.
+        if (this.attackBuf > 0 && p.pos.y > 0.4) {
           this.attackBuf = 0;
-          this.startDive();
-          break;
+          if (!p.dashAvail && p.diveAvail) {
+            this.startDive();
+            break;
+          }
+          if (this.nearestCloseEnemy()) {
+            this.airSlashQueued = true;
+            p.glow = Math.max(p.glow, 0.9); // the blade answers: this swing is booked for the landing
+            this.sfx.unsheathe();
+          }
         }
         if (p.airDashT > 0) {
           p.airDashT -= dt;
@@ -3963,18 +4147,100 @@ export class Game {
           this.landFromAir(p.vy, landingY);
           break;
         }
+        // brushed a ledge and still pressing into it → the hands catch it and the climb takes over
+        if (p.t > 0.05 && this.tryMantle(move)) break;
         // in the air: a somersault opens up (blade out, arms wide), tucks in the middle, then opens again for the landing
+        // A plain jump is no longer a single frozen pose either. It is three beats, all read straight off the
+        // vertical speed, so the very same code covers the first jump, the double jump and a long rooftop fall:
+        //   1. takeoff extension — the body opens, the free arm punches up, the trailing leg kicks back
+        //   2. apex hang         — everything floats open for a moment at the top of the arc
+        //   3. descent           — the legs swing down and under the hips to go and meet the ground
+        const vyN = clamp(p.vy / 8.4, -1, 1);
+        const rise = clamp(vyN, 0, 1);
+        const fall = clamp(-vyN, 0, 1);
+        const apex = 1 - Math.min(1, Math.abs(vyN) / 0.3);
+        const ext = 1 - smooth01(p.t / 0.24); // the takeoff beat, gone after a quarter of a second
+        const stretch = clamp(Math.hypot(p.vel.x, p.vel.z) - 4, 0, 7) / 7; // a fast leap flattens out
         if (Math.abs(p.flipV) > 0.1) {
           const prog = clamp(1 - Math.abs(p.flipEnd - p.flip) / TAU, 0, 1);
           const w = smooth01((prog - 0.12) / 0.18) * (1 - smooth01((prog - 0.68) / 0.22));
           blendInto(T, FLIP_OPEN, P.tuck, w);
+          // the flip still answers the air around it: flat and long when travelling fast, open at the top
+          T.torsoX += 0.1 * stretch;
+          T.dy += 0.03 * apex;
         } else if (p.flipStyle === 'back') {
           copyPose(T, FLIP_OPEN);
+          T.dy += 0.03 * apex;
         } else {
           copyPose(T, P.jump);
-          T.torsoX += clamp(p.vy * 0.03, -0.2, 0.2);
+          const tk = rise * ext; // takeoff beat
+          T.torsoX += 0.2 * tk - 0.13 * fall + 0.16 * stretch;
+          T.headX += -0.12 * tk + 0.17 * fall; // chin up off the ground, eyes on the landing coming down
+          T.hipX += 0.1 * tk + 0.13 * fall + 0.06 * stretch;
+          T.dy += 0.05 * tk + 0.035 * apex - 0.03 * fall;
+          // free arm: punches up on takeoff, flares wide at the apex, drops to brace before touchdown
+          T.lsX += -0.5 * tk + 0.2 * apex - 0.24 * fall;
+          T.lsZ += 0.32 * tk + 0.24 * apex;
+          T.leX += -0.32 * tk + 0.16 * apex - 0.1 * fall;
+          // sword arm trails behind the body, then comes up ready as the ground arrives
+          T.rsX += 0.18 * fall + 0.1 * tk;
+          T.sp += 0.09 * fall;
+          T.sw += -0.06 * tk;
+          // legs: trailing kick, open at the top, then down and under the hips for the landing
+          T.rhX += 0.24 * tk - 0.3 * fall;
+          T.rkX += -0.28 * tk + 0.52 * fall;
+          T.lhX += -0.2 * tk + 0.34 * fall;
+          T.lkX += 0.22 * tk - 0.4 * fall;
+          T.plant = 0;
         }
-        rate = 24;
+        // the pose follower snaps hard on takeoff and relaxes at the top of the arc — that is the hang time
+        rate = 20 + 14 * rise * ext + 6 * fall;
+        break;
+      }
+      case 'mantle': {
+        // Climbing a ledge the hands caught in mid-air. Two beats: the pull (the body hangs long off the free
+        // arm, legs trailing, chest up) and coming over the lip (the lead knee lands on top, the torso folds
+        // forward, that arm presses down), then he stands out of it. The body is interpolated from where the
+        // hands caught the ledge to a spot past the edge, so a mantle always ends on solid surface.
+        const u = clamp(p.t / this.mantleDur, 0, 1);
+        p.vel.set(0, 0, 0);
+        p.vy = 0;
+        p.look = null;
+        // a somersault that ends on a ledge is unwound by the flip settle in updatePlayer, not snapped flat
+        // The pull is the slow part, and it happens *on the face*: the body rises first and only swings in
+        // once the hips are level with the lip, otherwise the legs would bury themselves in the rooftop.
+        const rise = smooth01(u / 0.7);
+        const slide = smooth01((u - 0.7) / 0.3);
+        p.pos.y = this.mantleFrom.y + (this.mantleTo.y - this.mantleFrom.y) * rise;
+        p.pos.x = this.mantleFrom.x + (this.mantleTo.x - this.mantleFrom.x) * slide;
+        p.pos.z = this.mantleFrom.z + (this.mantleTo.z - this.mantleFrom.z) * slide;
+        p.yaw = turnToward(p.yaw, this.mantleYaw, 9 * dt);
+        p.aim = p.yaw;
+        const over = smooth01((u - 0.3) / 0.42);
+        blendInto(T, MANTLE_PULL, MANTLE_OVER, over);
+        // the hang breathes while the arm takes the weight
+        const hang = 1 - over;
+        T.torsoZ += Math.sin(p.t * 7.5) * 0.035 * hang;
+        T.hipYaw += Math.sin(p.t * 5.1) * 0.05 * hang;
+        T.dy -= 0.06 * hang;
+        T.headX -= 0.05 * hang;
+        // the last third stands up out of the climb
+        const stand = smooth01((u - 0.7) / 0.3);
+        if (stand > 0) blendInto(T, T, P.idle, stand);
+        rate = 26 + 10 * over;
+        if (u >= 1) {
+          p.state = 'idle';
+          p.t = 0;
+          p.pos.copy(this.mantleTo);
+          p.jumps = 0; // both jumps are back: mantle, then double-jump to the next roof
+          p.diveAvail = true;
+          p.dashAvail = true;
+          p.settle = 0.28;
+          this.sfx.step(2.4);
+          this.sfx.land(0.3);
+          this.dustBurst(this.tmpV2.set(p.pos.x, p.pos.y + 0.06, p.pos.z), 6, 2);
+          this.shake(0.07);
+        }
         break;
       }
       case 'impale': {
@@ -4052,9 +4318,10 @@ export class Game {
           }
         }
         const landingY = this.landingHeightAt(previousY, p.pos.y, p.pos.x, p.pos.z);
-        if (hitE) this.diveStrike(hitE);
-        else if (landingY !== null) this.diveLand(landingY);
-        else if (p.t > 1.2) this.diveLand(this.parkourFloorAt(p.pos.x, p.pos.z));
+        // one contact only: after the slash connects the dive simply falls to the ground
+        if (hitE && !p.diveHit) this.diveStrike(hitE);
+        if (landingY !== null) this.diveLand(landingY, !p.diveHit);
+        else if (p.t > 1.2) this.diveLand(this.parkourFloorAt(p.pos.x, p.pos.z), !p.diveHit);
         break;
       }
       case 'stomp': {
@@ -4171,21 +4438,28 @@ export class Game {
       p.pos.x += p.vel.x * dt;
       p.pos.z += p.vel.z * dt;
     }
-    this.resolveParkourSideCollision(previousX, previousZ);
-    if (p.state === 'idle') {
-      const floor = this.parkourFloorAt(p.pos.x, p.pos.z);
-      if (p.pos.y > floor + 0.02) {
-        // Walking off a step becomes a real fall, preserving double-jump and air-dash access.
-        p.state = 'jump';
-        p.t = 0;
-        p.anim = null;
-        p.vy = 0;
-        p.jumps = 1;
-        p.diveAvail = true;
-        p.dashAvail = true;
-        p.airDashT = 0;
-        p.jumpStart = -9;
-      } else p.pos.y = floor;
+    this.mantleCD = Math.max(0, this.mantleCD - dt);
+    // a step-up interrupted by a jump, a hit or a mantle is simply dropped — it must never stay booked
+    if (p.state !== 'idle' && this.stepSurf >= 0) this.stepSurf = -1;
+    // A climb owns the body for its length: no side push-out (that is what the climb is defeating) and no
+    // floor snap (the body is deliberately above the ground it left while it rides up the face).
+    if (!(p.state === 'idle' && this.stepUp(dt, move))) {
+      if (p.state !== 'mantle') this.resolveParkourSideCollision(previousX, previousZ);
+      if (p.state === 'idle') {
+        const floor = this.parkourFloorAt(p.pos.x, p.pos.z);
+        if (p.pos.y > floor + 0.02) {
+          // Walking off a step becomes a real fall, preserving double-jump and air-dash access.
+          p.state = 'jump';
+          p.t = 0;
+          p.anim = null;
+          p.vy = 0;
+          p.jumps = 1;
+          p.diveAvail = true;
+          p.dashAvail = true;
+          p.airDashT = 0;
+          p.jumpStart = -9;
+        } else p.pos.y = floor;
+      }
     }
     if (
       p.state !== 'attack' &&
@@ -4205,7 +4479,8 @@ export class Game {
           : p.state === 'dodge' || p.state === 'land'
             ? p.state + (p.anim?.name ?? '')
             : p.state;
-    p.soft = p.state === 'idle' || p.state === 'heal' || p.state === 'stomp' || p.state === 'jump' || p.state === 'style';
+    p.soft =
+      p.state === 'idle' || p.state === 'heal' || p.state === 'stomp' || p.state === 'jump' || p.state === 'style' || p.state === 'mantle';
     this.finishPose(p, rate, dt);
     if (p.state === 'dead') p.rig.root.position.y = 0.12 * clamp(p.t / 0.9, 0, 1);
     void desiredSpeed;
@@ -4247,17 +4522,17 @@ export class Game {
         const d = this.enemySurfaceDistance(e, p.pos);
         if (d > 5.0) continue;
         const ranged = e.kind === 'archer' || e.kind === 'gunner';
-        const evadeChance = ranged ? 0.5 : this.isHeavyBoss(e) ? (e.phase2 ? 0.08 : 0.03) : e.boss ? (e.phase2 ? 0.34 : 0.24) : 0.2;
+        const evadeChance = ranged ? 0.55 : this.isHeavyBoss(e) ? (e.phase2 ? 0.11 : 0.05) : e.boss ? (e.phase2 ? 0.4 : 0.3) : 0.26;
         if (e.evadeCD <= 0 && Math.random() < evadeChance) {
           this.startEvade(e, d < 2.6);
           continue;
         }
         if (ranged) continue;
-        const parryChance = e.boss ? (e.phase2 ? 0.4 : 0.3) : 0.16;
-        const blockChance = e.boss ? 0.3 : 0.34;
+        const parryChance = e.boss ? (e.phase2 ? 0.46 : 0.36) : 0.24;
+        const blockChance = e.boss ? 0.36 : 0.42;
         const r = Math.random();
         e.defense = e.parryCD <= 0 && r < parryChance ? 'deflect' : r < parryChance + blockChance ? 'block' : null;
-        e.defenseUntil = this.time + 0.6;
+        e.defenseUntil = this.time + 0.72;
       }
     } else if (!this.rage.on && special?.hits[0]?.kind !== 'kick') {
       // Tactical update: readable guards replace random melee evasions; wind-ups and recovery remain punishable.
@@ -4273,8 +4548,8 @@ export class Game {
         if (e.defense && this.time < e.defenseUntil) continue;
         const parryReady = e.parryCD <= 0;
         e.defense = parryReady ? 'deflect' : 'block';
-        e.defenseUntil = this.time + (parryReady ? 0.5 : 0.62);
-        if (parryReady) e.parryCD = e.boss ? 2.2 : 3.6;
+        e.defenseUntil = this.time + (parryReady ? 0.6 : 0.78);
+        if (parryReady) e.parryCD = e.boss ? 1.5 : 2.4;
       }
     }
   }
@@ -4292,7 +4567,7 @@ export class Game {
     e.state = 'evade';
     e.stateT = 0;
     e.stateDur = back ? 0.42 : 0.38;
-    e.evadeCD = this.combatMode === 'after' ? (e.boss ? 2.1 : 3.2) : e.boss ? rand(1.6, 2.6) : rand(2.6, 4.2);
+    e.evadeCD = this.combatMode === 'after' ? (e.boss ? 1.5 : 2.3) : e.boss ? rand(1.2, 2.0) : rand(1.9, 3.0);
     e.yaw = Math.atan2(toP.x, toP.z);
     e.aim = e.yaw;
     // a dodge is a free opening to strike back
@@ -4417,6 +4692,12 @@ export class Game {
     p.trailOn = false;
     // moving jump = somersault; standing jump = a graceful leap (a second press in the air double-jumps)
     const moving = move.lengthSq() > 0.05;
+    // a moving takeoff commits to the direction of travel — the lock never steers the body in the air.
+    // A jump pressed while standing still keeps the current facing (and has no somersault at all).
+    if (moving) {
+      p.yaw = Math.atan2(move.x, move.z);
+      p.aim = p.yaw;
+    }
     const front = !moving || move.dot(fwd(p.yaw)) > -0.2;
     p.flip = 0;
     p.flipV = moving ? (front ? 1 : -1) * 9.4 : 0;
@@ -4438,6 +4719,9 @@ export class Game {
     }
     this.sfx.whoosh();
     this.dustBurst(p.pos.clone().setY(0.15), 8, 2.5);
+    // the ground answers the push-off: a thin ring of air at the feet and a breath of camera lift
+    this.shocks.spawn(p.pos.clone().setY(0.1), 0xcfe2ff, 1.5, 0.26);
+    this.kickV.y += 0.022;
   }
 
   /**
@@ -4448,13 +4732,17 @@ export class Game {
     const p = this.player;
     const back = p.flipStyle === 'back';
     const airtime = p.t;
+    const held = this.airSlashQueued;
+    this.airSlashQueued = false;
     p.pos.y = floorY;
     p.jumps = 0;
     p.diveAvail = true;
     p.dashAvail = true;
+    p.diveHit = false;
     p.airDashT = 0;
     p.flipStyle = '';
     const power = clamp(-impactVy / 12, 0.2, 1);
+    this.landPower = power; // the landing pose reads this: how deep it compresses, how long it holds
     this.dustBurst(p.pos.clone().setY(floorY + 0.1), 8 + Math.round(10 * power), 2.5 + 2 * power);
     this.shake(0.12 + 0.28 * power);
     if (airtime > 0.3 || impactVy < -6) {
@@ -4472,6 +4760,9 @@ export class Game {
       p.t = 0;
       p.vel.multiplyScalar(0.25);
     }
+    // a swing held in the air is delivered on contact (the landing pose already cancels into it)
+    // generous on purpose: 'land' only cancels into a swing after 0.2 s, and slow-motion stretches that
+    if (held) this.attackBuf = Math.max(this.attackBuf, 0.5);
   }
 
   /**
@@ -4579,8 +4870,13 @@ export class Game {
   }
 
   /** Flying Swallow: a hard dive at the locked target (or straight ahead if none). */
+  /**
+   * Flying slash — only reachable after an air dash (roll depan). One cut, kick-weight, and then the
+   * fighter drops to the ground; there is no rebound and no second pass at the same body.
+   */
   private startDive() {
     const p = this.player;
+    p.diveHit = false;
     let tgt = this.lockOn ? this.lockTarget : null;
     if (!tgt || !this.alive(tgt) || this.enemySurfaceDistance(tgt, p.pos) > CLOSE_ATTACK_RANGE) {
       tgt = this.nearestCloseEnemy();
@@ -4611,56 +4907,54 @@ export class Game {
     this.kickV.addScaledVector(dir, 0.2);
   }
 
-  /** The dive connects: heavy cut, then the player rebounds off the target and can dive again. */
+  /**
+   * The flying slash connects: ONE cut weighted like the kick — little HP, enough posture to break a
+   * guard — and that is the whole move. The dive's momentum dies on contact, so gravity drops the
+   * fighter straight to the ground instead of bouncing him back up for another peck.
+   */
   private diveStrike(e: Enemy) {
     const p = this.player;
-    const h: HitDef = { t: 0, dmg: 34, post: 34, reach: 3, arc: 360, kind: 'slash', heavy: true, ang: 0.95 };
+    const h: HitDef = { t: 0, dmg: 10, post: 36, reach: 2.6, arc: 140, kind: 'slash', heavy: true, ang: 0.95 };
+    p.diveHit = true;
     p.aim = Math.atan2(e.pos.x - p.pos.x, e.pos.z - p.pos.z);
     p.yaw = p.aim;
     this.onPlayerStrike(h);
     this.applyPlayerHit(e, h);
-    this.addStyle(18);
-    this.shake(0.55);
-    this.fovPunch = 6;
-    this.shocks.spawn(this.tmpV.copy(e.pos).setY(this.isHeavyBoss(e) ? 2.2 * this.sizeK : 1.1 * e.scale), 0xfff0c0, 3, 0.35);
-    // rebound: spring back up and away
-    const away = new THREE.Vector3(p.pos.x - e.pos.x, 0, p.pos.z - e.pos.z);
-    if (away.lengthSq() < 0.01) away.copy(fwd(p.yaw)).multiplyScalar(-1);
-    away.normalize();
-    p.state = 'jump';
-    p.t = 0;
-    p.vy = 9;
-    p.vel.copy(away).multiplyScalar(5);
-    p.jumps = 1;
-    p.diveAvail = true;
-    p.dashAvail = true;
-    p.airDashT = 0;
-    p.jumpStart = -9;
-    p.flipV = -10.5;
-    p.flipEnd = p.flip - TAU;
+    this.addStyle(14);
+    this.shake(0.42);
+    this.fovPunch = 4;
+    this.shocks.spawn(this.tmpV.copy(e.pos).setY(this.isHeavyBoss(e) ? 2.2 * this.sizeK : 1.1 * e.scale), 0xfff0c0, 2.6, 0.32);
+    p.vel.multiplyScalar(0.2);
+    p.vy = Math.min(p.vy, -3);
   }
 
   /** The dive hits the ground: shockwave that staggers anything close. */
-  private diveLand(floorY = 0) {
+  private diveLand(floorY = 0, shock = true) {
     const p = this.player;
+    this.airSlashQueued = false;
+    p.diveHit = false;
     p.pos.y = floorY;
     p.state = 'land';
     p.t = 0;
     p.anim = LAND_HERO_ANIM;
     p.landBack = false;
+    this.landPower = 1; // slamming down out of a flying slash is the hardest landing there is
     p.flipStyle = '';
     p.vel.multiplyScalar(0.1);
     p.jumps = 0;
     p.diveAvail = true;
     p.dashAvail = true;
-    this.shocks.spawn(p.pos.clone().setY(floorY + 0.1), 0xffd9b0, 5, 0.5);
-    this.dustBurst(p.pos.clone().setY(floorY + 0.1), 18, 4);
-    this.shake(0.4);
+    this.shocks.spawn(p.pos.clone().setY(floorY + 0.1), 0xffd9b0, shock ? 5 : 3.2, 0.5);
+    this.dustBurst(p.pos.clone().setY(floorY + 0.1), shock ? 18 : 10, shock ? 4 : 2.6);
+    this.shake(shock ? 0.4 : 0.24);
     this.sfx.kick();
-    for (const e of this.enemies.slice()) {
-      if (!this.alive(e)) continue;
-      if (this.enemySurfaceDistance(e, p.pos) < 2.8) {
-        this.applyPlayerHit(e, { t: 0, dmg: 14, post: 24, reach: 3, arc: 360, kind: 'slash', heavy: false, ang: 0.95 });
+    // an empty dive still dents the ground; one that already cut somebody does not hit him twice
+    if (shock) {
+      for (const e of this.enemies.slice()) {
+        if (!this.alive(e)) continue;
+        if (this.enemySurfaceDistance(e, p.pos) < 2.8) {
+          this.applyPlayerHit(e, { t: 0, dmg: 14, post: 24, reach: 3, arc: 360, kind: 'slash', heavy: false, ang: 0.95 });
+        }
       }
     }
   }
@@ -4860,7 +5154,7 @@ export class Game {
     if (def === 'deflect') {
       // a real parry: your blade is thrown off, you stagger, and he is already swinging back
       e.defense = null;
-      e.parryCD = this.combatMode === 'before' ? (e.boss ? rand(1.4, 2.4) : rand(3.0, 5.0)) : e.boss ? 2.2 : 3.6;
+      e.parryCD = this.combatMode === 'before' ? (e.boss ? rand(1.0, 1.8) : rand(2.2, 3.6)) : e.boss ? 1.5 : 2.4;
       this.interruptEnemy(e);
       e.state = 'parry';
       e.stateT = 0;
@@ -5107,12 +5401,12 @@ export class Game {
     const r = Math.random();
     let n: EnemyAttackName;
     // The heavy boss favors slow, readable, high-impact strikes over rapid multi-hit strings.
-    if (!e.boss) n = r < 0.26 ? 'slash' : r < 0.58 ? 'combo2' : r < 0.78 ? 'combo3' : r < 0.92 ? 'thrust' : 'sweep';
+    if (!e.boss) n = r < 0.18 ? 'slash' : r < 0.46 ? 'combo2' : r < 0.68 ? 'combo3' : r < 0.86 ? 'thrust' : 'sweep';
     else if (this.isHeavyBoss(e)) {
       if (!e.phase2) n = r < 0.38 ? 'slash' : r < 0.68 ? 'sweep' : r < 0.9 ? 'thrust' : 'combo2';
       else n = r < 0.3 ? 'sweep' : r < 0.65 ? 'thrust' : r < 0.85 ? 'slash' : 'combo3';
-    } else if (!e.phase2) n = r < 0.16 ? 'slash' : r < 0.52 ? 'combo3' : r < 0.74 ? 'combo4' : r < 0.88 ? 'thrust' : 'sweep';
-    else n = r < 0.08 ? 'combo3' : r < 0.5 ? 'combo4' : r < 0.74 ? 'thrust' : 'sweep';
+    } else if (!e.phase2) n = r < 0.12 ? 'slash' : r < 0.46 ? 'combo3' : r < 0.72 ? 'combo4' : r < 0.88 ? 'thrust' : 'sweep';
+    else n = r < 0.06 ? 'combo3' : r < 0.44 ? 'combo4' : r < 0.72 ? 'thrust' : 'sweep';
     if ((n === 'thrust' || n === 'sweep') && e.lastAttack === n) n = this.isHeavyBoss(e) ? 'slash' : e.boss ? 'combo3' : 'slash';
     return n;
   }
@@ -5269,6 +5563,7 @@ export class Game {
     p.state = 'dead';
     p.t = 0;
     this.deadT = 0;
+    this.airSlashQueued = false; // a swing booked for a landing that will never happen
     this.sfx.die();
     this.slowmo(1.2, 0.25);
     this.onEvent({ type: 'playerDeath', text: '死' });
@@ -5292,8 +5587,8 @@ export class Game {
     const wantYaw = Math.atan2(toP.x, toP.z);
     let speed = 0;
 
-    if (e.state !== 'broken' && e.state !== 'dying' && e.state !== 'dead' && e.state !== 'spawn' && e.postureT > 1.6) {
-      e.posture = Math.max(0, e.posture - 16 * (0.5 + 0.5 * (e.hp / e.hpMax)) * dt);
+    if (e.state !== 'broken' && e.state !== 'dying' && e.state !== 'dead' && e.state !== 'spawn' && e.postureT > 1.15) {
+      e.posture = Math.max(0, e.posture - 21 * (0.5 + 0.5 * (e.hp / e.hpMax)) * dt);
     }
 
     switch (e.state) {
@@ -5318,13 +5613,13 @@ export class Game {
         }
         const ranged = e.kind === 'archer' || e.kind === 'gunner';
         // ranged enemies never block the melee queue — they snipe independently
-        // two blades may press you at once now (three used to take turns politely)
+        // three blades may press you at once now: the duel is meant to feel outnumbered
         const busy =
           !ranged &&
-          this.enemies.filter((o) => o !== e && o.state === 'attack' && o.kind !== 'archer' && o.kind !== 'gunner').length >= 2;
+          this.enemies.filter((o) => o !== e && o.state === 'attack' && o.kind !== 'archer' && o.kind !== 'gunner').length >= 3;
         let fwdS = 0;
         let side = 0;
-        const approach = heavyBoss ? 1.75 * (0.45 + 0.55 * this.sizeK) : (e.boss ? 4.4 : 3.7) * (0.45 + 0.55 * this.sizeK);
+        const approach = heavyBoss ? 2.15 * (0.45 + 0.55 * this.sizeK) : (e.boss ? 5.2 : 4.6) * (0.45 + 0.55 * this.sizeK);
         if (ranged) {
           // keep a firing distance: back off fast when rushed, close in when too far, always sidestep
           const lo = e.kind === 'archer' ? 8 : 6.5;
@@ -5338,15 +5633,16 @@ export class Game {
           else if (dist < 3.2) fwdS = -0.45 * this.sizeK;
           side = e.circleDir * (dist < 3.2 ? 0.06 : 0.18) * this.sizeK;
         } else if (busy) {
-          if (dist < 4.5) fwdS = -1.8;
-          else if (dist > 6) fwdS = approach * 0.6;
-          side = e.circleDir * 1.2;
-        } else if (dist > 3.4) {
+          // waiting their turn no longer means walking away: they crowd you and look for the gap
+          if (dist < 4.0) fwdS = -0.9;
+          else if (dist > 5.4) fwdS = approach * 0.85;
+          side = e.circleDir * 1.5;
+        } else if (dist > 3.0) {
           fwdS = approach;
-          side = e.circleDir * 0.5;
-        } else if (dist < 1.9) {
-          fwdS = -1.6;
-          side = e.circleDir * 1.0;
+          side = e.circleDir * 0.6;
+        } else if (dist < 1.6) {
+          fwdS = -1.2;
+          side = e.circleDir * 1.15;
         } else {
           side = e.circleDir * 1.3;
         }
@@ -5372,7 +5668,7 @@ export class Game {
           e.attackTimer <= 0 &&
           !e.disarmed &&
           !busy &&
-          dist < (heavyBoss ? HEAVY_BOSS_ATTACK_RANGE : 4.3) &&
+          dist < (heavyBoss ? HEAVY_BOSS_ATTACK_RANGE : 4.9) &&
           playerAlive &&
           this.alive(e)
         ) {
@@ -5446,12 +5742,12 @@ export class Game {
           e.trailOn = false;
           e.settle = 0.3;
           e.attackTimer = this.isHeavyBoss(e)
-            ? rand(e.phase2 ? 0.65 : 1.15, e.phase2 ? 1.05 : 1.8)
+            ? rand(e.phase2 ? 0.5 : 0.85, e.phase2 ? 0.8 : 1.35)
             : e.boss
-              ? rand(e.phase2 ? 0.18 : 0.32, e.phase2 ? 0.5 : 0.8)
+              ? rand(e.phase2 ? 0.14 : 0.24, e.phase2 ? 0.4 : 0.62)
               : e.kind === 'archer' || e.kind === 'gunner'
-                ? rand(0.8, 1.7)
-                : rand(0.35, 0.95);
+                ? rand(0.65, 1.35)
+                : rand(0.22, 0.62);
         }
         break;
       }
@@ -5462,7 +5758,7 @@ export class Game {
         if (e.stateT > e.stateDur) {
           e.state = 'idle';
           e.stateT = 0;
-          e.attackTimer = Math.min(e.attackTimer, rand(0.3, 0.9));
+          e.attackTimer = Math.min(e.attackTimer, rand(0.18, 0.5));
         }
         break;
       }
@@ -5472,7 +5768,7 @@ export class Game {
         if (e.stateT > e.stateDur) {
           e.state = 'idle';
           e.stateT = 0;
-          e.attackTimer = rand(0.2, 0.6);
+          e.attackTimer = rand(0.1, 0.35);
         }
         break;
       }
@@ -5758,14 +6054,7 @@ export class Game {
       lock,
       perilous,
       prompt,
-      stageName:
-        this.gameMode === 'runner'
-          ? `RUNNER · ${Math.floor(this.runnerDistance).toString().padStart(3, '0')}m`
-          : this.gameMode === 'apartment'
-            ? 'APARTMENT · LANTAI 04'
-            : this.stage >= 0 && this.stage < STAGES.length
-              ? STAGES[this.stage].name
-              : '',
+      stageName: this.stage >= 0 && this.stage < STAGES.length ? STAGES[this.stage].name : '',
       stage: this.stage,
       stats: { ...this.stats },
       streak: this.streak,
@@ -5774,7 +6063,7 @@ export class Game {
       lockOn: this.lockOn,
       combatMode: this.combatMode,
       rage: this.rageSnapshot(),
-      theme: this.gameMode === 'duel' ? this.theme : 'neon',
+      theme: this.theme,
       cine: this.cineW,
       style: { rank: this.styleRank(), pct: this.styleScore / 100, score: this.styleScore },
     };
