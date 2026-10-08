@@ -106,11 +106,11 @@ function EnemyTop({ e }: { e: EnemyView }) {
 
 type RageView = Snapshot['rage'];
 
-function RageMeter({ r }: { r: RageView }) {
+function RageMeter({ r, w = 240 }: { r: RageView; w?: number }) {
   return (
     <div className="mt-2 flex items-center gap-2">
       <span className={`font-jp text-sm ${r.on ? 'kanji-red' : 'text-red-300/70'}`}>怒</span>
-      <div className={`relative h-[8px] ${r.on ? 'anim-break' : ''}`} style={{ width: 240 }}>
+      <div className={`relative h-[8px] ${r.on ? 'anim-break' : ''}`} style={{ width: w }}>
         <div className="absolute inset-0 border border-white/20 bg-black/60" />
         <div
           className="absolute top-0 bottom-0 left-0 transition-[width] duration-100"
@@ -301,9 +301,13 @@ export function ThreatMarkers({ enemies }: { enemies: EnemyView[] }) {
   );
 }
 
-export function Hud({ s }: { s: Snapshot }) {
+/**
+ * The duel HUD. `touch` is set while the on-screen pad is up: the two bottom corners then belong to
+ * the thumbs, so vitality and posture move into the top-left column and the keyboard hints go away.
+ */
+export function Hud({ s, touch = false }: { s: Snapshot; touch?: boolean }) {
   const focus = s.enemies.find((e) => e.focus);
-  const barW = 300;
+  const barW = touch ? 210 : 300;
   const white = s.theme === 'white';
   return (
     <div className="pointer-events-none absolute inset-0 overflow-hidden">
@@ -370,8 +374,8 @@ export function Hud({ s }: { s: Snapshot }) {
         </div>
       )}
 
-      {/* bottom-left: vitality */}
-      <div className="absolute bottom-8 left-8">
+      {/* vitality: bottom-left with a mouse, top-left once the thumb pad owns the bottom corners */}
+      <div className={touch ? 'absolute top-[92px] left-9' : 'absolute bottom-8 left-8'}>
         <div className="mb-1 flex items-center gap-3">
           <span className="font-jp text-xs tracking-[0.3em] text-white/60">体力</span>
           <div className="flex items-center gap-1.5" title="Gourd penyembuh (H)">
@@ -393,14 +397,22 @@ export function Hud({ s }: { s: Snapshot }) {
           </div>
         </div>
         <HealthBar v={s.hp} width={barW} h={12} />
-        <RageMeter r={s.rage} />
+        {touch && (
+          <div className="mt-2">
+            <PostureBar v={s.posture} broken={s.postureBroken} width={barW} h={9} />
+            <div className="font-jp mt-1 text-[10px] tracking-[0.5em] text-white/40">体幹</div>
+          </div>
+        )}
+        <RageMeter r={s.rage} w={touch ? barW - 30 : 240} />
       </div>
 
-      {/* bottom center: posture */}
-      <div className="absolute bottom-12 left-1/2 -translate-x-1/2 text-center">
-        <PostureBar v={s.posture} broken={s.postureBroken} width={380} h={9} />
-        <div className="font-jp mt-1 text-[10px] tracking-[0.5em] text-white/40">体幹</div>
-      </div>
+      {/* bottom center: posture (with a mouse — the touch layout keeps it beside vitality) */}
+      {!touch && (
+        <div className="absolute bottom-12 left-1/2 -translate-x-1/2 text-center">
+          <PostureBar v={s.posture} broken={s.postureBroken} width={380} h={9} />
+          <div className="font-jp mt-1 text-[10px] tracking-[0.5em] text-white/40">体幹</div>
+        </div>
+      )}
 
       {/* top-left stage */}
       <div className="absolute top-7 left-9 flex items-start gap-3">
@@ -465,7 +477,8 @@ export function Hud({ s }: { s: Snapshot }) {
         </div>
       )}
 
-      {/* a short, contextual hint — never a wall of text */}
+      {/* a short, contextual hint — never a wall of text, and never under the thumb cluster */}
+      {!touch && (
       <div className="font-title absolute right-9 bottom-9 space-y-1 text-right text-[9px] tracking-[0.28em] text-white/22 uppercase">
         {s.rage.on ? (
           <>
@@ -482,6 +495,7 @@ export function Hud({ s }: { s: Snapshot }) {
           </>
         )}
       </div>
+      )}
     </div>
   );
 }

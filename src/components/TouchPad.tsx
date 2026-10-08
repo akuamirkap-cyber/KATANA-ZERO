@@ -1,126 +1,175 @@
-import { useCallback, useEffect, useRef, useState } from 'react';
+import { useRef, useState } from 'react';
 import type { Game, TouchAction } from '../game/Game';
 
-/**
- * On-screen mobile controls for NINJA RUN (9:16 portrait frame).
+/*
+ * On-screen controls for the duel.
  *
- * The run only needs three verbs — LOMPAT · SERANG · DASH — so those are the big thumb buttons on the
- * right. Guard / Rage / Heal stay reachable as smaller buttons, ◀ ▶ step between the three depth lanes
- * of the flat track, and the play field itself accepts gestures: tap = tebas, swipe up = lompat,
- * swipe down = dash, swipe left/right = pindah jalur. Every control routes into the very same intents
- * the keyboard and mouse use (Game.pressTouch / releaseTouch / changeRunnerLane).
+ * Left thumb  : a virtual stick that walks the arena (it feeds the very same axes as WASD).
+ * Right thumb : the verb cluster — tebas, dash, lompat, guard, tendang, Rage, heal, ganti target.
+ * The camera auto-locks onto the target, so no thumb ever has to steer it; the ◎ button hops to the
+ * next enemy when a stage has more than one. Every button fires the same intent as its key binding,
+ * so a mouse/keyboard player and a touch player are playing the identical game.
+ *
+ * Sizes are in vmin because the duel fills the whole window (landscape or portrait, it always has a
+ * shorter axis to size against).
  */
+
+type Tone = 'red' | 'steel' | 'gold' | 'green';
+
+const TONE: Record<Tone, string> = {
+  red: 'border-red-400/60 bg-red-950/55 text-red-50 shadow-[0_0_18px_rgba(255,60,40,.3)]',
+  steel: 'border-sky-200/40 bg-slate-900/55 text-sky-50 shadow-[0_0_14px_rgba(90,160,255,.22)]',
+  gold: 'border-amber-200/55 bg-amber-950/50 text-amber-50 shadow-[0_0_16px_rgba(255,200,90,.26)]',
+  green: 'border-emerald-300/50 bg-emerald-950/50 text-emerald-50 shadow-[0_0_14px_rgba(80,255,170,.24)]',
+};
 
 interface PadButtonProps {
   jp: string;
   label: string;
-  /** diameter in cqw */
+  /** diameter in vmin */
   size: number;
-  style: React.CSSProperties;
+  tone?: Tone;
+  style?: React.CSSProperties;
   onPress: () => void;
   onRelease?: () => void;
-  tone?: 'red' | 'steel' | 'amber' | 'green';
-  hint?: string;
+  dim?: boolean;
 }
 
-const TONE: Record<string, { ring: string; bg: string; text: string }> = {
-  red: { ring: 'rgba(255,90,70,.65)', bg: 'rgba(60,10,10,.55)', text: '#ffe9e2' },
-  steel: { ring: 'rgba(220,230,240,.45)', bg: 'rgba(14,16,22,.5)', text: '#eef2f6' },
-  amber: { ring: 'rgba(255,196,90,.6)', bg: 'rgba(58,34,6,.5)', text: '#ffeecb' },
-  green: { ring: 'rgba(120,235,180,.55)', bg: 'rgba(8,44,30,.5)', text: '#dcffee' },
-};
-
-function PadButton({ jp, label, size, style, onPress, onRelease, tone = 'red', hint }: PadButtonProps) {
-  const [down, setDown] = useState(false);
-  const held = useRef(false);
-  const t = TONE[tone];
-
-  const release = useCallback(() => {
-    if (!held.current) return;
-    held.current = false;
-    setDown(false);
-    onRelease?.();
-  }, [onRelease]);
-
-  // never leave a hold-button stuck down (e.g. the pause overlay opens mid-press)
-  useEffect(() => {
-    return () => release();
-  }, [release]);
-
+function PadButton({ jp, label, size, tone = 'steel', style, onPress, onRelease, dim }: PadButtonProps) {
   return (
     <button
       type="button"
       aria-label={label}
       onPointerDown={(e) => {
-        e.preventDefault(); // suppress the compatibility mouse event → no double trigger on the canvas
-        e.stopPropagation(); // keep the game's window-level mousedown listener out of it
-        (e.currentTarget as HTMLElement).setPointerCapture?.(e.pointerId);
-        held.current = true;
-        setDown(true);
+        e.preventDefault();
+        e.stopPropagation();
         onPress();
       }}
       onPointerUp={(e) => {
         e.stopPropagation();
-        release();
+        onRelease?.();
       }}
-      onPointerCancel={release}
-      onLostPointerCapture={release}
+      onPointerCancel={() => onRelease?.()}
+      onPointerLeave={() => onRelease?.()}
       onMouseDown={(e) => e.stopPropagation()}
       onContextMenu={(e) => e.preventDefault()}
-      className="pointer-events-auto absolute flex flex-col items-center justify-center rounded-full backdrop-blur-[2px] transition-[transform,box-shadow,background] duration-75 select-none"
-      style={{
-        width: `${size}cqw`,
-        height: `${size}cqw`,
-        border: `1px solid ${t.ring}`,
-        background: down ? t.ring : t.bg,
-        boxShadow: down ? `0 0 22px ${t.ring}, inset 0 0 18px rgba(0,0,0,.45)` : `0 0 12px rgba(0,0,0,.45), inset 0 0 12px rgba(0,0,0,.35)`,
-        transform: down ? 'scale(.93)' : 'scale(1)',
-        touchAction: 'none',
-        ...style,
-      }}
+      className={`font-jp pointer-events-auto absolute flex items-center justify-center rounded-full border backdrop-blur-[2px] transition-transform duration-75 select-none active:scale-95 ${TONE[tone]} ${dim ? 'opacity-35' : ''}`}
+      style={{ width: `${size}vmin`, height: `${size}vmin`, touchAction: 'none', ...style }}
     >
-      <span
-        className="font-jp leading-none font-extrabold"
-        style={{ fontSize: `${size * 0.42}cqw`, color: down ? '#1a0b0b' : t.text, textShadow: down ? 'none' : '0 2px 8px rgba(0,0,0,.9)' }}
-      >
-        {jp}
-      </span>
-      <span
-        className="font-title mt-[0.6cqw] leading-none tracking-[0.14em] uppercase"
-        style={{ fontSize: `${Math.max(6, size * 0.135)}cqw`, color: down ? '#2a1010' : 'rgba(255,255,255,.62)' }}
-      >
-        {label}
-      </span>
-      {hint && (
-        <span className="font-title leading-none tracking-[0.1em] text-white/35 uppercase" style={{ fontSize: `${Math.max(5, size * 0.1)}cqw` }}>
-          {hint}
+      <span className="flex flex-col items-center leading-none">
+        <span style={{ fontSize: `${size * 0.4}vmin` }}>{jp}</span>
+        <span
+          className="font-title mt-[0.7vmin] tracking-[0.14em] uppercase"
+          style={{ fontSize: `${Math.max(1.4, size * 0.135)}vmin` }}
+        >
+          {label}
         </span>
-      )}
+      </span>
     </button>
   );
 }
 
-interface TouchPadProps {
-  game: Game | null;
-  paused: boolean;
-  /** rage mode is on → a drag over the field steers the cut angle instead of firing a gesture */
-  rageOn: boolean;
-  dead: boolean;
+/** Analog thumb stick. Dead-zoned, clamped to its base, and released the moment the finger lifts. */
+function Stick({ game, disabled }: { game: Game | null; disabled: boolean }) {
+  const [knob, setKnob] = useState({ x: 0, y: 0 });
+  const id = useRef(-1);
+  const c = useRef({ x: 0, y: 0, r: 1 });
+
+  const apply = (px: number, py: number) => {
+    const dx = px - c.current.x;
+    const dy = py - c.current.y;
+    const d = Math.hypot(dx, dy) || 1e-4;
+    const clamped = Math.min(d, c.current.r);
+    const ux = dx / d;
+    const uy = dy / d;
+    setKnob({ x: ux * clamped, y: uy * clamped });
+    // a small dead zone keeps the fighter standing still when the thumb merely rests on the stick
+    const n = clamped / c.current.r;
+    const dead = 0.16;
+    const k = n <= dead ? 0 : (n - dead) / (1 - dead);
+    // screen y grows downward, but "forward" is +z away from the camera → flip it
+    game?.setTouchMove(ux * k, -uy * k);
+  };
+  const end = () => {
+    id.current = -1;
+    setKnob({ x: 0, y: 0 });
+    game?.setTouchMove(0, 0);
+  };
+
+  return (
+    <div
+      className="pointer-events-auto absolute rounded-full border border-white/15 bg-white/[0.045]"
+      style={{ left: '3.5vmin', bottom: '3.5vmin', width: '28vmin', height: '28vmin', touchAction: 'none' }}
+      onPointerDown={(e) => {
+        if (disabled) return;
+        e.preventDefault();
+        e.stopPropagation();
+        (e.currentTarget as HTMLElement).setPointerCapture?.(e.pointerId);
+        const r = e.currentTarget.getBoundingClientRect();
+        c.current = { x: r.left + r.width / 2, y: r.top + r.height / 2, r: r.width * 0.31 };
+        id.current = e.pointerId;
+        apply(e.clientX, e.clientY);
+      }}
+      onPointerMove={(e) => {
+        if (id.current !== e.pointerId) return;
+        e.stopPropagation();
+        apply(e.clientX, e.clientY);
+      }}
+      onPointerUp={(e) => {
+        if (id.current === e.pointerId) end();
+      }}
+      onPointerCancel={() => end()}
+      onMouseDown={(e) => e.stopPropagation()}
+      onMouseMove={(e) => e.stopPropagation()}
+      onContextMenu={(e) => e.preventDefault()}
+    >
+      <div className="absolute inset-0 flex items-center justify-center">
+        <div className="h-px w-[58%] bg-white/10" />
+      </div>
+      <div className="absolute inset-0 flex items-center justify-center">
+        <div className="h-[58%] w-px bg-white/10" />
+      </div>
+      <div
+        className="absolute rounded-full border border-white/45 bg-white/15 shadow-[0_0_16px_rgba(120,180,255,.35)]"
+        style={{
+          width: '11vmin',
+          height: '11vmin',
+          left: `calc(50% + ${knob.x}px)`,
+          top: `calc(50% + ${knob.y}px)`,
+          transform: 'translate(-50%,-50%)',
+        }}
+      />
+      <span className="font-title absolute -top-[3.6vmin] left-1/2 -translate-x-1/2 text-[1.5vmin] tracking-[0.3em] text-white/28 uppercase">
+        gerak
+      </span>
+    </div>
+  );
 }
 
-export function TouchPad({ game, paused, rageOn, dead }: TouchPadProps) {
-  const press = useCallback((a: TouchAction) => () => game?.pressTouch(a), [game]);
-  const release = useCallback((a: TouchAction) => () => game?.releaseTouch(a), [game]);
+export interface TouchPadProps {
+  game: Game | null;
+  paused: boolean;
+  rageOn: boolean;
+  dead: boolean;
+  /** true on touch devices: also lay a gesture field over the canvas (tap = tebas, swipe = aksi) */
+  gestures: boolean;
+  lockOn: boolean;
+  /** more than one live enemy → the target-hop button matters */
+  multiTarget: boolean;
+}
+
+export function TouchPad({ game, paused, rageOn, dead, gestures, lockOn, multiTarget }: TouchPadProps) {
+  const press = (a: TouchAction) => () => game?.pressTouch(a);
+  const release = (a: TouchAction) => () => game?.releaseTouch(a);
   const rageRef = useRef(rageOn);
   rageRef.current = rageOn;
-
   const g = useRef({ id: -1, x0: 0, y0: 0, lx: 0, ly: 0, t0: 0, moved: false });
 
   const onFieldDown = (e: React.PointerEvent) => {
     if (paused || dead) return;
     e.preventDefault();
     e.stopPropagation();
-    e.currentTarget.setPointerCapture?.(e.pointerId);
+    (e.currentTarget as HTMLElement).setPointerCapture?.(e.pointerId);
     g.current = { id: e.pointerId, x0: e.clientX, y0: e.clientY, lx: e.clientX, ly: e.clientY, t0: performance.now(), moved: false };
   };
 
@@ -131,7 +180,7 @@ export function TouchPad({ game, paused, rageOn, dead }: TouchPadProps) {
     g.current.lx = e.clientX;
     g.current.ly = e.clientY;
     if (Math.hypot(e.clientX - g.current.x0, e.clientY - g.current.y0) > 12) g.current.moved = true;
-    // in Rage mode the finger replaces the mouse: it steers the angle of the next slice
+    // in Rage the finger replaces the mouse: it steers the angle of the next slice
     if (rageRef.current && g.current.moved) game?.steerTouch(dx, dy);
   };
 
@@ -142,118 +191,103 @@ export function TouchPad({ game, paused, rageOn, dead }: TouchPadProps) {
     if (paused || dead || !game) return;
     const dx = e.clientX - st.x0;
     const dy = e.clientY - st.y0;
+    const d = Math.hypot(dx, dy);
     const dt = performance.now() - st.t0;
-    // A tap on the field is a slash (like a left click). It resolves on release so that a swipe up
-    // never fires an attack first — an attack buffered into a jump would turn into a dive. The 斬
-    // button is the low-latency path: it fires on press.
-    if (Math.hypot(dx, dy) < 22 && dt < 400) {
+    // A tap is a slash (like a left click) and resolves on release, so a swipe up can never sneak an
+    // attack in first — an attack buffered into a jump turns into a dive. 斬 stays the fast path.
+    if (d < 22 && dt < 400) {
       game.pressTouch('attack');
       return;
     }
-    if (Math.hypot(dx, dy) < 24) return;
-    if (Math.abs(dy) > Math.abs(dx)) {
-      game.pressTouch(dy < 0 ? 'jump' : 'dash');
-    } else {
-      game.changeRunnerLane(dx < 0 ? -1 : 1);
-    }
+    if (d < 26) return;
+    if (Math.abs(dy) > Math.abs(dx)) game.pressTouch(dy < 0 ? 'jump' : 'dash');
+    else game.pressTouch('target');
   };
 
   return (
     <div className="pointer-events-none absolute inset-0 z-20">
-      {/* gesture field: sits over the canvas, under the buttons */}
-      <div
-        className="pointer-events-auto absolute inset-0"
-        style={{ touchAction: 'none' }}
-        onPointerDown={onFieldDown}
-        onPointerMove={onFieldMove}
-        onPointerUp={onFieldUp}
-        onPointerCancel={onFieldUp}
-        onMouseDown={(e) => e.stopPropagation()}
-        onMouseMove={(e) => e.stopPropagation()}
-        onContextMenu={(e) => e.preventDefault()}
-      />
+      {gestures && (
+        <div
+          className="pointer-events-auto absolute inset-0"
+          style={{ touchAction: 'none' }}
+          onPointerDown={onFieldDown}
+          onPointerMove={onFieldMove}
+          onPointerUp={onFieldUp}
+          onPointerCancel={onFieldUp}
+          onMouseDown={(e) => e.stopPropagation()}
+          onMouseMove={(e) => e.stopPropagation()}
+          onContextMenu={(e) => e.preventDefault()}
+        />
+      )}
 
-      {/* ---- right thumb: the three verbs ---- */}
+      <Stick game={game} disabled={paused || dead} />
+
+      {/* ---- right thumb: the verbs, arced around the big attack button ---- */}
       <PadButton
         jp="斬"
         label="Serang"
-        size={23}
+        size={16}
         tone="red"
-        style={{ right: '4cqw', bottom: '5cqw' }}
+        style={{ right: '3.5vmin', bottom: '4vmin' }}
         onPress={press('attack')}
         onRelease={release('attack')}
       />
       <PadButton
+        jp="瞬"
+        label="Dash"
+        size={11}
+        style={{ right: '21vmin', bottom: '4.5vmin' }}
+        onPress={press('dash')}
+      />
+      <PadButton
         jp="跳"
         label="Lompat"
-        size={17}
-        tone="steel"
-        style={{ right: '7cqw', bottom: '31cqw' }}
+        size={11}
+        style={{ right: '5vmin', bottom: '21.5vmin' }}
         onPress={press('jump')}
       />
       <PadButton
-        jp="瞬"
-        label="Dash"
-        size={16}
-        tone="steel"
-        style={{ right: '28cqw', bottom: '7cqw' }}
-        onPress={press('dash')}
-      />
-
-      {/* ---- left thumb: lanes + the Sekiro extras ---- */}
-      <PadButton
-        jp="◀"
-        label="Jalur"
-        size={13}
-        tone="steel"
-        hint="jauh"
-        style={{ left: '4cqw', bottom: '5cqw' }}
-        onPress={() => game?.changeRunnerLane(-1)}
-      />
-      <PadButton
-        jp="▶"
-        label="Jalur"
-        size={13}
-        tone="steel"
-        hint="dekat"
-        style={{ left: '19cqw', bottom: '5cqw' }}
-        onPress={() => game?.changeRunnerLane(1)}
-      />
-      <PadButton
-        jp="弾"
-        label="Guard"
-        size={14}
-        tone="amber"
-        style={{ left: '4cqw', bottom: '22cqw' }}
+        jp={rageOn ? '決' : '弾'}
+        label={rageOn ? 'Tebas akhir' : 'Guard'}
+        size={10.5}
+        tone={rageOn ? 'gold' : 'steel'}
+        style={{ right: '20vmin', bottom: '18vmin' }}
         onPress={press('guard')}
         onRelease={release('guard')}
       />
       <PadButton
+        jp="蹴"
+        label="Tendang"
+        size={9}
+        style={{ right: '33.5vmin', bottom: '6vmin' }}
+        onPress={press('kick')}
+      />
+      <PadButton
         jp="怒"
         label="Rage"
-        size={13}
-        tone="red"
-        style={{ left: '21cqw', bottom: '24cqw' }}
+        size={9}
+        tone={rageOn ? 'red' : 'gold'}
+        style={{ right: '33vmin', bottom: '18.5vmin' }}
         onPress={press('rage')}
       />
       <PadButton
         jp="薬"
         label="Heal"
-        size={13}
+        size={9}
         tone="green"
-        style={{ left: '37cqw', bottom: '24cqw' }}
+        style={{ right: '12vmin', bottom: '34vmin' }}
         onPress={press('heal')}
       />
       <PadButton
-        jp="蹴"
-        label="Tendang"
-        size={12}
-        tone="amber"
-        style={{ left: '38cqw', bottom: '7cqw' }}
-        onPress={press('kick')}
+        jp="◎"
+        label="Target"
+        size={9}
+        style={{ right: '23vmin', bottom: '32vmin' }}
+        onPress={press('target')}
+        dim={!multiTarget && lockOn}
       />
 
-      {/* ---- pause: top-right corner, the usual mobile spot and clear of both thumbs ---- */}
+      {/* ---- pause: bottom centre, out of both thumbs' way ---- */}
       <button
         type="button"
         aria-label="Jeda"
@@ -264,13 +298,14 @@ export function TouchPad({ game, paused, rageOn, dead }: TouchPadProps) {
         }}
         onMouseDown={(e) => e.stopPropagation()}
         onContextMenu={(e) => e.preventDefault()}
-        className="pointer-events-auto absolute flex items-center justify-center rounded-full border border-white/25 bg-black/55 backdrop-blur-[2px] active:bg-white/25"
-        style={{ top: '2cqw', right: '3cqw', width: '9cqw', height: '9cqw', touchAction: 'none' }}
+        className="font-title pointer-events-auto absolute flex items-center gap-[1vmin] rounded-full border border-white/25 bg-black/55 px-[2.6vmin] py-[1.1vmin] tracking-[0.26em] text-white/70 uppercase backdrop-blur-[2px] active:bg-white/20"
+        style={{ left: '50%', bottom: '2vmin', transform: 'translateX(-50%)', fontSize: '1.7vmin', touchAction: 'none' }}
       >
-        <span className="flex gap-[0.9cqw]">
-          <span className="inline-block h-[3.4cqw] w-[1cqw] bg-white/85" />
-          <span className="inline-block h-[3.4cqw] w-[1cqw] bg-white/85" />
+        <span className="flex gap-[0.5vmin]">
+          <span className="inline-block h-[2.2vmin] w-[0.6vmin] bg-white/85" />
+          <span className="inline-block h-[2.2vmin] w-[0.6vmin] bg-white/85" />
         </span>
+        jeda
       </button>
     </div>
   );

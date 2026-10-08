@@ -10,8 +10,8 @@ import { AnimDef, HitDef, P, PLAYER_COMBO, DEATHBLOW, KICK, enemyAttack, EnemyAt
 import { Loco, LocoOut, newLoco, newOut, stepLoco } from './locomotion';
 import { Sfx } from './audio';
 import { Particles, Sparks, Trail, Shocks } from './fx';
-import { buildWorld, buildWhiteWorld, buildSideWorld, applyEnvironment, applyWhiteEnvironment, Theme, World, ARENA_HALF_EXTENT, RUNNER_LANES, RUNNER_TRACK_HALF } from './world';
-import type { Snapshot, GameEvent, EnemyView, CombatMode, GameMode } from './types';
+import { buildWorld, buildWhiteWorld, applyEnvironment, applyWhiteEnvironment, Theme, World, ARENA_HALF_EXTENT } from './world';
+import type { Snapshot, GameEvent, EnemyView, CombatMode } from './types';
 import {
   applyArcs, buildCut, AIM_POSE, buildDodge, DodgeKind, FLIP_OPEN, LAND_HERO_ANIM, LAND_BACK_ANIM,
   EVADE_SIDE, EVADE_BACK, PARRY_POSE, IMPALE, IMPALED_POSE, TUMBLE_POSE,
@@ -26,34 +26,18 @@ import { IDLE_BOW, IDLE_GUN, rangedAttack, RangedAttackName } from './ranged';
 type EKind = 'blade' | 'archer' | 'gunner' | 'boss';
 import { RageShader } from './ragepass';
 
-interface RunnerHazard {
-  root: THREE.Group;
-  /** depth-lane centre of the obstacle (x = jarak dari kamera, bukan tinggi lantai) */
-  x: number;
-  z: number;
-  hit: boolean;
-  clearance: number;
-  halfWidth: number;
-}
-
-/**
- * NINJA RUN is a one-level track: everybody stays on the same flat rooftop (y = 0), the run never
- * climbs or drops to another floor. The only vertical movement is the player's own jump / air-dash.
- * The three lanes are DEPTH lanes (x = toward / away from the side camera), which is what A·D and a
- * left/right swipe move between — they read as three stripes going into the screen, not as floors.
- * The lane offsets themselves live in world.ts so the track art and the collision stay in sync.
- */
-export type RunnerLane = -1 | 0 | 1;
-
 /** Actions the on-screen mobile controls can fire. Mirrors the keyboard / mouse bindings. */
 export type TouchAction =
   | 'attack'
   | 'jump'
   | 'dash'
   | 'guard'
+  | 'finisher'
   | 'kick'
   | 'heal'
   | 'rage'
+  | 'target'
+  | 'lock'
   | 'pause';
 
 interface CutPlane {
@@ -341,16 +325,6 @@ export class Game {
   private player!: Player;
   private enemies: Enemy[] = [];
   private enemyId = 1;
-  private runnerDistance = 0;
-  private runnerNextEnemyZ = 14;
-  private runnerNextHazardZ = 8;
-  private runnerSpawnCount = 0;
-  private runnerHazardCount = 0;
-  private runnerHazards: RunnerHazard[] = [];
-  /** Current depth lane (-1 / 0 / +1) and the x it eases toward — the track itself never changes height. */
-  private runnerLane: RunnerLane = 0;
-  private runnerLaneX = 0;
-
   private raf = 0;
   private lastT = 0;
   private time = 0;
@@ -378,6 +352,10 @@ export class Game {
   private mouseGuard = false;
   /** guard held down by the on-screen mobile button */
   private touchGuard = false;
+  /** the on-screen stick + buttons are up → no pointer lock, and the HUD lifts its bars */
+  private touchControls = false;
+  /** on-screen stick vector, -1..1 per axis (0,0 = nobody touching it) */
+  private touchMove = { x: 0, y: 0 };
   private attackBuf = 0;
   private dodgeBuf = 0;
   private jumpBuf = 0;
@@ -518,7 +496,6 @@ export class Game {
     private sizeMode: SizeMode = 'chibi',
     private fxStyle: FxStyle = 'kz',
     private combatMode: CombatMode = 'after',
-    private gameMode: GameMode = 'duel',
   ) {
     const w = container.clientWidth || window.innerWidth;
     const h = container.clientHeight || window.innerHeight;
@@ -531,7 +508,7 @@ export class Game {
     this.renderer.shadowMap.enabled = true;
     this.renderer.shadowMap.type = THREE.PCFSoftShadowMap;
     this.renderer.toneMapping = THREE.ACESFilmicToneMapping;
-    this.renderer.toneMappingExposure = this.gameMode !== 'duel' ? 1.02 : this.theme === 'white' ? 0.84 : 1.05;
+    this.renderer.toneMappingExposure = this.theme === 'white' ? 0.84 : 1.05;
     this.renderer.domElement.style.display = 'block';
     container.appendChild(this.renderer.domElement);
 
@@ -540,19 +517,15 @@ export class Game {
     this.chibi = this.sizeMode === 'chibi';
     this.sizeK = this.chibi ? CHIBI_K : 1;
     this.sprintSpd = 14.0 * (0.3 + 0.7 * (this.sizeK * (this.chibi ? 0.9 : 1)));
-    const white = this.gameMode === 'duel' && this.theme === 'white';
+    const white = this.theme === 'white';
     this.scene.fog = white ? new THREE.FogExp2(0xdfe2e4, 0.0095) : new THREE.FogExp2(0x2a1038, 0.015);
-    this.fov = this.gameMode === 'duel' ? 58 : 39;
+    this.fov = 58;
     this.camera = new THREE.PerspectiveCamera(this.fov, w / h, 0.03, 700);
     this.scene.add(this.camera);
 
-    if (this.gameMode === 'duel') {
-      this.world = white ? buildWhiteWorld(this.scene) : buildWorld(this.scene);
-      if (white) applyWhiteEnvironment(this.renderer, this.scene);
-      else applyEnvironment(this.renderer, this.scene);
-    } else {
-      this.world = buildSideWorld(this.scene, this.gameMode);
-    }
+    this.world = white ? buildWhiteWorld(this.scene) : buildWorld(this.scene);
+    if (white) applyWhiteEnvironment(this.renderer, this.scene);
+    else applyEnvironment(this.renderer, this.scene);
 
     this.blood = new Particles(this.scene, 700, false, 9, 0.6);
     this.dust = new Particles(this.scene, 300, false, -0.2, 2.2, 1.2);
@@ -591,39 +564,48 @@ export class Game {
     this.sfx.init();
     this.requestLock();
     this.initRage();
-    if (this.gameMode === 'runner') {
-      this.stage = 0;
-      this.stageCleared = false;
-      this.ended = false;
-      this.runnerNextEnemyZ = 14;
-      this.runnerNextHazardZ = 8;
-      // start in the middle lane of the one flat level
-      this.runnerLane = 0;
-      this.runnerLaneX = RUNNER_LANES[1];
-      this.player.pos.x = this.runnerLaneX;
-      this.onEvent({ type: 'stage', text: 'NINJA RUNNER · endless' });
-    } else {
-      this.nextStage();
-    }
-    // Keep the duel's opening crane shot; side modes begin directly in their fixed side-view camera.
-    if (this.gameMode === 'duel') {
-      const openingBoss = this.enemies.find((e) => this.isHeavyBoss(e)) ?? null;
-      const bossIntro = openingBoss !== null;
-      this.startCine('intro', this.player.pos.clone().setY(1.3), bossIntro ? 4.2 : 3.8);
-      if (bossIntro) {
-        this.cine.r0 = 24;
-        this.cine.r1 = 18;
-        this.cine.h0 = 12;
-        this.cine.h1 = 7;
-        this.cine.fov = 58;
-      }
+    this.nextStage();
+    // the duel opens on a crane shot that settles into the fight
+    const openingBoss = this.enemies.find((e) => this.isHeavyBoss(e)) ?? null;
+    const bossIntro = openingBoss !== null;
+    this.startCine('intro', this.player.pos.clone().setY(1.3), bossIntro ? 4.2 : 3.8);
+    if (bossIntro) {
+      this.cine.r0 = 24;
+      this.cine.r1 = 18;
+      this.cine.h0 = 12;
+      this.cine.h1 = 7;
+      this.cine.fov = 58;
     }
     this.lastT = performance.now();
     this.raf = requestAnimationFrame(this.frame);
   }
 
+  /**
+   * The on-screen pad replaces the mouse. With it up we never take the pointer lock: a locked pointer
+   * would swallow every click aimed at a button, and the camera already rides the auto-lock. Turning
+   * it back off hands the mouse its camera again.
+   */
+  setTouchControls(on: boolean) {
+    if (this.touchControls === on) return;
+    this.touchControls = on;
+    if (on) {
+      this.touchGuard = false;
+      this.touchMove.x = 0;
+      this.touchMove.y = 0;
+      if (document.pointerLockElement) {
+        this.lockWasOn = false; // leaving the lock on purpose must never auto-pause the duel
+        document.exitPointerLock();
+      }
+    } else if (!this.paused && !this.disposed) {
+      this.requestLock();
+    }
+  }
+
   requestLock() {
-    if (this.gameMode !== 'duel') return;
+    // Pointer lock is how a mouse aims the duel camera; on a touch screen (or with the pad up) it
+    // does nothing useful, and the auto-lock camera plays the fight fine without it.
+    if (this.touchControls) return;
+    if (window.matchMedia?.('(pointer: coarse)').matches) return;
     try {
       const el = this.renderer.domElement;
       const r = el.requestPointerLock?.() as unknown as Promise<void> | undefined;
@@ -662,16 +644,6 @@ export class Game {
     if (document.pointerLockElement) document.exitPointerLock();
     this.sliceWorld?.dispose();
     this.ghosts?.dispose();
-    this.runnerHazards.forEach(({ root }) => {
-      this.scene.remove(root);
-      root.traverse((o) => {
-        if (!(o instanceof THREE.Mesh)) return;
-        o.geometry.dispose();
-        const mats = Array.isArray(o.material) ? o.material : [o.material];
-        mats.forEach((m) => m.dispose());
-      });
-    });
-    this.runnerHazards = [];
     this.renderer.dispose();
     this.composer.dispose();
     this.sfx.ctx?.close().catch(() => {});
@@ -732,15 +704,10 @@ export class Game {
       this.styleBuf = 0.3;
       this.styleForce = -1;
     }
-    // NINJA RUN: A / D step between the three depth lanes of the flat track (a swipe does the same).
-    if (this.gameMode === 'runner') {
-      if (c === 'KeyA') this.changeRunnerLane(-1);
-      if (c === 'KeyD') this.changeRunnerLane(1);
-    }
     if (c === 'KeyQ') this.toggleLock();
     if (c === 'Tab' || c === 'KeyX') this.switchTarget();
     if (c === 'KeyR') this.revive();
-    if (c === 'KeyP' || (c === 'Escape' && this.gameMode !== 'duel')) {
+    if (c === 'KeyP' || (c === 'Escape' && !document.pointerLockElement)) {
       this.paused = true;
       this.onEvent({ type: 'pause', n: 1 });
     }
@@ -777,12 +744,6 @@ export class Game {
   private onMouseMove = (e: MouseEvent) => {
     if (this.paused) return;
     const pointerLocked = document.pointerLockElement === this.renderer.domElement;
-    // Side modes keep a fixed side camera; ordinary mouse movement is only used to aim Rage slashes.
-    if (this.gameMode !== 'duel') {
-      if (this.rage.aiming) this.aimMouse(e.movementX, e.movementY);
-      else if (this.rage.on) this.steerSlash(e.movementX, e.movementY);
-      return;
-    }
     if (!pointerLocked) return;
     if (this.rage.aiming) {
       this.aimMouse(e.movementX, e.movementY);
@@ -814,6 +775,8 @@ export class Game {
   private lockWasOn = false;
   private onBlur = () => {
     this.keys.clear();
+    this.touchMove.x = 0;
+    this.touchMove.y = 0;
     this.mouseGuard = false;
     this.touchGuard = false;
   };
@@ -845,9 +808,10 @@ export class Game {
 
   /* =================== mobile / touch controls =================== */
   /**
-   * The on-screen pad fires exactly the same intents as the keyboard and the mouse, so NINJA RUN is
-   * fully playable with two thumbs: tap = tebas, swipe up = lompat, swipe left/right = pindah jalur,
-   * swipe down = dash. Guard is a hold-button and keeps its own state in `touchGuard`.
+   * The on-screen pad fires exactly the same intents as the keyboard and the mouse, so the duel is
+   * playable with two thumbs: the left stick walks the arena, the right cluster attacks, jumps,
+   * dashes, guards, kicks, heals, opens Rage and hops between targets. Guard is a hold-button with
+   * its own state in `touchGuard`. The camera auto-locks onto the target, so no thumb has to aim it.
    */
   pressTouch(action: TouchAction) {
     if (this.disposed) return;
@@ -872,11 +836,15 @@ export class Game {
         this.dodgeBuf = 0.2;
         break;
       case 'guard':
+        // identical to the right mouse button: a guard, except in Rage where it is the final slash
         if (this.rage.on) this.pressFinisher();
         else {
           this.touchGuard = true;
           this.guardBuf = 0.2;
         }
+        break;
+      case 'finisher':
+        this.pressFinisher();
         break;
       case 'kick':
         this.kickBuf = 0.2;
@@ -887,33 +855,35 @@ export class Game {
       case 'rage':
         this.toggleRage();
         break;
+      case 'target':
+        this.switchTarget();
+        break;
+      case 'lock':
+        this.toggleLock();
+        break;
     }
   }
 
   releaseTouch(action: TouchAction) {
     if (action === 'guard') this.touchGuard = false;
+    if (action === 'attack') this.releaseAttack();
+    if (action === 'finisher') this.releaseFinisher();
+  }
+
+  /**
+   * The virtual stick. x = strafe, y = forward, both -1..1 (the pad dead-zones and normalises it).
+   * moveInput() sums it with WASD, so a keyboard and a thumb coexist without fighting.
+   */
+  setTouchMove(x: number, y: number) {
+    this.touchMove.x = clamp(x, -1, 1);
+    this.touchMove.y = clamp(y, -1, 1);
   }
 
   /** A drag over the play field steers the Rage cut angle, exactly like moving the mouse does. */
   steerTouch(dx: number, dy: number) {
-    if (this.paused || this.disposed || this.gameMode === 'duel') return;
+    if (this.paused || this.disposed) return;
     if (this.rage.aiming) this.aimMouse(dx, dy);
     else if (this.rage.on) this.steerSlash(dx, dy);
-  }
-
-  /** Step one depth lane left (-1) or right (+1). The track stays on the same level — nothing to climb. */
-  changeRunnerLane(dir: -1 | 1) {
-    if (this.gameMode !== 'runner' || this.paused || this.player.state === 'dead') return;
-    const next = clamp(this.runnerLane + dir, -1, 1) as RunnerLane;
-    if (next === this.runnerLane) return;
-    const from = this.runnerLaneX;
-    this.runnerLane = next;
-    this.runnerLaneX = RUNNER_LANES[next + 1];
-    // a small shove along the real depth axis, so the body leans into the lane change and the gait
-    // settles again a moment later
-    this.player.vel.x += Math.sign(this.runnerLaneX - from) * 3.2;
-    this.dustBurst(this.tmpV2.set(this.player.pos.x, 0.06, this.player.pos.z), 2, 2);
-    this.sfx.step(4);
   }
 
   private toggleLock() {
@@ -1150,46 +1120,6 @@ export class Game {
   }
 
   private nextStage() {
-    if (this.gameMode === 'runner') return;
-    if (this.gameMode === 'apartment') {
-      if (this.stage >= 0) {
-        this.ended = true;
-        this.sfx.victory();
-        this.pendingT = 0.9;
-        this.pendingIdx = STYLE_JODAN;
-        this.onEvent({ type: 'victory' });
-        return;
-      }
-      this.stage = 0;
-      this.stageCleared = false;
-      this.ended = false;
-      const encounter: { kind: EKind; z: number; captain?: boolean }[] = [
-        { kind: 'blade', z: 7.5 },
-        { kind: 'blade', z: 16 },
-        { kind: 'archer', z: 25 },
-        { kind: 'gunner', z: 34 },
-        { kind: 'blade', z: 43, captain: true },
-      ];
-      for (const { kind, z, captain } of encounter) {
-        const e = this.makeEnemy(kind, 0);
-        e.pos.set(0, 0, z);
-        e.yaw = Math.PI;
-        e.rig.root.position.copy(e.pos);
-        if (captain) {
-          e.name = 'Kapten Lantai Empat';
-          e.hpMax *= 1.35;
-          e.hp = e.hpMax;
-          e.postureMax *= 1.2;
-        }
-        this.enemies.push(e);
-      }
-      this.sfx.stage();
-      this.onEvent({ type: 'stage', text: 'APARTMENT · LANTAI 04' });
-      this.lockTarget = this.nearestEnemy();
-      this.lockOn = true;
-      return;
-    }
-
     this.stage++;
     if (this.stage >= STAGES.length) {
       this.ended = true;
@@ -1212,187 +1142,6 @@ export class Game {
     this.onEvent({ type: 'stage', text: st.name });
     this.lockTarget = this.nearestEnemy();
     this.lockOn = true;
-  }
-
-  private spawnRunnerEnemy(z: number) {
-    const sequence: EKind[] = ['blade', 'blade', 'gunner', 'blade', 'archer'];
-    const kind = sequence[this.runnerSpawnCount % sequence.length];
-    // Everybody stands on the same flat level (y = 0); only the depth lane rotates.
-    const lane = RUNNER_LANES[this.runnerSpawnCount % RUNNER_LANES.length];
-    const e = this.makeEnemy(kind, 0);
-    e.pos.set(lane, 0, z);
-    e.yaw = Math.PI;
-    e.rig.root.position.copy(e.pos);
-    e.attackTimer = Math.min(e.attackTimer, 0.8 + (this.runnerSpawnCount % 3) * 0.2);
-    this.enemies.push(e);
-    if (!this.lockTarget || !this.alive(this.lockTarget)) this.lockTarget = e;
-    this.runnerSpawnCount++;
-  }
-
-  /**
-   * Obstacles for the endless run. They all sit on the ONE flat level of the track (base at y = 0) —
-   * nothing is climbable and nothing changes the floor height. Each piece is cleared with a jump, a
-   * dash (i-frames), or by stepping into a free lane:
-   *   · crate  — blocks a single lane
-   *   · gate   — a full-width barrier, so it has to be jumped or dashed through
-   */
-  private spawnRunnerHazard(z: number) {
-    const pattern = this.runnerHazardCount % 4;
-    this.runnerHazardCount++;
-    if (pattern === 1) {
-      this.addRunnerGate(z);
-      return;
-    }
-    const lanes =
-      pattern === 2
-        ? [RUNNER_LANES[0], RUNNER_LANES[2]] // outer lanes blocked → slip to the middle or jump
-        : [RUNNER_LANES[(this.runnerHazardCount * 2) % RUNNER_LANES.length]];
-    for (const x of lanes) this.addRunnerCrate(z, x);
-  }
-
-  /** Flat warning strip painted on the roof: from the side camera it shows which lane is blocked. */
-  private runnerDecal(widthX: number, depthZ: number, opacity = 0.2) {
-    const decal = new THREE.Mesh(
-      new THREE.PlaneGeometry(widthX, depthZ),
-      new THREE.MeshBasicMaterial({ color: 0xd94e44, transparent: true, opacity, depthWrite: false }),
-    );
-    decal.rotation.x = -Math.PI / 2;
-    decal.position.y = 0.02;
-    decal.renderOrder = 1;
-    return decal;
-  }
-
-  private addRunnerCrate(z: number, x: number) {
-    const root = new THREE.Group();
-    const hazardMat = new THREE.MeshStandardMaterial({ color: 0x59616a, emissive: 0x10151a, emissiveIntensity: 0.12, roughness: 0.72 });
-    const trimMat = new THREE.MeshStandardMaterial({ color: 0xe6e8ea, roughness: 0.76 });
-    const crate = new THREE.Mesh(new THREE.BoxGeometry(1.32, 0.82, 0.95), hazardMat);
-    crate.position.y = 0.41;
-    const band = new THREE.Mesh(new THREE.BoxGeometry(1.36, 0.1, 0.99), trimMat);
-    band.position.y = 0.55;
-    root.add(crate, band, this.runnerDecal(1.75, 1.6));
-    root.position.set(x, 0, z);
-    // the painted floor decal must not cast a shadow, only the solid obstacle does
-    root.traverse((o) => {
-      if (o instanceof THREE.Mesh && !(o.material instanceof THREE.MeshBasicMaterial)) {
-        o.castShadow = true;
-        o.receiveShadow = true;
-      }
-    });
-    this.scene.add(root);
-    this.runnerHazards.push({ root, x, z, hit: false, clearance: 0.82, halfWidth: 0.82 });
-  }
-
-  private addRunnerGate(z: number) {
-    const root = new THREE.Group();
-    const hazardMat = new THREE.MeshStandardMaterial({ color: 0xd94e44, emissive: 0x671813, emissiveIntensity: 0.75, roughness: 0.72 });
-    const trimMat = new THREE.MeshStandardMaterial({ color: 0xe6e8ea, roughness: 0.76 });
-    const span = (RUNNER_TRACK_HALF + 0.35) * 2;
-    const crossbar = new THREE.Mesh(new THREE.BoxGeometry(span, 0.22, 0.3), hazardMat);
-    crossbar.position.y = 0.98;
-    root.add(crossbar);
-    const stripe = new THREE.Mesh(new THREE.BoxGeometry(span, 0.07, 0.32), trimMat);
-    stripe.position.y = 0.98;
-    root.add(stripe);
-    for (const x of [-RUNNER_TRACK_HALF - 0.1, RUNNER_TRACK_HALF + 0.1]) {
-      const post = new THREE.Mesh(new THREE.BoxGeometry(0.2, 1.1, 0.28), trimMat);
-      post.position.set(x, 0.55, 0);
-      root.add(post);
-    }
-    root.add(this.runnerDecal((RUNNER_TRACK_HALF + 0.4) * 2, 1.7, 0.26));
-    root.position.set(0, 0, z);
-    // the painted floor decal must not cast a shadow, only the solid obstacle does
-    root.traverse((o) => {
-      if (o instanceof THREE.Mesh && !(o.material instanceof THREE.MeshBasicMaterial)) {
-        o.castShadow = true;
-        o.receiveShadow = true;
-      }
-    });
-    this.scene.add(root);
-    this.runnerHazards.push({ root, x: 0, z, hit: false, clearance: 0.88, halfWidth: RUNNER_TRACK_HALF + 0.4 });
-  }
-
-  /** Nudge a spawn forward until nothing else sits in its reading window, so threats never overlap. */
-  private runnerFreeZ(z: number, gap = 4.4) {
-    let out = z;
-    for (let i = 0; i < 8; i++) {
-      const busy =
-        this.runnerHazards.some((h) => Math.abs(h.z - out) < gap) ||
-        this.enemies.some((e) => this.alive(e) && Math.abs(e.pos.z - out) < gap);
-      if (!busy) break;
-      out += gap;
-    }
-    return out;
-  }
-
-  private updateRunnerMode(dt: number) {
-    const p = this.player;
-    this.runnerDistance = Math.max(this.runnerDistance, p.pos.z);
-    // The track is one flat level: only the depth lane changes, eased smoothly toward the chosen x.
-    p.pos.x += (this.runnerLaneX - p.pos.x) * (1 - Math.exp(-11 * Math.min(0.05, dt)));
-    while (this.runnerNextEnemyZ <= p.pos.z + 25) {
-      const spawnZ = this.runnerFreeZ(Math.max(this.runnerNextEnemyZ, p.pos.z + 10));
-      this.spawnRunnerEnemy(spawnZ);
-      this.runnerNextEnemyZ = spawnZ + Math.max(11, 16 - this.runnerDistance * 0.005);
-    }
-    while (this.runnerNextHazardZ <= p.pos.z + 19) {
-      const spawnZ = this.runnerFreeZ(Math.max(this.runnerNextHazardZ, p.pos.z + 8));
-      this.spawnRunnerHazard(spawnZ);
-      this.runnerNextHazardZ = spawnZ + Math.max(10, 13.5 - this.runnerDistance * 0.004);
-    }
-
-    for (const hazard of this.runnerHazards) {
-      if (
-        !hazard.hit &&
-        Math.abs(p.pos.z - hazard.z) < 0.5 &&
-        Math.abs(p.pos.x - hazard.x) < hazard.halfWidth &&
-        p.pos.y < hazard.clearance &&
-        p.inv <= 0 &&
-        p.state !== 'dodge' &&
-        p.state !== 'cut' &&
-        p.state !== 'dead'
-      ) {
-        hazard.hit = true;
-        p.hp = Math.max(0, p.hp - 18);
-        this.addPlayerPosture(14);
-        p.inv = 0.75;
-        p.flash = 1;
-        p.vel.z = Math.min(p.vel.z, -2.4);
-        p.anim = null;
-        p.trailOn = false;
-        this.sfx.hurt();
-        this.hurtFx = 0.7;
-        this.sparkBurst(p.pos.clone().setY(0.9), new THREE.Vector3(0, 0.35, -1), 20, 4, 0.9, new THREE.Color(2.4, 0.75, 0.45), 0.32);
-        this.shake(0.46);
-        if (p.hp <= 0) this.killPlayer();
-        else {
-          p.state = 'hurt';
-          p.t = 0;
-        }
-      }
-    }
-
-    this.runnerHazards = this.runnerHazards.filter((hazard) => {
-      if (p.pos.z > hazard.z + 5) {
-        this.scene.remove(hazard.root);
-        hazard.root.traverse((o) => {
-          if (!(o instanceof THREE.Mesh)) return;
-          o.geometry.dispose();
-          const mats = Array.isArray(o.material) ? o.material : [o.material];
-          mats.forEach((m) => m.dispose());
-        });
-        return false;
-      }
-      return true;
-    });
-
-    for (const e of this.enemies) {
-      if (e.pos.z < p.pos.z - 8 && this.alive(e)) {
-        e.state = 'dead';
-        e.rig.root.visible = false;
-        e.removeAt = this.time - 3;
-      }
-    }
   }
 
   /* ================= main loop ================= */
@@ -1499,7 +1248,6 @@ export class Game {
     }
 
     this.updatePlayer(pdt);
-    if (this.gameMode === 'runner' && this.player.state !== 'dead') this.updateRunnerMode(pdt);
 
     // afterimages: dodge dash, blade-cut dash and full sprint leave translucent echoes behind
     {
@@ -1536,7 +1284,6 @@ export class Game {
 
     // stage progression
     if (
-      this.gameMode !== 'runner' &&
       !this.ended &&
       !this.stageCleared &&
       this.enemies.length > 0 &&
@@ -1560,15 +1307,7 @@ export class Game {
           this.player.hp = Math.min(this.player.hpMax, this.player.hp + 35);
           this.player.gourds = Math.min(3, this.player.gourds + 1);
         }
-        if (this.gameMode === 'apartment') {
-          this.ended = true;
-          this.sfx.victory();
-          this.pendingT = 0.9;
-          this.pendingIdx = STYLE_JODAN;
-          this.onEvent({ type: 'victory' });
-        } else {
-          this.nextStage();
-        }
+        this.nextStage();
       }
     }
     // cleanup dead
@@ -3036,35 +2775,6 @@ export class Game {
   /* ================= camera ================= */
   private updateCamera(dt: number, real: number) {
     const p = this.player;
-    if (this.gameMode !== 'duel') {
-      // NINJA RUN lives in a 9:16 phone frame, and a portrait viewport gives away a lot of horizontal
-      // view — so the side camera lifts up and widens the lens while still looking straight along +X
-      // (the ninja is seen exactly from the side). Measured on a 390x693 frame: the ninja fills ~14 %
-      // of the height at ~14 % from the left edge, the three depth lanes sit ~100 px apart, the roof
-      // reads as one flat band, and ~4.4 m of track ahead stays visible for jumping / dashing.
-      const portrait = this.gameMode === 'runner' && this.camera.aspect < 1.05;
-      const dist = portrait ? 10.8 : 10.5;
-      const height = portrait ? 4.0 : 2.95;
-      const lookY = portrait ? 0.85 : 1.22;
-      const lead = this.gameMode === 'runner' ? (portrait ? 1.85 : 3.4) : 3.0;
-      const look = this.tmpV.set(0, lookY, p.pos.z + lead);
-      this.camera.position.set(-dist, height, p.pos.z + lead);
-      this.camera.up.set(0, 1, 0);
-      this.camera.lookAt(look);
-      this.camPos.copy(this.camera.position);
-      this.camLook.copy(look);
-      this.camYaw = 0;
-      const sideFov = this.gameMode === 'runner' ? (portrait ? 46 : 39) : 41;
-      if (Math.abs(this.camera.fov - sideFov) > 0.01) {
-        this.camera.fov = sideFov;
-        this.fov = sideFov;
-        this.camera.updateProjectionMatrix();
-        this.updatePointScale();
-      }
-      void dt;
-      void real;
-      return;
-    }
     const tgt = this.lockOn ? this.lockTarget : null;
     const arrow = (this.keys.has('ArrowLeft') ? 1 : 0) - (this.keys.has('ArrowRight') ? 1 : 0);
     if (!tgt) this.camYaw += arrow * 2.2 * real;
@@ -3591,33 +3301,15 @@ export class Game {
   /* ================= player ================= */
   private moveInput(): THREE.Vector3 {
     const k = this.keys;
-    if (this.gameMode === 'apartment') {
-      // The side camera looks from -X toward +X: A/D move left/right on screen,
-      // while W/S step forward into the corridor / back toward the camera.
-      let screen = 0;
-      let depth = 0;
-      if (k.has('KeyD')) screen += 1;
-      if (k.has('KeyA')) screen -= 1;
-      if (k.has('KeyW')) depth += 1;
-      if (k.has('KeyS')) depth -= 1;
-      const v = new THREE.Vector3(depth, 0, screen);
-      if (v.lengthSq() > 1) v.normalize();
-      return v;
-    }
-
     let mx = 0;
     let mz = 0;
-    if (this.gameMode === 'runner') {
-      // The runner always moves straight ahead along the one flat level. Side-to-side is not free
-      // drift any more: A / D and swipes step between the three lanes (see changeRunnerLane), and
-      // updateRunnerMode eases the body onto the chosen lane. W / S only adjust the pace.
-      mz = 1;
-    } else {
-      if (k.has('KeyW')) mz += 1;
-      if (k.has('KeyS')) mz -= 1;
-      if (k.has('KeyD')) mx += 1;
-      if (k.has('KeyA')) mx -= 1;
-    }
+    if (k.has('KeyW')) mz += 1;
+    if (k.has('KeyS')) mz -= 1;
+    if (k.has('KeyD')) mx += 1;
+    if (k.has('KeyA')) mx -= 1;
+    // the on-screen stick pushes the same axes; keyboard and thumb simply add up and re-normalise
+    mx += this.touchMove.x;
+    mz += this.touchMove.y;
     const dir = new THREE.Vector3(Math.sin(this.camYaw), 0, Math.cos(this.camYaw));
     const right = new THREE.Vector3(-Math.cos(this.camYaw), 0, Math.sin(this.camYaw));
     const v = dir.multiplyScalar(mz).add(right.multiplyScalar(mx));
@@ -3633,18 +3325,7 @@ export class Game {
   }
 
   private clampArena(v: THREE.Vector3, margin = 0.8) {
-    if (this.gameMode === 'runner') {
-      // Only the width of the single flat track is bounded; forward distance is unending.
-      v.x = clamp(v.x, -RUNNER_TRACK_HALF, RUNNER_TRACK_HALF);
-      return;
-    }
-    if (this.gameMode === 'apartment') {
-      // Keep the fighter inside the corridor's walkable width and mission footprint.
-      v.x = clamp(v.x, -1.45, 1.45);
-      v.z = clamp(v.z, -1.5, 61);
-      return;
-    }
-    // The duel remains an open, wide rectangular battlefield with no circular arena wall.
+    // The duel is an open, wide rectangular battlefield with no circular arena wall.
     const limit = ARENA_HALF_EXTENT - margin;
     v.x = clamp(v.x, -limit, limit);
     v.z = clamp(v.z, -limit, limit);
@@ -3872,14 +3553,6 @@ export class Game {
         // speed is capped by what the legs can actually turn over — outrun your own stride and the feet skate
         const bodyK = this.sizeK * (this.chibi ? 0.9 : 1);
         let spd = (guarding ? 2.4 : sprint ? 14.0 : 8.4) * (1 + 0.08 * this.flowLevel()) * (0.3 + 0.7 * bodyK);
-        if (this.gameMode === 'runner' && !guarding) {
-          // The endless run sets its own pace (no sprint key): brisk at the start, a little faster with
-          // distance. It is deliberately calmer than the duel because the portrait frame only shows a
-          // short stretch of track ahead — every obstacle must stay readable on a phone.
-          spd = (4.9 + 0.55 * bodyK) * (1 + 0.08 * this.flowLevel()) + Math.min(1.5, this.runnerDistance * 0.005);
-          if (this.keys.has('KeyW')) spd *= 1.15;
-          else if (this.keys.has('KeyS')) spd = Math.max(2.6, spd * 0.6);
-        }
         if (move.lengthSq() > 0.01) desiredSpeed = spd;
         // weighty acceleration: ~0.2 s to full run, firm braking — the lean in the animation comes from this
         const desVel = move.clone().multiplyScalar(spd);
@@ -5946,14 +5619,7 @@ export class Game {
       lock,
       perilous,
       prompt,
-      stageName:
-        this.gameMode === 'runner'
-          ? `RUNNER · ${Math.floor(this.runnerDistance).toString().padStart(3, '0')}m`
-          : this.gameMode === 'apartment'
-            ? 'APARTMENT · LANTAI 04'
-            : this.stage >= 0 && this.stage < STAGES.length
-              ? STAGES[this.stage].name
-              : '',
+      stageName: this.stage >= 0 && this.stage < STAGES.length ? STAGES[this.stage].name : '',
       stage: this.stage,
       stats: { ...this.stats },
       streak: this.streak,
@@ -5962,9 +5628,8 @@ export class Game {
       lockOn: this.lockOn,
       combatMode: this.combatMode,
       rage: this.rageSnapshot(),
-      theme: this.gameMode === 'duel' ? this.theme : 'neon',
+      theme: this.theme,
       cine: this.cineW,
-      lane: this.gameMode === 'runner' ? this.runnerLane : 0,
       style: { rank: this.styleRank(), pct: this.styleScore / 100, score: this.styleScore },
     };
   }

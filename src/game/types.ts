@@ -1,5 +1,4 @@
 export type CombatMode = 'before' | 'after';
-export type GameMode = 'duel' | 'runner' | 'apartment';
 export type CombatTell = 'guard' | 'parry' | 'opening';
 
 export interface EnemyView {
@@ -64,8 +63,6 @@ export interface Snapshot {
   /** 'white' = SUPERHOT void → the HUD must switch to dark ink to stay readable */
   theme: 'white' | 'neon';
   cine: number; // 0..1 cinematic shot weight (drives letterbox bars)
-  /** NINJA RUN: the depth lane the runner is committed to (-1 far · 0 middle · 1 near). 0 elsewhere. */
-  lane: number;
   style: { rank: string; pct: number; score: number };
 }
 
