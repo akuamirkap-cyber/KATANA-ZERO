@@ -239,7 +239,7 @@ const CONTROLS: [string, string][] = [
   ['Klik kiri', 'Tebas — combo 5 serangan'],
   ['Klik kanan tahan', 'Guard depan · ketuk saat benturan = Deflect'],
   ['C', 'Dodge / Mikiri saat tusukan · mundur = backflip'],
-  ['E', 'Lompat · tekan 2× = double jump · serang di udara ditahan sampai mendarat'],
+  ['E', 'Lompat · tekan 2× = double jump · arah lompat ikut stick (bukan lock) · serang di udara ditahan sampai mendarat'],
   ['C di udara', 'Roll depan (air dash) · sesudahnya 斬 = 1 tebasan terbang sekuat tendangan'],
   ['V', 'Tendangan keras — tembus tangkisan'],
   ['Klik tengah', 'Tancap pedang → tendang lepas, musuh terjungkal'],
@@ -267,6 +267,8 @@ const RULES: [string, string][] = [
   ['七', 'Tidak ada lagi mencocor dari udara. Lompat lalu tekan serang tidak mengeluarkan apa-apa — kecuali musuh sudah masuk jangkauan pedang: tebasan ditahan (bilah menyala) dan baru keluar begitu kaki menyentuh tanah.'],
   ['八', 'Satu-satunya serangan udara adalah sesudah roll depan (C di udara): SATU tebasan terbang, sekali saja, sekuat tendangan — damage kecil tetapi postur musuh jebol, lalu kamu jatuh dan mendarat.'],
   ['九', 'Musuh sekarang lebih galak sekaligus lebih rapat bertahan: sampai tiga bilah menekan bersamaan, jeda antar serangan lebih pendek, ayunan mereka lebih cepat, guard dan parry lebih lama serta lebih sering, dan postur mereka pulih lebih cepat. Jebol pertahanan dengan tendang (V), deflect, Mikiri, atau tebasan terbang.'],
+  ['十', 'Lompat ya lompat: di udara tubuh dan kepala menghadap arah gerak (stick), bukan musuh — kamera tetap mengunci target. Double jump mendorong ke arah yang kamu tekan, salto mengikuti arah itu, dan pendaratan menekuk sedalam jatuhmu (jatuh dari atap = kompresi berat, lengan terbuka, debu lebih lama).'],
+  ['十一', 'Sistem gerak diperhalus: ada dorongan awal (badan memanjang, langkah pertama lebih panjang), pengereman (badan menahan ke belakang, tumit menjejak lebih depan), dan potong arah (bahu memuntir melawan belokan lalu melepas, kaki menyilang, badan miring ke dalam belokan). Kepala distabilkan terhadap ayunan langkah dan mengangkat dagu saat sprint.'],
 ];
 
 /** Slow-drifting embers behind the title. */

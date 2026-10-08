@@ -358,6 +358,8 @@ export class Game {
   private touchMove = { x: 0, y: 0 };
   /** a swing pressed in mid-air with an enemy in reach: it is held and comes out the instant feet land */
   private airSlashQueued = false;
+  /** how hard the last landing hit (0.2 = a small hop, 1 = a rooftop drop) — the landing pose is scaled by it */
+  private landPower = 0.6;
   private attackBuf = 0;
   private dodgeBuf = 0;
   private jumpBuf = 0;
@@ -2784,8 +2786,10 @@ export class Game {
     // smaller fighters → pull the camera in so they still fill the frame
     let dist = 6.2 * (0.45 + 0.55 * this.sizeK);
     let pitch = this.camPitch;
-    // sense of speed: the lens widens when sprinting
-    let fovT = 58 + (p.state === 'idle' ? clamp((Math.hypot(p.vel.x, p.vel.z) - 6) * 1.7, 0, 8) : 0);
+    // sense of speed: the lens widens when sprinting — and through the air too, so an air dash (17.5 m/s)
+    // and a long rooftop leap stretch the frame instead of flying past at walking lens
+    const fastStates = p.state === 'idle' || p.state === 'jump' || p.state === 'dive';
+    let fovT = 58 + (fastStates ? clamp((Math.hypot(p.vel.x, p.vel.z) - 6) * 1.7, 0, 8) : 0);
     const pivot = this.tmpV.copy(p.pos).add(new THREE.Vector3(0, 1.55 * this.sizeK, 0));
     if (tgt) {
       const dx = tgt.pos.x - p.pos.x;
@@ -3216,17 +3220,37 @@ export class Game {
     out.headX -= 0.85 * lean;
     out.torsoZ += o.roll * lw * 0.7;
     out.hipZ += o.roll * lw * 0.3;
+    // the head rides out the bounce of the stride and answers speed with the chin — a stabilised head is what
+    // sells the weight of a run, and it sits on top of the lean so it survives every pose
+    out.headX += (o.headStab + o.chinLift) * lw;
+    // push-off stretches the body out; braking folds it back and drops the hips
+    out.hipX += (0.05 * o.burst - 0.07 * o.brake) * lw;
+    out.torsoX += (0.07 * o.burst - 0.1 * o.brake) * lw;
+    out.dy -= 0.03 * o.brake * lw;
     if (w <= 0.001) return;
     const ph = L.phase * TAU;
     out.hipYaw += o.pelvisYaw * w;
     out.torsoY += o.torsoYaw * w;
     out.hipZ += o.hipRoll * w;
     out.torsoZ += o.torsoRoll * w;
+    // a hard cut winds the shoulders up against the turn and lets them unwrap a beat later
+    out.torsoY += o.twist * w;
+    out.hipYaw -= o.twist * 0.4 * w;
     const carryW = f.locoCarryW;
+    // With the sword up in guard (or a bow in hand) the arms are locked to the weapon by IK, so the stride can
+    // only show in the shoulder line and the hips: a low, tight shuffle instead of a free-armed run.
+    const tightW = (1 - carryW) * smooth01((L.sp - 0.9) / 1.4) * w;
+    if (tightW > 0.001) {
+      out.torsoZ += o.arm * 0.035 * tightW; // the shoulder line rocks with the steps
+      out.hipZ += o.hipRoll * 0.7 * tightW;
+      out.dy -= 0.012 * o.bounce * tightW; // stays low: a guard shuffle does not bounce
+      out.headX += 0.02 * o.bounce * tightW; // ...and the head stays on the target
+      out.torsoX += 0.05 * tightW;
+    }
     if (carryW > 0.001) {
       // The free arm trails back; keep the sword hand lower and close to the hip in a ready carry.
       const c = smooth01((L.sp - 0.9) / 1.6) * carryW;
-      const amp = 0.24 + 0.34 * o.run + 0.1 * o.spr;
+      const amp = 0.24 + 0.34 * o.run + 0.1 * o.spr + 0.16 * o.burst; // the arms pump harder when driving off
       out.lsX += (-0.3 - o.arm * amp - out.lsX) * c;
       out.lsZ += (0.12 + 0.08 * o.run - out.lsZ) * c;
       out.leX += (-(0.7 + 0.75 * o.run) - 0.25 * Math.max(0, o.arm) * o.run - out.leX) * c;
@@ -3744,14 +3768,35 @@ export class Game {
         // anime hero landing: crouched, hand to the ground, eyes on the enemy; any input breaks out of it early
         const a = p.anim!;
         sampleFrames(a.frames, p.t, T);
-        rate = 30;
+        // Impact detail. Everything below is scaled by how hard the feet arrived (`landPower`, taken from the
+        // vertical speed at contact), so a small hop stays light while a rooftop drop folds the body deep,
+        // throws the free arm out for balance and holds the compression before it recovers. The feet stay
+        // planted (the landing poses are planted), so lowering the hips bends the knees through the leg IK.
+        const lp = this.landPower;
+        const hold = 1 - smooth01(p.t / (0.16 + 0.34 * lp));
+        const w = lp * hold;
+        T.dy -= 0.12 * w;
+        T.torsoX += 0.14 * w;
+        T.hipX += 0.14 * w;
+        T.headX -= 0.1 * w; // the body folds over the impact; the eyes stay up on the enemy
+        T.lsX += -0.5 * w; // free arm flares out and back to keep the balance
+        T.lsZ += 0.6 * w;
+        T.leX += -0.42 * w;
+        T.rsX += 0.12 * w;
+        T.sp += 0.09 * w; // the blade dips with the compression
+        rate = 26 + 14 * w; // snap into the compression, then settle out of it
         p.look = tgt ? tgt.pos : (this.nearestEnemy()?.pos ?? null);
         if (tgt) p.yaw = turnToward(p.yaw, Math.atan2(tgt.pos.x - p.pos.x, tgt.pos.z - p.pos.z), 9 * dt);
         p.aim = p.yaw;
         if (p.landBack && p.vel.lengthSq() > 4 && Math.random() < 0.7) {
           this.dustBurst(this.tmpV2.set(p.pos.x, 0.06, p.pos.z), 1, 2.4); // the skid throws gravel
         }
-        if ((p.t > 0.22 && move.lengthSq() > 0.05) || p.t >= a.dur) {
+        // a heavy landing keeps throwing dust while the body is still folding
+        if (lp > 0.6 && hold > 0.35 && Math.random() < 0.4) {
+          this.dustBurst(this.tmpV2.set(p.pos.x, p.pos.y + 0.08, p.pos.z), 2, 2 + 2 * lp);
+        }
+        // the recovery waits for the compression: the heavier the impact, the longer the landing owns him
+        if ((p.t > 0.2 + 0.16 * lp && move.lengthSq() > 0.05) || p.t >= a.dur * (0.86 + 0.5 * lp)) {
           p.state = 'idle';
           p.t = 0;
         }
@@ -3759,16 +3804,30 @@ export class Game {
       }
       case 'jump': {
         const sweeping = this.enemies.some((e) => e.state === 'attack' && e.anim?.warn?.kind === 'sweep');
+        // ---- the jump belongs to the stick, never to the lock ----
+        // Airborne, the fighter stops staring at the target (the camera keeps its own lock, so nothing is lost
+        // on screen) and turns toward where he is actually travelling. Head, body, somersault and kimono all
+        // commit to the movement direction, which is what makes a double jump read as a jump.
+        p.look = null;
+        const airSpd = Math.hypot(p.vel.x, p.vel.z);
+        if (airSpd > 0.9) p.yaw = turnToward(p.yaw, Math.atan2(p.vel.x, p.vel.z), 7 * dt);
+        p.aim = p.yaw;
         // ---- double jump: a second somersault, with a burst of air ----
         if (this.jumpBuf > 0 && p.jumps < 2) {
           this.jumpBuf = 0;
           p.jumps = 2;
           p.flipStyle = '';
           p.vy = 7.8;
-          const front = move.lengthSq() < 0.05 || move.dot(fwd(p.yaw)) > -0.2;
+          // the second press answers the stick, not the target: face the way you are pushing, flip that way
+          const pushing = move.lengthSq() > 0.05;
+          if (pushing) {
+            p.yaw = Math.atan2(move.x, move.z);
+            p.aim = p.yaw;
+          }
+          const front = !pushing || move.dot(fwd(p.yaw)) > -0.2;
           p.flipV = (front ? 1 : -1) * 10.5;
           p.flipEnd = p.flip + (front ? 1 : -1) * TAU;
-          if (move.lengthSq() > 0.05) p.vel.copy(move).multiplyScalar(6.4);
+          if (pushing) p.vel.copy(move).multiplyScalar(6.4);
           p.jumpStart = -9;
           p.airDashT = 0;
           this.sfx.whoosh();
@@ -3839,17 +3898,51 @@ export class Game {
           break;
         }
         // in the air: a somersault opens up (blade out, arms wide), tucks in the middle, then opens again for the landing
+        // A plain jump is no longer a single frozen pose either. It is three beats, all read straight off the
+        // vertical speed, so the very same code covers the first jump, the double jump and a long rooftop fall:
+        //   1. takeoff extension — the body opens, the free arm punches up, the trailing leg kicks back
+        //   2. apex hang         — everything floats open for a moment at the top of the arc
+        //   3. descent           — the legs swing down and under the hips to go and meet the ground
+        const vyN = clamp(p.vy / 8.4, -1, 1);
+        const rise = clamp(vyN, 0, 1);
+        const fall = clamp(-vyN, 0, 1);
+        const apex = 1 - Math.min(1, Math.abs(vyN) / 0.3);
+        const ext = 1 - smooth01(p.t / 0.24); // the takeoff beat, gone after a quarter of a second
+        const stretch = clamp(Math.hypot(p.vel.x, p.vel.z) - 4, 0, 7) / 7; // a fast leap flattens out
         if (Math.abs(p.flipV) > 0.1) {
           const prog = clamp(1 - Math.abs(p.flipEnd - p.flip) / TAU, 0, 1);
           const w = smooth01((prog - 0.12) / 0.18) * (1 - smooth01((prog - 0.68) / 0.22));
           blendInto(T, FLIP_OPEN, P.tuck, w);
+          // the flip still answers the air around it: flat and long when travelling fast, open at the top
+          T.torsoX += 0.1 * stretch;
+          T.dy += 0.03 * apex;
         } else if (p.flipStyle === 'back') {
           copyPose(T, FLIP_OPEN);
+          T.dy += 0.03 * apex;
         } else {
           copyPose(T, P.jump);
-          T.torsoX += clamp(p.vy * 0.03, -0.2, 0.2);
+          const tk = rise * ext; // takeoff beat
+          T.torsoX += 0.2 * tk - 0.13 * fall + 0.16 * stretch;
+          T.headX += -0.12 * tk + 0.17 * fall; // chin up off the ground, eyes on the landing coming down
+          T.hipX += 0.1 * tk + 0.13 * fall + 0.06 * stretch;
+          T.dy += 0.05 * tk + 0.035 * apex - 0.03 * fall;
+          // free arm: punches up on takeoff, flares wide at the apex, drops to brace before touchdown
+          T.lsX += -0.5 * tk + 0.2 * apex - 0.24 * fall;
+          T.lsZ += 0.32 * tk + 0.24 * apex;
+          T.leX += -0.32 * tk + 0.16 * apex - 0.1 * fall;
+          // sword arm trails behind the body, then comes up ready as the ground arrives
+          T.rsX += 0.18 * fall + 0.1 * tk;
+          T.sp += 0.09 * fall;
+          T.sw += -0.06 * tk;
+          // legs: trailing kick, open at the top, then down and under the hips for the landing
+          T.rhX += 0.24 * tk - 0.3 * fall;
+          T.rkX += -0.28 * tk + 0.52 * fall;
+          T.lhX += -0.2 * tk + 0.34 * fall;
+          T.lkX += 0.22 * tk - 0.4 * fall;
+          T.plant = 0;
         }
-        rate = 24;
+        // the pose follower snaps hard on takeoff and relaxes at the top of the arc — that is the hang time
+        rate = 20 + 14 * rise * ext + 6 * fall;
         break;
       }
       case 'impale': {
@@ -4293,6 +4386,12 @@ export class Game {
     p.trailOn = false;
     // moving jump = somersault; standing jump = a graceful leap (a second press in the air double-jumps)
     const moving = move.lengthSq() > 0.05;
+    // a moving takeoff commits to the direction of travel — the lock never steers the body in the air.
+    // A jump pressed while standing still keeps the current facing (and has no somersault at all).
+    if (moving) {
+      p.yaw = Math.atan2(move.x, move.z);
+      p.aim = p.yaw;
+    }
     const front = !moving || move.dot(fwd(p.yaw)) > -0.2;
     p.flip = 0;
     p.flipV = moving ? (front ? 1 : -1) * 9.4 : 0;
@@ -4314,6 +4413,9 @@ export class Game {
     }
     this.sfx.whoosh();
     this.dustBurst(p.pos.clone().setY(0.15), 8, 2.5);
+    // the ground answers the push-off: a thin ring of air at the feet and a breath of camera lift
+    this.shocks.spawn(p.pos.clone().setY(0.1), 0xcfe2ff, 1.5, 0.26);
+    this.kickV.y += 0.022;
   }
 
   /**
@@ -4334,6 +4436,7 @@ export class Game {
     p.airDashT = 0;
     p.flipStyle = '';
     const power = clamp(-impactVy / 12, 0.2, 1);
+    this.landPower = power; // the landing pose reads this: how deep it compresses, how long it holds
     this.dustBurst(p.pos.clone().setY(floorY + 0.1), 8 + Math.round(10 * power), 2.5 + 2 * power);
     this.shake(0.12 + 0.28 * power);
     if (airtime > 0.3 || impactVy < -6) {
@@ -4529,6 +4632,7 @@ export class Game {
     p.t = 0;
     p.anim = LAND_HERO_ANIM;
     p.landBack = false;
+    this.landPower = 1; // slamming down out of a flying slash is the hardest landing there is
     p.flipStyle = '';
     p.vel.multiplyScalar(0.1);
     p.jumps = 0;

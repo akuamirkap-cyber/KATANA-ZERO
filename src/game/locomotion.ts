@@ -3,6 +3,12 @@
  *
  * Design goals: a readable anime-swordsman run with a forward-driven torso, softly flexed knees and comfortable stride reach.
  * Body motion stays phase-locked to the alternating steps; speed comes from cadence, not extreme leg extension.
+ *
+ * On top of the steady-state gait the generator also produces the *transients* — the bits that happen between
+ * two speeds and that the eye actually reads as weight: push-off (burst), braking (brake) and the rate at which
+ * the travel direction swings across the body (cross, i.e. a cut). They feed stride length, cadence, lean,
+ * banking, foot placement and the shoulder twist, so accelerating away, hauling up and circling an opponent all
+ * look like different movements instead of the same loop at different speeds.
  */
 import { LEG_K } from './rig';
 const TAU = Math.PI * 2;
@@ -25,9 +31,15 @@ export interface Loco {
   aF: number; // smoothed local acceleration
   aS: number;
   sp: number; // smoothed speed
+  burst: number; // smoothed push-off transient (driving away from a standstill / into a sprint)
+  brake: number; // smoothed braking transient (hauling back toward a stop)
+  cross: number; // smoothed cut rate: how fast the travel direction swings across the body, rad/s
+  pdx: number; // previous travel direction (kept to measure the cut rate)
+  pdz: number;
 }
 export const newLoco = (): Loco => ({
   phase: 0.6, prevPhase: 0.6, w: 0, lw: 0, active: false, dx: 0, dz: 1, vF: 0, vS: 0, aF: 0, aS: 0, sp: 0,
+  burst: 0, brake: 0, cross: 0, pdx: 0, pdz: 1,
 });
 
 export interface FootT {
@@ -53,6 +65,12 @@ export interface LocoOut {
   spr: number;
   ninja: number;
   duty: number;
+  burst: number; // push-off transient, 0..1
+  brake: number; // braking transient, 0..1
+  cross: number; // cut rate, rad/s (+ = cutting toward the character's left)
+  twist: number; // shoulder wind-up against a hard cut (radians)
+  headStab: number; // head pitch that rides out the vertical bounce of the stride
+  chinLift: number; // head pitch from speed: chin up when sprinting, tucked when braking
 }
 export const newOut = (): LocoOut => ({
   feet: [
@@ -61,6 +79,7 @@ export const newOut = (): LocoOut => ({
   ],
   bob: 0, sway: 0, leanF: 0, roll: 0, pelvisYaw: 0, torsoYaw: 0, hipRoll: 0, torsoRoll: 0,
   arm: 0, armAmp: 0, bounce: 0, run: 0, spr: 0, ninja: 0, duty: 0.6,
+  burst: 0, brake: 0, cross: 0, twist: 0, headStab: 0, chinLift: 0,
 });
 
 /**
@@ -105,14 +124,50 @@ export function stepLoco(
     L.dz /= n;
   }
 
+  /* ----- transients: push-off, braking, and the cut ----- */
+  // A cut is not the same thing as a turn: strafing around an opponent keeps the body facing him while the
+  // travel direction swings underneath, so it is measured from the direction vector rather than from yaw.
+  let cutRate = 0;
+  if (sp > 0.8) {
+    let da = Math.atan2(L.dz, L.dx) - Math.atan2(L.pdz, L.pdx);
+    while (da > Math.PI) da -= TAU;
+    while (da < -Math.PI) da += TAU;
+    cutRate = clamp(da / d, -7, 7);
+  }
+  L.pdx = L.dx;
+  L.pdz = L.dz;
+  L.burst += (sst(1.6, 8.0, L.aF) - L.burst) * (1 - Math.exp(-12 * d));
+  L.brake += (sst(1.6, 9.0, -L.aF) - L.brake) * (1 - Math.exp(-11 * d));
+  L.cross += (cutRate - L.cross) * (1 - Math.exp(-9 * d));
+  if (!want) {
+    // nothing to push off from or cut through while standing: let the transients bleed away
+    L.burst *= Math.exp(-8 * d);
+    L.cross *= Math.exp(-6 * d);
+  }
+  if (L.burst < 0.003) L.burst = 0;
+  if (L.brake < 0.003) L.brake = 0;
+  if (Math.abs(L.cross) < 0.02) L.cross = 0;
+  o.burst = L.burst;
+  o.brake = L.brake;
+  o.cross = L.cross;
+
   /* ----- mild forward lean and turn response ----- */
   const leanF = clamp(
-    0.045 * Math.max(L.vF, 0) + 0.007 * Math.abs(L.vS) + 0.002 * clamp(L.aF, -30, 30),
-    -0.12,
-    0.58,
+    0.045 * Math.max(L.vF, 0) +
+      0.007 * Math.abs(L.vS) +
+      0.002 * clamp(L.aF, -30, 30) +
+      0.05 * L.burst -
+      0.06 * L.brake,
+    -0.14,
+    0.62,
   );
   o.leanF = leanF;
-  o.roll = clamp(-(0.014 * L.vS + 0.003 * L.aS) - clamp(yawRate, -8, 8) * L.sp * 0.012, -0.17, 0.17);
+  // banking: strafing, body yaw rate, and the cut — a hard change of direction lays the torso into it
+  o.roll = clamp(
+    -(0.014 * L.vS + 0.003 * L.aS) - clamp(yawRate, -8, 8) * L.sp * 0.012 - L.cross * L.sp * 0.007,
+    -0.22,
+    0.22,
+  );
 
   /* ----- gait parameters from speed ----- */
   const v = want ? Math.max(L.sp, 1.0) : L.sp;
@@ -124,11 +179,18 @@ export function stepLoco(
   const gaitT = sst(1.5, 6.0, v);
   // Keep each step inside the leg's comfortable range; a slightly quicker cadence is preferable to a locked knee.
   const LEG = 1.05 * bodyK;
-  const A = Math.min(clamp(0.2 + 0.045 * v, 0.18, 0.68) * bodyK, 0.42 * LEG) * (1 - 0.18 * adx) * back;
+  // a push-off lengthens the first strides, a brake shortens them (and the leading foot plants further out
+  // front, below, so the body has something to stop against)
+  const A =
+    Math.min(clamp(0.2 + 0.045 * v, 0.18, 0.68) * bodyK, 0.42 * LEG) *
+    (1 - 0.18 * adx) *
+    back *
+    (1 + 0.16 * L.burst - 0.1 * L.brake);
   const duty = clamp(0.62 - 0.22 * gaitT - 0.2 * spr, 0.24, 0.62);
   const H = (0.06 + 0.18 * run + 0.11 * spr) * (1 + 0.2 * adx) * LEG_K * bodyK;
   const cadenceFloor = 0.7 / Math.max(0.25, bodyK);
-  const freq = want ? clamp((v * duty) / (2 * A), cadenceFloor, 4.8) : 0.9 / Math.max(0.25, bodyK);
+  // breaking away also quickens the cadence for a couple of steps
+  const freq = want ? clamp((v * duty) / (2 * A), cadenceFloor, 4.8) * (1 + 0.12 * L.burst) : 0.9 / Math.max(0.25, bodyK);
   o.run = run;
   o.spr = spr;
   o.ninja = ninja;
@@ -167,9 +229,14 @@ export function stepLoco(
     }
     const sA = s * (s > 0 ? 0.86 : 0.9);
     const lat = (i === 0 ? -1 : 1) * (0.09 + 0.025 * adx) * bodyK;
+    // crossover step: cutting across the body puts the *swinging* foot down toward the new direction,
+    // while the planted foot only shifts a quarter of the way (it is still carrying the weight)
+    const crossStep = (u >= duty ? 1 : 0.25) * clamp(L.cross * 0.018, -0.09, 0.09) * bodyK;
+    // braking brace: only the foot already in front reaches further out
+    const brace = s > 0 ? 0.08 * L.brake * bodyK : 0;
     const f = o.feet[i];
-    f.x = lat + L.dx * sA * A;
-    f.z = zc + L.dz * sA * A;
+    f.x = lat + L.dx * (sA * A + brace) + crossStep;
+    f.z = zc + L.dz * (sA * A + brace);
     f.lift = lift;
     f.pitch = pitch;
   }
@@ -188,6 +255,15 @@ export function stepLoco(
   // Small spring only: no sustained crouch, with compact strides keeping the knee naturally bent.
   o.bob = (-(0.005 + 0.012 * run + 0.01 * spr) + (0.012 + 0.018 * run) * c4 * (1 - 2 * run)) * bodyK;
   o.arm = Math.cos(ph - 0.05); // + = left arm forward
-  o.armAmp = 0.22 + 0.38 * run + 0.12 * spr;
+  o.armAmp = 0.22 + 0.38 * run + 0.12 * spr + 0.16 * L.burst; // the arms pump when breaking away
   o.bounce = 0.7 * Math.abs(Math.sin(ph));
+
+  /* ----- detail layers driven by the transients ----- */
+  // the shoulders wind up against a hard cut and unwrap a beat later: the twist lag that makes a change of
+  // direction readable from behind instead of looking like the whole model was simply rotated
+  o.twist = clamp(-L.cross * (0.32 + 0.11 * L.sp), -0.34, 0.34);
+  // the head rides out the vertical bounce of the stride (stabilisation) and answers speed with the chin:
+  // lifted while sprinting or driving off, tucked toward the chest while braking. headX negative = looking up.
+  o.headStab = clamp(o.bob * 1.05, -0.032, 0.032); // kept small so it tracks the bounce instead of pinning
+  o.chinLift = -(0.02 * spr + 0.03 * L.burst - 0.035 * L.brake);
 }
