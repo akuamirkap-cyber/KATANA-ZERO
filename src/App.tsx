@@ -4,6 +4,8 @@ import type { SizeMode, FxStyle } from './game/Game';
 import type { CombatMode, GameEvent, GameMode, Snapshot } from './game/types';
 import type { Theme } from './game/world';
 import { Hud } from './components/Hud';
+import { MobileHud } from './components/MobileHud';
+import { TouchPad } from './components/TouchPad';
 
 interface Toast {
   id: number;
@@ -39,7 +41,7 @@ const DURATION: Partial<Record<GameEvent['type'], number>> = {
 const SIDE_EVENTS = new Set<GameEvent['type']>(['cut', 'kick', 'reflect', 'mikiri', 'stomp', 'heal', 'deflect']);
 
 /** Small, fast callout at the left edge — the stuff that fires constantly (slices, parries, kicks). */
-function SideItem({ t }: { t: Toast }) {
+function SideItem({ t, portrait = false }: { t: Toast; portrait?: boolean }) {
   const dur = `${(DURATION[t.type] ?? 500) / 1000}s`;
   const map: Partial<Record<GameEvent['type'], { jp: string; sub?: string; col: string; glow: string }>> = {
     cut: { jp: '斬', col: '#fff1ee', glow: 'rgba(255,90,70,.9)' },
@@ -51,7 +53,10 @@ function SideItem({ t }: { t: Toast }) {
   };
   if (t.type === 'heal') {
     return (
-      <div className="anim-side font-title text-lg font-bold text-emerald-300" style={{ ['--dur' as string]: dur }}>
+      <div
+        className={`anim-side font-title font-bold text-emerald-300 ${portrait ? 'text-[3.4cqw]' : 'text-lg'}`}
+        style={{ ['--dur' as string]: dur }}
+      >
         +{t.n} HP
       </div>
     );
@@ -61,113 +66,152 @@ function SideItem({ t }: { t: Toast }) {
   return (
     <div className="anim-side flex items-baseline gap-2" style={{ ['--dur' as string]: dur }}>
       <span
-        className="font-jp text-4xl font-extrabold"
+        className={`font-jp font-extrabold ${portrait ? 'text-[7cqw]' : 'text-4xl'}`}
         style={{ color: d.col, textShadow: `0 0 12px ${d.glow}, 0 2px 6px rgba(0,0,0,.9)` }}
       >
         {d.jp}
       </span>
-      {t.n && t.n > 1 ? <span className="font-title text-xl font-bold text-amber-300">×{t.n}</span> : null}
-      {d.sub ? <span className="font-title text-[10px] tracking-[0.3em] text-white/55 uppercase">{d.sub}</span> : null}
+      {t.n && t.n > 1 ? (
+        <span className={`font-title font-bold text-amber-300 ${portrait ? 'text-[3.8cqw]' : 'text-xl'}`}>×{t.n}</span>
+      ) : null}
+      {d.sub ? (
+        <span className={`font-title tracking-[0.3em] text-white/55 uppercase ${portrait ? 'text-[2.1cqw]' : 'text-[10px]'}`}>
+          {d.sub}
+        </span>
+      ) : null}
     </div>
   );
 }
 
-/** Rare, cinematic beats. Kept compact and high up so the fighters below stay visible. */
-function CenterItem({ t }: { t: Toast }) {
+/**
+ * Rare, cinematic beats. Kept compact and high up so the fighters below stay visible.
+ * `portrait` switches every size to `cqw` so the callouts scale with the 9:16 phone frame
+ * instead of the browser window.
+ */
+function CenterItem({ t, portrait = false }: { t: Toast; portrait?: boolean }) {
   const dur = `${(DURATION[t.type] ?? 1000) / 1000}s`;
   const s = { ['--dur' as string]: dur };
+  /**
+   * Portrait sizes have to be inline styles: a `cqw` class built by interpolation is invisible to
+   * Tailwind's scanner, and `cqw` resolves against the phone-stage container (see .phone-stage).
+   */
+  const big = (cqw: number) => (portrait ? ({ fontSize: `${cqw}cqw` } as React.CSSProperties) : null);
+  const cls = (land: string) => (portrait ? '' : land);
   switch (t.type) {
     case 'deathblow':
       return (
-        <div className="absolute inset-x-0 top-[13%] text-center">
-          <div className="absolute top-1/2 h-16 w-full -translate-y-1/2 overflow-hidden">
+        <div className={`absolute inset-x-0 text-center ${portrait ? 'top-[16%]' : 'top-[13%]'}`}>
+          <div className={`absolute top-1/2 w-full -translate-y-1/2 overflow-hidden ${portrait ? 'h-[9cqw]' : 'h-16'}`}>
             <div
               className="absolute inset-y-0 w-full bg-gradient-to-r from-transparent via-red-600/45 to-transparent"
               style={{ animation: 'slashLine .5s ease-out forwards' }}
             />
           </div>
-          <div className="font-jp kanji-red anim-slam-s text-[clamp(56px,9vw,120px)] leading-none font-extrabold" style={s}>
+          <div
+            className={`font-jp kanji-red anim-slam-s leading-none font-extrabold ${cls('text-[clamp(56px,9vw,120px)]')}`}
+            style={{ ...s, ...big(17) }}
+          >
             忍殺
           </div>
         </div>
       );
     case 'perfect':
       return (
-        <div className="absolute inset-x-0 top-[12%] text-center">
+        <div className={`absolute inset-x-0 text-center ${portrait ? 'top-[15%]' : 'top-[12%]'}`}>
           <div
-            className="font-jp anim-slam-s text-[clamp(60px,10vw,132px)] leading-none font-extrabold text-white drop-shadow-[0_0_26px_rgba(255,60,40,.9)]"
-            style={s}
+            className={`font-jp anim-slam-s leading-none font-extrabold text-white drop-shadow-[0_0_26px_rgba(255,60,40,.9)] ${cls('text-[clamp(60px,10vw,132px)]')}`}
+            style={{ ...s, ...big(19) }}
           >
             斬
           </div>
-          <div className="font-title anim-side text-sm tracking-[0.5em] text-amber-200 uppercase" style={s}>
+          <div className={`font-title anim-side tracking-[0.5em] text-amber-200 uppercase ${portrait ? 'text-[2.6cqw]' : 'text-sm'}`} style={s}>
             Perfect · +HP
           </div>
         </div>
       );
     case 'rage':
       return (
-        <div className="absolute inset-x-0 top-[12%] text-center">
-          <div className="font-jp kanji-red anim-slam-s text-[clamp(52px,8vw,110px)] leading-none font-extrabold" style={s}>
+        <div className={`absolute inset-x-0 text-center ${portrait ? 'top-[15%]' : 'top-[12%]'}`}>
+          <div className={`font-jp kanji-red anim-slam-s leading-none font-extrabold ${cls('text-[clamp(52px,8vw,110px)]')}`} style={{ ...s, ...big(16) }}>
             怒
           </div>
-          <div className="font-title anim-side text-xs tracking-[0.5em] text-red-200 uppercase" style={s}>
+          <div className={`font-title anim-side tracking-[0.5em] text-red-200 uppercase ${portrait ? 'text-[2.4cqw]' : 'text-xs'}`} style={s}>
             Raiden · Rage Mode
           </div>
         </div>
       );
     case 'enemyBreak':
       return (
-        <div className="absolute inset-x-0 top-[17%] text-center">
-          <div className="font-jp anim-slam-s text-3xl font-extrabold tracking-[0.3em] text-white drop-shadow-[0_0_12px_rgba(255,255,255,.8)]" style={s}>
+        <div className={`absolute inset-x-0 text-center ${portrait ? 'top-[19%]' : 'top-[17%]'}`}>
+          <div
+            className={`font-jp anim-slam-s font-extrabold tracking-[0.3em] text-white drop-shadow-[0_0_12px_rgba(255,255,255,.8)] ${cls('text-3xl')}`}
+            style={{ ...s, ...big(6.4) }}
+          >
             体幹崩し
           </div>
-          <div className="font-title text-[10px] tracking-[0.4em] text-white/65 uppercase">Serang untuk Deathblow</div>
+          <div className={`font-title tracking-[0.4em] text-white/65 uppercase ${portrait ? 'text-[2.2cqw]' : 'text-[10px]'}`}>
+            Serang untuk Deathblow
+          </div>
         </div>
       );
     case 'playerBreak':
       return (
-        <div className="absolute inset-x-0 top-[17%] text-center">
-          <div className="font-title anim-slam-s text-xl font-bold tracking-[0.3em] text-red-400 uppercase" style={s}>
+        <div className={`absolute inset-x-0 text-center ${portrait ? 'top-[19%]' : 'top-[17%]'}`}>
+          <div
+            className={`font-title anim-slam-s font-bold tracking-[0.3em] text-red-400 uppercase ${cls('text-xl')}`}
+            style={{ ...s, ...big(4.6) }}
+          >
             Postur hancur!
           </div>
         </div>
       );
     case 'rageLow':
       return (
-        <div className="absolute inset-x-0 bottom-[22%] text-center">
-          <div className="font-title anim-side text-xs tracking-[0.35em] text-red-300 uppercase" style={s}>
+        <div className="absolute inset-x-0 bottom-[26%] text-center">
+          <div className={`font-title anim-side tracking-[0.35em] text-red-300 uppercase ${portrait ? 'text-[2.4cqw]' : 'text-xs'}`} style={s}>
             Rage belum cukup
           </div>
         </div>
       );
     case 'stage':
       return (
-        <div className="absolute inset-x-0 top-[15%] text-center">
-          <div className="font-jp anim-banner text-[10px] tracking-[0.6em] text-white/55">決闘</div>
-          <div className="font-title anim-banner ink-text mt-1 text-2xl font-bold tracking-[0.3em] whitespace-nowrap text-white uppercase">
+        <div className={`absolute inset-x-0 text-center ${portrait ? 'top-[24%]' : 'top-[15%]'}`}>
+          <div className={`font-jp anim-banner tracking-[0.6em] text-white/55 ${portrait ? 'text-[2.4cqw]' : 'text-[10px]'}`}>決闘</div>
+          <div
+            className={`font-title anim-banner ink-text mt-1 font-bold tracking-[0.3em] whitespace-nowrap text-white uppercase ${cls('text-2xl')}`}
+            style={big(4.6) ?? undefined}
+          >
             {t.text}
           </div>
         </div>
       );
     case 'stageClear':
       return (
-        <div className="absolute inset-x-0 top-[14%] text-center">
-          <div className="font-jp kanji-red anim-banner text-5xl font-extrabold">撃破</div>
-          <div className="font-title anim-banner mt-1 text-xs tracking-[0.4em] text-white/75 uppercase">+HP · +Gourd</div>
+        <div className={`absolute inset-x-0 text-center ${portrait ? 'top-[18%]' : 'top-[14%]'}`}>
+          <div className={`font-jp kanji-red anim-banner font-extrabold ${cls('text-5xl')}`} style={big(11) ?? undefined}>
+            撃破
+          </div>
+          <div className={`font-title anim-banner mt-1 tracking-[0.4em] text-white/75 uppercase ${portrait ? 'text-[2.4cqw]' : 'text-xs'}`}>
+            +HP · +Gourd
+          </div>
         </div>
       );
     case 'phase2':
       return (
-        <div className="absolute inset-x-0 top-[14%] text-center">
-          <div className="font-jp kanji-red anim-banner text-4xl font-extrabold">鬼</div>
-          <div className="font-title anim-banner mt-1 text-xs tracking-[0.4em] text-red-200 uppercase">{t.text}</div>
+        <div className={`absolute inset-x-0 text-center ${portrait ? 'top-[18%]' : 'top-[14%]'}`}>
+          <div className={`font-jp kanji-red anim-banner font-extrabold ${cls('text-4xl')}`} style={big(9.5) ?? undefined}>鬼</div>
+          <div className={`font-title anim-banner mt-1 tracking-[0.4em] text-red-200 uppercase ${portrait ? 'text-[2.4cqw]' : 'text-xs'}`}>
+            {t.text}
+          </div>
         </div>
       );
     case 'resurrect':
       return (
-        <div className="absolute inset-x-0 top-[14%] text-center">
-          <div className="font-jp anim-banner text-5xl font-extrabold text-amber-200 drop-shadow-[0_0_20px_rgba(255,210,120,.9)]">
+        <div className={`absolute inset-x-0 text-center ${portrait ? 'top-[18%]' : 'top-[14%]'}`}>
+          <div
+            className={`font-jp anim-banner font-extrabold text-amber-200 drop-shadow-[0_0_20px_rgba(255,220,120,.9)] ${cls('text-5xl')}`}
+            style={big(11) ?? undefined}
+          >
             復活
           </div>
         </div>
@@ -177,19 +221,23 @@ function CenterItem({ t }: { t: Toast }) {
   }
 }
 
-function Callouts({ toasts }: { toasts: Toast[] }) {
+function Callouts({ toasts, portrait = false }: { toasts: Toast[]; portrait?: boolean }) {
   const side = toasts.filter((t) => SIDE_EVENTS.has(t.type));
   const centre = toasts.filter((t) => !SIDE_EVENTS.has(t.type));
   return (
     <div className="pointer-events-none absolute inset-0 z-10">
       {/* action feed: hugs the left edge, well clear of the fighters */}
-      <div className="absolute top-1/2 left-6 flex -translate-y-1/2 flex-col items-start gap-1">
+      <div
+        className={`absolute top-1/2 flex -translate-y-1/2 flex-col items-start ${
+          portrait ? 'left-[3cqw] gap-[0.4cqw]' : 'left-6 gap-1'
+        }`}
+      >
         {side.map((t) => (
-          <SideItem key={t.id} t={t} />
+          <SideItem key={t.id} t={t} portrait={portrait} />
         ))}
       </div>
       {centre.map((t) => (
-        <CenterItem key={t.id} t={t} />
+        <CenterItem key={t.id} t={t} portrait={portrait} />
       ))}
     </div>
   );
@@ -229,16 +277,15 @@ const RULES: [string, string][] = [
 
 const SIDE_MODE_CONTROLS: Record<'runner' | 'apartment', [string, string][]> = {
   runner: [
-    ['W / S', 'Lari otomatis · W mempercepat · S mengerem tanpa berhenti'],
-    ['A / D', 'Pindah jalur kedalaman · A menjauh · D mendekat'],
-    ['Shift', 'Sprint tambahan'],
-    ['Klik kiri / J', 'Tebas · combo 5 serangan · Deathblow saat terbuka'],
-    ['Klik kanan tahan · F / K', 'Guard depan · ketuk saat benturan untuk Deflect'],
-    ['C · E', 'Dodge / Mikiri · lompat (tekan dua kali untuk double jump)'],
-    ['V · Klik tengah', 'Tendang pemecah guard · tancap lalu lepas'],
-    ['Space', 'Raiden / Rage · slow-motion dan tebasan terarah'],
-    ['Q / Tab · H · R', 'Lock-on / ganti target · heal · bangkit'],
-    ['P / Esc', 'Jeda · G freestyle bilah'],
+    ['Layar 9:16', 'NINJA RUN tampil sebagai layar HP portrait — dimainkan dengan dua jempol'],
+    ['Tombol 斬', 'Serang · combo 5 tebasan · Deathblow saat musuh terbuka'],
+    ['Tombol 跳', 'Lompat · tekan lagi di udara = double jump'],
+    ['Tombol 瞬', 'Dash · menerobos rintangan dengan i-frame · Mikiri saat ada tusukan'],
+    ['Tap layar', 'Tebas — sama seperti tombol 斬'],
+    ['Swipe atas / bawah', 'Lompat / dash'],
+    ['Swipe kiri / kanan', 'Pindah jalur · kiri menjauh, kanan mendekat'],
+    ['◀ ▶ · 弾 · 怒 · 薬 · 蹴', 'Pindah jalur · guard/deflect · rage · heal · tendang pemecah guard'],
+    ['Keyboard', 'J / klik = tebas · E = lompat · C = dash · A / D = jalur · W / S = laju · F = guard · Space = rage · H = heal · P = jeda'],
   ],
   apartment: [
     ['A / D', 'Bergerak kiri / kanan sepanjang koridor di layar'],
@@ -255,11 +302,12 @@ const SIDE_MODE_CONTROLS: Record<'runner' | 'apartment', [string, string][]> = {
 
 const SIDE_MODE_RULES: Record<'runner' | 'apartment', [string, string][]> = {
   runner: [
-    ['一', 'Lari tanpa akhir di atap kota 3D; W menambah laju, S mengerem tetapi auto-run tidak berhenti.'],
-    ['二', 'A/D mengubah jalur kedalaman (A menjauh, D mendekat); kecepatan dan kepadatan ancaman naik seiring jarak.'],
-    ['三', 'Lompat atau dodge melewati rintangan; mendarat di beam/crate akan mengurangi HP dan postur.'],
-    ['四', 'Drone bersenjata memakai pola serang dan pertahanan Sekiro yang sama: baca GUARD, PARRY, celah, dan perilaku perilous.'],
-    ['五', 'Lock-on, Deflect, Mikiri, Deathblow, heal, Rage, serta posture management tetap aktif seperti di duel.'],
+    ['一', 'SATU lantai datar: lintasan atap tidak pernah naik atau turun, tidak ada tangga, platform, atau lantai kedua. Ninja hanya meninggalkan tanah karena lompatannya sendiri.'],
+    ['二', 'Cukup tiga aksi — LOMPAT · SERANG · DASH. Peti dilewati dengan lompat atau pindah jalur; dash menerobos dengan i-frame.'],
+    ['三', 'Gerbang merah menutup seluruh jalur sehingga harus dilompati. Menabrak rintangan mengurangi HP dan postur.'],
+    ['四', 'Tiga jalur adalah jalur kedalaman pada lantai yang sama: kiri menjauh dari kamera, kanan mendekat. Indikator jalur ada di kiri atas.'],
+    ['五', 'Lari otomatis; W menambah laju dan S mengerem tanpa berhenti. Laju serta kepadatan ancaman naik perlahan seiring jarak.'],
+    ['六', 'Musuh memakai pola Sekiro yang sama: baca GUARD, PARRY, CELAH, dan kilatan 危 untuk perilous. Deflect, Mikiri, Deathblow, Rage, heal, dan postur tetap aktif seperti di duel.'],
   ],
   apartment: [
     ['一', 'Bersihkan lima hostile di koridor apartemen sebelum elevator terbuka. Captain terakhir lebih tahan pukul; Kurogane tidak muncul di misi ini.'],
@@ -270,7 +318,9 @@ const SIDE_MODE_RULES: Record<'runner' | 'apartment', [string, string][]> = {
 };
 
 const SIDE_MODE_SPECIAL: Record<'runner' | 'apartment', [string, string][]> = {
-  runner: [['Rage', 'Space mengaktifkan slow-motion; tebasan terakhir tetap diarahkan dengan mouse / klik kanan.']],
+  runner: [
+    ['Rage', 'Tombol 怒 (atau Space) mengaktifkan slow-motion; geser jari di layar untuk mengarahkan sudut tebasan, tombol 弾 untuk tebasan terakhir.'],
+  ],
   apartment: [['Rage', 'Space mengaktifkan slow-motion; Rage tetap mode terpisah dan bisa dipakai kapan saja.']],
 };
 
@@ -317,7 +367,7 @@ function KeyRow({ k, v }: { k: string; v: string }) {
   );
 }
 
-function CombatModePicker({ mode, onChange }: { mode: CombatMode; onChange: (mode: CombatMode) => void }) {
+function CombatModePicker({ mode, onChange, compact = false }: { mode: CombatMode; onChange: (mode: CombatMode) => void; compact?: boolean }) {
   const options: [CombatMode, string][] = [
     ['before', 'BEFORE · Klasik'],
     ['after', 'AFTER · Taktis'],
@@ -342,7 +392,7 @@ function CombatModePicker({ mode, onChange }: { mode: CombatMode; onChange: (mod
           </button>
         ))}
       </div>
-      <div className="max-w-[min(92vw,440px)] text-center text-[10px] leading-relaxed text-white/40">
+      <div className={`text-center leading-relaxed text-white/40 ${compact ? 'max-w-[86cqw] text-[2.4cqw]' : 'max-w-[min(92vw,440px)] text-[10px]'}`}>
         {mode === 'before'
           ? 'BEFORE: auto-aim dekat, respons acak, guard dasar.'
           : 'AFTER: aim disengaja, counter per ancaman, celah dan guard terbaca.'}
@@ -379,7 +429,11 @@ function GameModePicker({ mode, onChange }: { mode: GameMode; onChange: (mode: G
         ))}
       </div>
       <div className="font-title text-[9px] tracking-[0.16em] text-white/35">
-        {mode === 'duel' ? 'Kurogane · duel 3D taktis' : mode === 'runner' ? 'Combat Sekiro · runner rooftop endless 3D' : 'Combat Sekiro · misi apartemen side-view 3D'}
+        {mode === 'duel'
+          ? 'Kurogane · duel 3D taktis'
+          : mode === 'runner'
+            ? 'Runner endless 3D · layar HP 9:16 · satu lantai datar'
+            : 'Combat Sekiro · misi apartemen side-view 3D'}
       </div>
     </div>
   );
@@ -417,7 +471,7 @@ function Menu({
   const rules = gameMode === 'duel' ? RULES : SIDE_MODE_RULES[gameMode];
   const specialHelp = gameMode === 'duel' ? RAGE_HELP : SIDE_MODE_SPECIAL[gameMode];
   return (
-    <div className="absolute inset-0 z-30 overflow-hidden bg-[#05040a]">
+    <div className="absolute inset-0 z-30 overflow-y-auto bg-[#05040a] overscroll-contain">
       {/* dusk haze + ink vignette */}
       <div className="absolute inset-0 bg-[radial-gradient(ellipse_at_50%_118%,#86303a_0%,#3a1424_28%,#120a16_58%,#05040a_100%)]" />
       <div className="absolute inset-0 bg-[radial-gradient(ellipse_at_50%_50%,transparent_35%,rgba(0,0,0,.85)_100%)]" />
@@ -426,8 +480,8 @@ function Menu({
       <div className="absolute inset-x-0 top-0 h-[7vh] bg-black" />
       <div className="absolute inset-x-0 bottom-0 h-[7vh] bg-black" />
 
-      {/* title block */}
-      <div className="absolute inset-0 flex flex-col items-center justify-center px-6">
+      {/* title block — grows to the full height so the menu can scroll on a small phone screen */}
+      <div className="relative flex min-h-full flex-col items-center justify-center px-6 py-[9vh]">
         <div className="relative flex flex-col items-center">
           <div
             className="font-jp anim-ink text-[clamp(84px,15vw,172px)] leading-[0.9] font-extrabold tracking-[0.08em] text-[#f3eee8]"
@@ -449,7 +503,11 @@ function Menu({
             className="font-title anim-soft mt-2 text-[10px] tracking-[0.42em] text-white/28 uppercase"
             style={{ animationDelay: '1.05s' }}
           >
-            {gameMode === 'duel' ? 'Duel pedang shinobi' : gameMode === 'runner' ? 'Ninja runner endless · rooftop' : 'Sideview · misi apartemen'}
+            {gameMode === 'duel'
+              ? 'Duel pedang shinobi'
+              : gameMode === 'runner'
+                ? 'Layar HP 9:16 · lari datar · lompat serang dash'
+                : 'Sideview · misi apartemen'}
           </div>
           <GameModePicker mode={gameMode} onChange={setGameMode} />
         </div>
@@ -686,6 +744,8 @@ export default function App() {
   shakeRef.current = shakeLvl;
   const containerRef = useRef<HTMLDivElement>(null);
   const gameRef = useRef<Game | null>(null);
+  /** same instance as gameRef, but as state so the touch pad re-renders once the game exists */
+  const [gameInst, setGameInst] = useState<Game | null>(null);
   const snapRef = useRef<Snapshot | null>(null);
   const idRef = useRef(1);
   const chooseCombatMode = useCallback((mode: CombatMode) => {
@@ -729,6 +789,7 @@ export default function App() {
       return;
     }
     gameRef.current = g;
+    setGameInst(g);
     g.setShakeScale(shakeRef.current);
     g.start();
     const iv = setInterval(() => {
@@ -740,6 +801,7 @@ export default function App() {
       clearInterval(iv);
       g.dispose();
       gameRef.current = null;
+      setGameInst(null);
     };
   }, [started, gameKey, gameMode, onEvent]);
 
@@ -776,27 +838,56 @@ export default function App() {
 
   const dead = !!snap?.dead;
 
-  return (
-    <div className="relative h-full w-full overflow-hidden bg-black">
+  const portraitRun = gameMode === 'runner';
+
+  /**
+   * Every in-game layer. NINJA RUN renders them inside a 9:16 phone frame (the canvas, the HUD, the
+   * touch pad and the overlays all share that box, so projected screen coordinates still line up);
+   * the duel and the apartment mission keep filling the whole window.
+   */
+  const stage = (
+    <>
       {started && <div ref={containerRef} className="absolute inset-0" />}
 
-      {started && snap && <Hud s={snap} />}
+      {/* NINJA RUN gets the portrait HUD; the duel and the apartment keep the widescreen one. */}
+      {started && snap && (portraitRun ? <MobileHud s={snap} /> : <Hud s={snap} />)}
 
       {/* Shared combat callouts for duel and side-view modes. */}
-      {started && <Callouts toasts={toasts} />}
+      {started && <Callouts toasts={toasts} portrait={portraitRun} />}
+
+      {/* thumbs-only controls, inside the 9:16 frame and only while the run is live */}
+      {started && portraitRun && !paused && !victory && !dead && (
+        <TouchPad game={gameInst} paused={paused} rageOn={!!snap?.rage.on} dead={dead} />
+      )}
 
       {/* death */}
       {started && dead && !victory && (
         <div className="absolute inset-0 z-20 flex flex-col items-center justify-center bg-black/55">
           <div
-            className="font-jp kanji-red text-[clamp(140px,30vw,380px)] leading-none font-extrabold"
-            style={{ animation: 'deathIn 1.6s ease-out forwards' }}
+            className={`font-jp kanji-red leading-none font-extrabold ${portraitRun ? '' : 'text-[clamp(140px,30vw,380px)]'}`}
+            style={{ animation: 'deathIn 1.6s ease-out forwards', ...(portraitRun ? { fontSize: '46cqw' } : null) }}
           >
             死
           </div>
-          <div className="font-title mt-4 text-sm tracking-[0.5em] text-white/70 uppercase" style={{ animation: 'fadeIn 2s 1s both' }}>
-            {snap?.canRevive ? 'Tekan R untuk bangkit' : snap && snap.resurrect > 0 ? '…' : 'Tekan R untuk mengulang'}
+          <div
+            className={`font-title mt-4 tracking-[0.5em] text-white/70 uppercase ${portraitRun ? 'text-[3cqw]' : 'text-sm'}`}
+            style={{ animation: 'fadeIn 2s 1s both' }}
+          >
+            {snap?.canRevive ? 'Bangkit — tekan R' : snap && snap.resurrect > 0 ? '…' : 'Ulang — tekan R'}
           </div>
+          {/* a thumb can reach this too: no keyboard on a phone */}
+          {snap?.canRevive && (
+            <button
+              onClick={() => {
+                gameRef.current?.revivePlayer();
+                setToasts([]);
+              }}
+              className="font-title pointer-events-auto mt-6 border border-amber-300/60 bg-amber-900/35 px-8 py-2 text-sm tracking-[0.35em] text-amber-100 uppercase hover:bg-amber-700/50"
+              style={{ animation: 'fadeIn 1.4s 1.1s both' }}
+            >
+              復活 · Bangkit
+            </button>
+          )}
           {snap && snap.resurrect === 0 && (
             <button
               onClick={restart}
@@ -813,7 +904,10 @@ export default function App() {
       {/* victory */}
       {started && victory && (
         <div className="absolute inset-0 z-20 flex flex-col items-center justify-center bg-black/70 px-6 text-center" style={{ animation: 'fadeIn 1.5s both' }}>
-          <div className="font-jp text-[clamp(100px,20vw,240px)] leading-none font-extrabold text-amber-100 drop-shadow-[0_0_40px_rgba(255,200,100,.7)]">
+          <div
+            className={`font-jp leading-none font-extrabold text-amber-100 drop-shadow-[0_0_40px_rgba(255,200,100,.7)] ${portraitRun ? '' : 'text-[clamp(100px,20vw,240px)]'}`}
+            style={portraitRun ? { fontSize: '30cqw' } : undefined}
+          >
             勝利
           </div>
           <div className="font-title mt-3 text-lg tracking-[0.5em] text-white/90 uppercase">
@@ -846,15 +940,15 @@ export default function App() {
       {/* pause */}
       {started && paused && !victory && (
         <div className="absolute inset-0 z-20 flex flex-col items-center justify-center bg-black/78 backdrop-blur-[3px]">
-          <div className="absolute inset-x-0 top-0 h-[7vh] bg-black" />
-          <div className="absolute inset-x-0 bottom-0 h-[7vh] bg-black" />
-          <div className="anim-ink font-jp text-5xl tracking-[0.3em] text-white/85">休</div>
+          <div className={`absolute inset-x-0 top-0 bg-black ${portraitRun ? 'h-[4%]' : 'h-[7vh]'}`} />
+          <div className={`absolute inset-x-0 bottom-0 bg-black ${portraitRun ? 'h-[4%]' : 'h-[7vh]'}`} />
+          <div className={`anim-ink font-jp tracking-[0.3em] text-white/85 ${portraitRun ? 'text-[10cqw]' : 'text-5xl'}`}>休</div>
           <div className="anim-line mt-6 h-px w-56 bg-gradient-to-r from-transparent via-white/25 to-transparent" />
           <div className="font-title anim-soft mt-5 text-[11px] tracking-[0.6em] text-white/45 uppercase">Dijeda</div>
 
           <div className="anim-soft mt-12 flex flex-col items-center" style={{ animationDelay: '.1s' }}>
             <div className="font-title mb-3 text-[9px] tracking-[0.4em] text-white/25 uppercase">Getaran layar</div>
-            <div className="pointer-events-auto flex gap-6">
+            <div className={`pointer-events-auto flex ${portraitRun ? 'gap-3' : 'gap-6'}`}>
               {(
                 [
                   ['Mati', 0],
@@ -889,7 +983,7 @@ export default function App() {
           </div>
 
           <div className="anim-soft pointer-events-auto mt-8" style={{ animationDelay: '.16s' }}>
-            <CombatModePicker mode={combatMode} onChange={chooseCombatMode} />
+            <CombatModePicker mode={combatMode} onChange={chooseCombatMode} compact={portraitRun} />
           </div>
 
           <div className="anim-soft pointer-events-auto mt-8 flex flex-col items-center gap-5" style={{ animationDelay: '.2s' }}>
@@ -909,6 +1003,21 @@ export default function App() {
         </div>
       )}
 
+    </>
+  );
+
+  return (
+    <div className="relative h-full w-full overflow-hidden bg-black">
+      {started &&
+        (portraitRun ? (
+          <div className="phone-shell">
+            <div className="phone-bezel">
+              <div className="phone-stage">{stage}</div>
+            </div>
+          </div>
+        ) : (
+          <div className="absolute inset-0">{stage}</div>
+        ))}
       {!started && (
         <Menu
           error={error}

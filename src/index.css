@@ -346,3 +346,60 @@ body,
 .hud-bar-red {
   background: linear-gradient(180deg, #e0302e 0%, #a1161a 55%, #6d0c10 100%);
 }
+
+/* ================= NINJA RUN · 9:16 mobile screen ================= */
+/* The phone frame doubles as a CSS container, so every `cqw` unit used by the portrait HUD, the
+   callouts and the touch pad scales with the frame instead of the browser window. */
+.phone-shell {
+  position: absolute;
+  inset: 0;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: clamp(6px, 1.4vmin, 22px);
+  overflow: hidden;
+  background:
+    radial-gradient(120% 70% at 50% 0%, rgba(150, 26, 32, 0.22), transparent 62%),
+    radial-gradient(90% 60% at 50% 100%, rgba(48, 48, 84, 0.3), transparent 66%),
+    #06050a;
+}
+.phone-bezel {
+  position: relative;
+  flex: 0 0 auto;
+  height: 100%;
+  padding: clamp(4px, 0.9vmin, 12px);
+  border-radius: clamp(16px, 3.2vmin, 40px);
+  background: linear-gradient(155deg, #2c2c35 0%, #0f0f13 44%, #1e1e26 100%);
+  box-shadow:
+    0 0 0 1px rgba(255, 255, 255, 0.1),
+    0 0 0 2px rgba(0, 0, 0, 0.65),
+    0 24px 70px rgba(0, 0, 0, 0.8),
+    0 0 70px rgba(205, 40, 40, 0.12);
+}
+.phone-stage {
+  position: relative;
+  height: 100%;
+  aspect-ratio: 9 / 16;
+  overflow: hidden;
+  container-type: inline-size;
+  border-radius: clamp(10px, 2.4vmin, 32px);
+  background: #000;
+  box-shadow: inset 0 0 0 1px rgba(255, 255, 255, 0.07);
+  /* the run is played with gestures: never let the browser scroll, zoom or rubber-band the frame */
+  touch-action: none;
+  overscroll-behavior: none;
+  -webkit-user-select: none;
+  user-select: none;
+  -webkit-tap-highlight-color: transparent;
+}
+/* On a screen that is itself narrower than 9:16 (an actual phone) the frame fills the width instead. */
+@media (max-aspect-ratio: 9/16) {
+  .phone-bezel {
+    height: auto;
+    width: 100%;
+  }
+  .phone-stage {
+    height: auto;
+    width: 100%;
+  }
+}

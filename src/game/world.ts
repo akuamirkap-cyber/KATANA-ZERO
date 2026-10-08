@@ -309,6 +309,26 @@ export function buildWhiteWorld(scene: THREE.Scene): World {
   };
 }
 
+/**
+ * NINJA RUN track layout — ONE flat level.
+ *
+ * The whole run happens on a single rooftop plane at y = 0: there are no steps, no second floor and
+ * nothing to climb, so the ninja never travels up or down between levels. The only vertical motion in
+ * the mode is the player's own jump / air-dash, and every obstacle is cleared by jumping, dashing or
+ * switching lane.
+ *
+ * The three lanes below are DEPTH lanes: x runs toward / away from the fixed side camera (which sits
+ * at negative x), so a lane change reads as the ninja slipping between three painted stripes that
+ * recede into the screen — never as a change of floor.
+ *
+ * Order matters: index 0 is the FAR lane (lane -1, "menjauh", +x, appears higher and smaller), index 2
+ * is the NEAR lane (lane +1, "mendekat", -x, appears lower and bigger). That keeps A / swipe-left /
+ * the ◀ button = menjauh, exactly like the on-screen labels say.
+ */
+export const RUNNER_LANES = [1.9, 0, -1.9] as const;
+/** Half-width of the walkable track; the low parapet sits just outside it. */
+export const RUNNER_TRACK_HALF = 2.8;
+
 /** 3D side-view environments for the Sekiro gameplay modes. The runner's scenery is tiled endlessly along +Z. */
 export function buildSideWorld(scene: THREE.Scene, mode: Exclude<GameMode, 'duel'>): World {
   const runner = mode === 'runner';
@@ -329,6 +349,11 @@ export function buildSideWorld(scene: THREE.Scene, mode: Exclude<GameMode, 'duel
   shadowCamera.far = 70;
   moon.shadow.bias = -0.0005;
   scene.add(moon);
+  // The runner never stops, so the sun and its shadow frustum have to travel with the ninja or the
+  // ground shadow (the main depth cue for the three lanes) would disappear after the first 20 m.
+  const moonTarget = new THREE.Object3D();
+  scene.add(moonTarget);
+  moon.target = moonTarget;
   const fill = new THREE.DirectionalLight(runner ? 0xeaf4ff : 0x809bda, runner ? 0.55 : 0.48);
   fill.position.set(10, 7, 12);
   scene.add(fill);
@@ -340,54 +365,103 @@ export function buildSideWorld(scene: THREE.Scene, mode: Exclude<GameMode, 'duel
 
   if (runner) {
     const road = new THREE.MeshStandardMaterial({ color: 0xc4c9cd, roughness: 0.9 });
+    const roofSide = new THREE.MeshStandardMaterial({ color: 0xa8aeb4, roughness: 0.94 });
     const edge = new THREE.MeshStandardMaterial({ color: 0xe5e8ea, roughness: 0.82 });
-    const paint = new THREE.MeshStandardMaterial({ color: 0xaab1b6, roughness: 0.86 });
+    const paint = new THREE.MeshStandardMaterial({ color: 0x9aa2a9, roughness: 0.86 });
+    const rail = new THREE.MeshStandardMaterial({ color: 0xd3d8dc, roughness: 0.88 });
+    const roadWidth = (RUNNER_TRACK_HALF + 0.7) * 2;
+    const slabDepth = 7;
     for (let i = -1; i <= 1; i++) {
       const tile = new THREE.Group();
-      const slab = new THREE.Mesh(new THREE.BoxGeometry(6.2, 0.3, tileLength), road);
-      slab.position.y = -0.15;
+      // ONE flat level for the whole endless run: a single thick rooftop slab whose top surface sits
+      // exactly at y = 0 in every tile. There are no steps, gaps, platforms or second floors anywhere
+      // on the track, so the ninja only ever leaves the ground with its own jump / air-dash. The slab
+      // is deep so the portrait 9:16 frame reads a solid rooftop edge along the bottom of the screen.
+      const slab = new THREE.Mesh(new THREE.BoxGeometry(roadWidth, slabDepth, tileLength), road);
+      slab.position.y = -slabDepth / 2;
       slab.receiveShadow = true;
       tile.add(slab);
-      for (const x of [-2.95, 2.95]) {
-        const curb = new THREE.Mesh(new THREE.BoxGeometry(0.22, 0.48, tileLength), edge);
-        curb.position.set(x, 0.12, 0);
+      // darker side face toward the camera, so the roof reads as a block rather than a floating strip
+      const sideFace = new THREE.Mesh(new THREE.PlaneGeometry(tileLength, slabDepth), roofSide);
+      sideFace.rotation.y = -Math.PI / 2; // normal toward -X, i.e. toward the side camera
+      sideFace.position.set(-roadWidth / 2 - 0.02, -slabDepth / 2, 0);
+      tile.add(sideFace);
+      // A low parapet only on the FAR edge: the near edge stays open so the runner is never occluded.
+      {
+        const x = RUNNER_TRACK_HALF + 0.3;
+        const curb = new THREE.Mesh(new THREE.BoxGeometry(0.26, 0.4, tileLength), rail);
+        curb.position.set(x, 0.05, 0);
         curb.castShadow = true;
+        curb.receiveShadow = true;
         tile.add(curb);
+        const cap = new THREE.Mesh(new THREE.BoxGeometry(0.34, 0.06, tileLength), edge);
+        cap.position.set(x, 0.28, 0);
+        tile.add(cap);
       }
-      for (const x of [-1.05, 1.05]) {
-        const stripe = new THREE.Mesh(new THREE.BoxGeometry(0.045, 0.012, tileLength), paint);
-        stripe.position.set(x, 0.006, 0);
-        tile.add(stripe);
+      // Painted edge line on the open (near) side of the roof.
+      const nearLine = new THREE.Mesh(new THREE.BoxGeometry(0.07, 0.012, tileLength), edge);
+      nearLine.position.set(-RUNNER_TRACK_HALF - 0.16, 0.006, 0);
+      tile.add(nearLine);
+      // Dashed dividers between the three depth lanes (at the midpoints of RUNNER_LANES). The dashes
+      // are the main speed cue on a roof that never changes height, and one InstancedMesh keeps them
+      // to a single draw call.
+      const laneMid = [(RUNNER_LANES[0] + RUNNER_LANES[1]) / 2, (RUNNER_LANES[1] + RUNNER_LANES[2]) / 2];
+      const dashCount = laneMid.length * 20;
+      const dashes = new THREE.InstancedMesh(new THREE.BoxGeometry(0.06, 0.014, 1.9), paint, dashCount);
+      const mat4 = new THREE.Matrix4();
+      let dash = 0;
+      for (const x of laneMid) {
+        for (let k = 0; k < 20; k++) {
+          mat4.setPosition(x, 0.008, -tileLength / 2 + 2 + k * 4);
+          dashes.setMatrixAt(dash++, mat4);
+        }
       }
+      dashes.count = dash;
+      dashes.instanceMatrix.needsUpdate = true;
+      tile.add(dashes);
+      // Railing posts along the far parapet, also instanced — they read the run's pace past the ninja.
+      const posts = new THREE.InstancedMesh(new THREE.BoxGeometry(0.14, 0.78, 0.14), rail, 10);
+      for (let k = 0; k < 10; k++) {
+        mat4.setPosition(RUNNER_TRACK_HALF + 0.3, 0.39, -tileLength / 2 + 4 + k * 8);
+        posts.setMatrixAt(k, mat4);
+      }
+      posts.instanceMatrix.needsUpdate = true;
+      posts.castShadow = true;
+      tile.add(posts);
       tile.position.z = i * tileLength;
       scene.add(tile);
       movingGroups.push(tile);
     }
 
     // Repeating monochrome high-rises provide continuous parallax without ever reaching a level edge.
+    // Only the FAR row can ever be seen: the side camera sits at x ≈ -11, so anything at negative x is
+    // behind it. A portrait 9:16 frustum is narrow in depth, so the row is packed every 8 m (instead of
+    // every 22 m) and layered at three distances — otherwise the skyline keeps blinking out.
     const facade = new THREE.MeshStandardMaterial({ color: 0xe6e9eb, roughness: 0.9 });
     const shadowFacade = new THREE.MeshStandardMaterial({ color: 0xb8bec3, roughness: 0.94 });
     const glass = new THREE.MeshStandardMaterial({ color: 0xaab7c0, roughness: 0.48, metalness: 0.08 });
     for (let tileIndex = -1; tileIndex <= 1; tileIndex++) {
       const tile = new THREE.Group();
-      for (let i = 0; i < 7; i++) {
-        const side = i % 2 === 0 ? -1 : 1;
-        const width = 5 + (i % 3) * 1.4;
-        const depth = 5 + ((i + 1) % 3) * 1.2;
-        const height = 11 + ((i * 7) % 19);
-        const x = side < 0 ? -17 - (i % 3) * 5 : 17 + (i % 2) * 5;
-        const z = -34 + i * 11;
+      for (let i = 0; i < 11; i++) {
+        const width = 5 + (i % 3) * 1.6;
+        const depth = 5 + ((i + 1) % 3) * 1.4;
+        const height = 10 + ((i * 7) % 23);
+        const x = 13 + (i % 3) * 5.5;
+        const z = -tileLength / 2 + i * 8;
+        // backdrop only: the sun comes from the camera side, so these never throw a shadow on the roof
         const block = new THREE.Mesh(new THREE.BoxGeometry(width, height, depth), i % 3 === 0 ? shadowFacade : facade);
         block.position.set(x, height / 2 - 1.8, z);
-        block.castShadow = true;
-        block.receiveShadow = true;
         tile.add(block);
         const roof = new THREE.Mesh(new THREE.BoxGeometry(width + 0.35, 0.22, depth + 0.35), edge);
         roof.position.set(x, height - 1.69, z);
         tile.add(roof);
-        const windowBand = new THREE.Mesh(new THREE.BoxGeometry(width * 0.76, 0.18, 0.04), glass);
-        windowBand.position.set(x, Math.max(2.6, height * 0.55 - 1.8), z + depth / 2 + 0.025);
-        tile.add(windowBand);
+        if (i % 2 === 0) {
+          // the band sits on the -X face: that is the one turned toward the side camera (a band on a
+          // ±Z face would only ever be seen edge-on and reads as nothing)
+          const windowBand = new THREE.Mesh(new THREE.BoxGeometry(0.05, 0.17, depth * 0.72), glass);
+          windowBand.position.set(x - width / 2 - 0.03, Math.max(2.4, height * 0.55 - 1.8), z);
+          tile.add(windowBand);
+        }
       }
       tile.position.z = tileIndex * tileLength;
       scene.add(tile);
@@ -509,6 +583,8 @@ export function buildSideWorld(scene: THREE.Scene, mode: Exclude<GameMode, 'duel
           movingGroups[tileIndex].position.z = center + i * tileLength;
           movingGroups[tileIndex + 3].position.z = center + i * tileLength;
         }
+        moon.position.z = focus.z - 12;
+        moonTarget.position.set(0, 0, focus.z);
       }
       const attr = moteGeometry.attributes.position as THREE.BufferAttribute;
       for (let i = 0; i < moteCount; i++) {

@@ -8,7 +8,7 @@ function postureColor(v: number, broken: boolean) {
 }
 
 /** Posture bar that grows from the center outward — the Sekiro look. Hairline frame, soft glow, tapered ends. */
-function PostureBar({ v, broken, width, h = 8 }: { v: number; broken: boolean; width: number; h?: number }) {
+export function PostureBar({ v, broken, width, h = 8 }: { v: number; broken: boolean; width: number | string; h?: number | string }) {
   const w = Math.max(0, Math.min(1, v)) * 100;
   return (
     <div
@@ -36,7 +36,7 @@ function PostureBar({ v, broken, width, h = 8 }: { v: number; broken: boolean; w
   );
 }
 
-function HealthBar({ v, width, h = 10 }: { v: number; width: number; h?: number }) {
+export function HealthBar({ v, width, h = 10 }: { v: number; width: number | string; h?: number | string }) {
   return (
     <div className="relative" style={{ width, height: h }}>
       <div
@@ -61,7 +61,7 @@ function HealthBar({ v, width, h = 10 }: { v: number; width: number; h?: number 
   );
 }
 
-function Pips({ n, max }: { n: number; max: number }) {
+export function Pips({ n, max }: { n: number; max: number }) {
   return (
     <div className="flex gap-1.5">
       {Array.from({ length: max }).map((_, i) => (
@@ -74,7 +74,7 @@ function Pips({ n, max }: { n: number; max: number }) {
   );
 }
 
-function CombatStateTag({ tell, compact = false }: { tell: EnemyView['combatTell']; compact?: boolean }) {
+export function CombatStateTag({ tell, compact = false }: { tell: EnemyView['combatTell']; compact?: boolean }) {
   if (!tell) return null;
   const label = tell === 'opening' ? 'CELAH · SERANG' : tell === 'parry' ? 'PARRY · V / TUNGGU' : 'GUARD · V / A5';
   const color = tell === 'opening' ? 'border-emerald-300/45 bg-emerald-950/70 text-emerald-100' : tell === 'parry' ? 'border-red-300/45 bg-red-950/75 text-red-100' : 'border-amber-200/40 bg-amber-950/70 text-amber-100';
@@ -218,7 +218,7 @@ function AimOverlay({ a }: { a: NonNullable<RageView['aim']> }) {
   );
 }
 
-function RageUI({ r }: { r: RageView }) {
+export function RageUI({ r }: { r: RageView }) {
   return (
     <>
       <div className="absolute inset-x-0 top-0 bg-black transition-[height] duration-300 ease-out" style={{ height: r.aim ? '9%' : 0 }} />
@@ -266,7 +266,7 @@ function RageUI({ r }: { r: RageView }) {
 }
 
 /** Warns about archers / gunners lining up a shot — on-screen marker, or an edge arrow when they're out of view. */
-function ThreatMarkers({ enemies }: { enemies: EnemyView[] }) {
+export function ThreatMarkers({ enemies }: { enemies: EnemyView[] }) {
   return (
     <>
       {enemies
