@@ -14,7 +14,7 @@ import { buildWorld, buildWhiteWorld, applyEnvironment, applyWhiteEnvironment, T
 import type { Snapshot, GameEvent, EnemyView, CombatMode } from './types';
 import {
   applyArcs, buildCut, AIM_POSE, buildDodge, DodgeKind, FLIP_OPEN, LAND_HERO_ANIM, LAND_BACK_ANIM,
-  EVADE_SIDE, EVADE_BACK, PARRY_POSE, IMPALE, IMPALED_POSE, TUMBLE_POSE,
+  EVADE_SIDE, EVADE_BACK, PARRY_POSE, IMPALE, IMPALED_POSE, TUMBLE_POSE, MANTLE_PULL, MANTLE_OVER,
 } from './anims';
 import { Streaks } from './streaks';
 import { SliceWorld, Piece, setSliceFxStyle } from './slice';
@@ -102,7 +102,7 @@ type EnemyState =
   | 'spawn' | 'idle' | 'attack' | 'evade' | 'parry' | 'flinch' | 'recoil' | 'stagger' | 'kicked'
   | 'impaled' | 'tumble' | 'broken' | 'dying' | 'dead';
 type PlayerState =
-  | 'idle' | 'attack' | 'dodge' | 'jump' | 'hurt' | 'broken' | 'heal' | 'stomp' | 'deathblow' | 'recoil' | 'cutaim' | 'cut' | 'style' | 'dive' | 'land' | 'impale' | 'dead';
+  | 'idle' | 'attack' | 'dodge' | 'jump' | 'hurt' | 'broken' | 'heal' | 'stomp' | 'deathblow' | 'recoil' | 'cutaim' | 'cut' | 'style' | 'dive' | 'land' | 'impale' | 'mantle' | 'dead';
 
 interface Foot {
   wx: number;
@@ -117,9 +117,25 @@ interface Foot {
   lift: number;
   pitch: number;
   init: boolean;
+  /** smoothed ground height under this foot (world metres) */
+  gy: number;
+  /** terrain offset of that ground from the body's own floor, in metres (+ = the foot stands on something higher) */
+  tl: number;
 }
+/**
+ * Foot IK reach, in metres of ground offset from the body's own floor. The leg only has ~0.28 m of slack past
+ * a standing hip height, so these are deliberately near that: a heel sliding off a rooftop lip reaches down
+ * and straightens, a toe catching a low step bends the knee — and anything bigger (a whole storey of air under
+ * one foot) saturates into a straight leg instead of stretching the mesh or dragging the hips with it.
+ */
+const FOOT_REACH_UP = 0.3;
+const FOOT_REACH_DOWN = 0.45;
+/** Walk into a rooftop step this tall or lower and the body climbs it instead of bumping into it. */
+const STEP_UP_MAX = 0.95;
+
 const newFoot = (): Foot => ({
   wx: 0, wz: 0, stepping: false, t: 0, dur: 0.15, fx: 0, fz: 0, tx: 0, tz: 0, lift: 0, pitch: 0, init: false,
+  gy: 0, tl: 0,
 });
 
 interface Common {
@@ -360,6 +376,20 @@ export class Game {
   private airSlashQueued = false;
   /** how hard the last landing hit (0.2 = a small hop, 1 = a rooftop drop) — the landing pose is scaled by it */
   private landPower = 0.6;
+  /** 1 = the camera is holding its lock, 0 = it has let go and swings behind the fighter (double jump) */
+  private lockW = 1;
+  /** rooftop step being walked up right now (index into world.parkourSurfaces), or -1 */
+  private stepSurf = -1;
+  private stepUpT = 0;
+  private stepDur = 0.3;
+  private stepFrom = new THREE.Vector3();
+  private stepTo = new THREE.Vector3();
+  /** air mantle bookkeeping */
+  private mantleCD = 0;
+  private mantleDur = 0.5;
+  private mantleFrom = new THREE.Vector3();
+  private mantleTo = new THREE.Vector3();
+  private mantleYaw = 0;
   private attackBuf = 0;
   private dodgeBuf = 0;
   private jumpBuf = 0;
@@ -2791,21 +2821,33 @@ export class Game {
     const fastStates = p.state === 'idle' || p.state === 'jump' || p.state === 'dive';
     let fovT = 58 + (fastStates ? clamp((Math.hypot(p.vel.x, p.vel.z) - 6) * 1.7, 0, 8) : 0);
     const pivot = this.tmpV.copy(p.pos).add(new THREE.Vector3(0, 1.55 * this.sizeK, 0));
+    // A double jump is the player's own move, not part of the duel, so the camera lets go of the target for
+    // its length and swings behind the direction of travel, then eases back onto the lock once the feet are
+    // down. `lockW` is that blend: 1 reproduces the locked framing exactly, 0 is a free camera behind him.
+    const letGo = p.state === 'jump' && p.jumps >= 2;
+    this.lockW += ((letGo ? 0 : 1) - this.lockW) * (1 - Math.exp(-(letGo ? 7 : 5) * real));
+    if (this.lockW < 0.004) this.lockW = 0;
+    else if (this.lockW > 0.996) this.lockW = 1;
     if (tgt) {
       const dx = tgt.pos.x - p.pos.x;
       const dz = tgt.pos.z - p.pos.z;
       const d = Math.hypot(dx, dz);
       const want = Math.atan2(dx, dz);
-      this.camYaw += angDiff(this.camYaw, want) * (1 - Math.exp(-8 * real));
-      dist = clamp(5.0 + d * 0.38, 5.4, 8.6);
-      pivot.x += dx * 0.28;
-      pivot.z += dz * 0.28;
+      const lw = this.lockW;
+      const aim = want + angDiff(want, p.yaw + Math.PI) * (1 - lw); // released → frame from behind the fighter
+      this.camYaw += angDiff(this.camYaw, aim) * (1 - Math.exp(-(5 + 3 * lw) * real));
+      const lockDist = clamp(5.0 + d * 0.38, 5.4, 8.6);
+      dist += (lockDist - dist) * lw;
+      pivot.x += dx * 0.28 * lw;
+      pivot.z += dz * 0.28 * lw;
       if (this.isHeavyBoss(tgt)) {
-        dist = Math.max(dist, tgt.scale * 3.2);
-        pivot.y = Math.max(pivot.y, tgt.scale * 0.92);
-        fovT = Math.max(fovT, 62);
+        const bossDist = Math.max(tgt.scale * 3.2, 6.0);
+        dist += (Math.max(dist, bossDist) - dist) * lw;
+        const bossY = Math.max(pivot.y, tgt.scale * 0.92);
+        pivot.y += (bossY - pivot.y) * lw;
+        fovT = Math.max(fovT, 58 + 4 * lw);
       }
-    }
+    } else this.lockW = 1;
     if (p.state === 'deathblow') {
       dist = 3.8;
       fovT = 40;
@@ -2951,6 +2993,32 @@ export class Game {
   }
 
   /**
+   * Walking up a rooftop step. Layered over the walk so the climb keeps its footwork: the lead leg drives up,
+   * the torso leans in over the step, the free arm swings for balance, the sword arm trails, the hips dip on
+   * the way and the eyes go up to the lip. The feet are freed from the planted system for the length of it,
+   * otherwise the IK would pin them to the floor he is leaving.
+   */
+  private stepUpPose(T: Pose, f: Common) {
+    const u = clamp(this.stepUpT, 0, 1);
+    const drive = Math.sin(Math.PI * u); // strongest in the middle of the climb
+    const leadR = f.loco.phase < 0.5 ? 1 : 0.3; // whichever foot is forward leads, the other pushes
+    const leadL = 1.3 - leadR;
+    T.plant = 0;
+    T.dy -= 0.05 * drive;
+    T.torsoX += 0.2 * drive;
+    T.hipX += 0.1 * drive;
+    T.headX -= 0.16 * drive;
+    T.rhX += -0.72 * drive * leadR;
+    T.rkX += 1.35 * drive * leadR;
+    T.lhX += -0.72 * drive * leadL;
+    T.lkX += 1.35 * drive * leadL;
+    T.lsX += -0.6 * drive;
+    T.leX += -0.45 * drive;
+    T.rsX += 0.3 * drive;
+    T.sp += 0.06 * drive;
+  }
+
+  /**
    * Procedural footwork. Each foot stays near its natural stance and takes a short, low step as the body moves.
    * Standing still = planted. Turning = small pivot steps. Running = alternating compact steps.
    */
@@ -2994,6 +3062,8 @@ export class Game {
         ft.lift = 0;
         ft.pitch = 0;
         ft.init = true;
+        ft.gy = f.pos.y; // no ankle snap after a teleport / revive / stage change
+        ft.tl = 0;
       } else if (ft.stepping) {
         ft.t += dt;
         const u = Math.min(1, ft.t / ft.dur);
@@ -3021,17 +3091,27 @@ export class Game {
       const lz = (ex * sy + ez * cy) / k;
       const ox = lx - st.x;
       const oz = lz - st.z;
+      // ---- per-foot terrain ----
+      // The pinned foot is sampled against the rooftop under it, so a foot that ends up on a step rests on that
+      // step and a foot that slides off a lip reaches down after the ground instead of floating at hip height.
+      // Player only: the duel's enemies never leave the gravel, so their footwork stays exactly as authored.
+      // Smoothed, which rolls the ankle over an edge rather than snapping it.
+      if (f === this.player) {
+        const gy = this.groundHeightAt(ft.wx, ft.wz, f.pos.y);
+        ft.gy += (gy - ft.gy) * (1 - Math.exp(-16 * Math.max(dt, 0.001)));
+        ft.tl = clamp(ft.gy - f.pos.y, -FOOT_REACH_DOWN, FOOT_REACH_UP);
+      } else ft.tl = 0;
       // when leaving locomotion (attack, hit…) offsets relax away instead of snapping to zero
       const dec = Math.exp(-15 * Math.max(dt, 0.001));
       if (i === 0) {
         g.rx = on ? ox : g.rx * dec;
         g.rz = on ? oz : g.rz * dec;
-        g.rl = on ? ft.lift : g.rl * dec;
+        g.rl = on ? ft.lift + ft.tl : g.rl * dec;
         g.rp = on ? ft.pitch : g.rp * dec;
       } else {
         g.lx = on ? ox : g.lx * dec;
         g.lz = on ? oz : g.lz * dec;
-        g.ll = on ? ft.lift : g.ll * dec;
+        g.ll = on ? ft.lift + ft.tl : g.ll * dec;
         g.lp = on ? ft.pitch : g.lp * dec;
       }
     }
@@ -3071,7 +3151,9 @@ export class Game {
 
     // pelvis shifts over the supporting leg, hips dip slightly on each step
     const tsway = on ? clamp((g.rl - g.ll) * 0.5, -0.04, 0.04) * (0.4 + sf) : 0;
-    const tbob = on ? -Math.max(g.rl, g.ll) * 0.22 : 0;
+    // one foot up on a rooftop step and the hips ride toward it; a foot hanging off a lip and they sink
+    const terrHip = clamp((f.feet[0].tl + f.feet[1].tl) * 0.3, -0.14, 0.16);
+    const tbob = on ? -Math.max(g.rl, g.ll) * 0.22 + terrHip : 0;
     const a = 1 - Math.exp(-18 * Math.max(dt, 0.001));
     g.sway += (tsway - g.sway) * a;
     g.bob += (tbob - g.bob) * a;
@@ -3151,7 +3233,7 @@ export class Game {
       const cp = i === 0 ? g.rp : g.lp;
       const nx = cx + (tgt.x / k - st.x - cx) * w;
       const nz = cz + (tgt.z / k - st.z - cz) * w;
-      const nl = cl + (tgt.lift / k - cl) * w;
+      const nl = cl + ((tgt.lift + ft.tl) / k - cl) * w;
       const np = cp + (tgt.pitch - cp) * w;
       if (i === 0) {
         g.rx = nx; g.rz = nz; g.rl = nl; g.rp = np;
@@ -3169,7 +3251,9 @@ export class Game {
       }
     }
     g.sway += (o.sway / k - g.sway) * w;
-    g.bob += (o.bob / k - g.bob) * w;
+    // the running hips answer the terrain as well, so jogging up onto a step lifts the whole body with it
+    const terrHipL = clamp((f.feet[0].tl + f.feet[1].tl) * 0.3, -0.14, 0.16) / k;
+    g.bob += (o.bob / k + terrHipL - g.bob) * w;
 
     // footfalls: gravel crunch (player only, so the mix stays clean) + dust puffs at speed
     if (want && L.sp > 0.9) {
@@ -3425,6 +3509,12 @@ export class Game {
   }
 
   /** Detect a downward crossing of the ground or one of the raised landing pads. */
+  /** Ground height under a point *for foot IK*: the parkour surface there, clamped to the leg's reach. */
+  private groundHeightAt(x: number, z: number, bodyY: number) {
+    const h = this.parkourFloorAt(x, z);
+    return h > bodyY + FOOT_REACH_UP ? bodyY + FOOT_REACH_UP : h < bodyY - FOOT_REACH_DOWN ? bodyY - FOOT_REACH_DOWN : h;
+  }
+
   private landingHeightAt(previousY: number, currentY: number, x: number, z: number): number | null {
     if (currentY > previousY) return null;
     let landing: number | null = null;
@@ -3463,6 +3553,135 @@ export class Game {
         p.vel.z = 0;
       }
     }
+  }
+
+  /**
+   * Which face of a surface a point is touching, plus that face's *inward* normal — the direction a body has
+   * to be travelling in to be pressing into it, as opposed to sliding past it or leaning away from it.
+   */
+  private pressedFace(px: number, pz: number, s: { x: number; z: number; width: number; depth: number }, radius: number) {
+    const dx = px - s.x;
+    const dz = pz - s.z;
+    const ox = s.width / 2 + radius - Math.abs(dx);
+    const oz = s.depth / 2 + radius - Math.abs(dz);
+    if (ox <= 0 || oz <= 0) return null;
+    const onX = ox < oz;
+    return { onX, dx, dz, nx: onX ? -(Math.sign(dx) || 1) : 0, nz: onX ? 0 : -(Math.sign(dz) || 1) };
+  }
+
+  /** Where a climb ends up standing: past the edge by `inward`, and kept inside the surface on the other axis. */
+  private climbTarget(s: { x: number; z: number; width: number; depth: number }, onX: boolean, dx: number, dz: number, px: number, pz: number, inward: number) {
+    return {
+      x: onX ? s.x + (Math.sign(dx) || 1) * (s.width / 2 - inward) : clamp(px, s.x - s.width / 2 + 0.45, s.x + s.width / 2 - 0.45),
+      z: onX ? clamp(pz, s.z - s.depth / 2 + 0.45, s.z + s.depth / 2 - 0.45) : s.z + (Math.sign(dz) || 1) * (s.depth / 2 - inward),
+    };
+  }
+
+  /**
+   * Walk into a rooftop step and the body climbs it instead of bumping into it — a real step-up: the lead leg
+   * drives, the hips ride up, the feet find the new floor (see the per-foot terrain IK). While the climb runs
+   * it owns the body position, so the side push-out and the floor snap are skipped for its length. Anything
+   * taller than STEP_UP_MAX still bumps, and jumping at that becomes an air mantle instead.
+   */
+  private stepUp(dt: number, move: THREE.Vector3): boolean {
+    const p = this.player;
+    if (this.stepSurf >= 0) {
+      const s = this.world.parkourSurfaces[this.stepSurf];
+      if (!s || p.state !== 'idle') {
+        this.stepSurf = -1; // hit or cancelled mid-climb: hand the body back to the normal systems
+        return false;
+      }
+      this.stepUpT = Math.min(1, this.stepUpT + dt / this.stepDur);
+      // rise up the face, then settle across the lip — never both at once, or the shins go through the step
+      const e = smooth01(this.stepUpT / 0.72);
+      const slide = smooth01((this.stepUpT - 0.72) / 0.28);
+      p.pos.y = this.stepFrom.y + (this.stepTo.y - this.stepFrom.y) * e;
+      p.pos.x = this.stepFrom.x + (this.stepTo.x - this.stepFrom.x) * slide;
+      p.pos.z = this.stepFrom.z + (this.stepTo.z - this.stepFrom.z) * slide;
+      if (this.stepUpT >= 1) {
+        this.stepSurf = -1;
+        p.pos.copy(this.stepTo);
+        this.sfx.step(2.2); // the trailing foot joins it up there
+        this.dustBurst(this.tmpV2.set(p.pos.x, p.pos.y + 0.05, p.pos.z), 4, 1.6);
+      }
+      return true;
+    }
+    const ml = move.length();
+    if (ml < 0.22) return false;
+    let best = -1;
+    let bestH = 99;
+    for (let i = 0; i < this.world.parkourSurfaces.length; i++) {
+      const s = this.world.parkourSurfaces[i];
+      const h = s.top - p.pos.y;
+      if (h <= 0.08 || h > STEP_UP_MAX) continue;
+      const face = this.pressedFace(p.pos.x, p.pos.z, s, 0.36);
+      if (!face) continue;
+      if ((move.x * face.nx + move.z * face.nz) / ml < 0.45) continue; // really walking into it, not grazing
+      if (h < bestH) {
+        bestH = h;
+        best = i;
+      }
+    }
+    if (best < 0) return false;
+    const s = this.world.parkourSurfaces[best];
+    const face = this.pressedFace(p.pos.x, p.pos.z, s, 0.36)!;
+    const to = this.climbTarget(s, face.onX, face.dx, face.dz, p.pos.x, p.pos.z, 0.5);
+    this.stepFrom.copy(p.pos);
+    this.stepTo.set(to.x, s.top, to.z);
+    this.stepSurf = best;
+    this.stepUpT = 0;
+    this.stepDur = 0.19 + 0.16 * bestH; // a knee-high step is quick, a hip-high one takes a beat longer
+    this.sfx.step(1.6);
+    return true;
+  }
+
+  /**
+   * Air mantle: brush a ledge while airborne and still pressing into it, and the hands catch it. Covers
+   * everything above the walk-up height and within arm reach, so a jump aimed at a rooftop becomes a climb
+   * instead of a bump and a fall. Ends standing on the ledge with both jumps refreshed.
+   */
+  private tryMantle(move: THREE.Vector3): boolean {
+    const p = this.player;
+    if (this.mantleCD > 0) return false;
+    const push = move.lengthSq() > 0.05 ? move : p.vel; // the stick, or the momentum when it is neutral
+    const pl = Math.hypot(push.x, push.z);
+    if (pl < 0.2) return false;
+    let best = -1;
+    let bestH = 99;
+    for (let i = 0; i < this.world.parkourSurfaces.length; i++) {
+      const s = this.world.parkourSurfaces[i];
+      const h = s.top - p.pos.y; // how far above the feet the lip is
+      if (h < 0.15 || h > 1.8) continue; // arm reach: from just below the feet to well overhead
+      const face = this.pressedFace(p.pos.x, p.pos.z, s, 0.44);
+      if (!face) continue;
+      if ((push.x * face.nx + push.z * face.nz) / pl < 0.3) continue;
+      if (h < bestH) {
+        bestH = h;
+        best = i;
+      }
+    }
+    if (best < 0) return false;
+    const s = this.world.parkourSurfaces[best];
+    const face = this.pressedFace(p.pos.x, p.pos.z, s, 0.44)!;
+    const to = this.climbTarget(s, face.onX, face.dx, face.dz, p.pos.x, p.pos.z, 0.62);
+    this.mantleFrom.copy(p.pos);
+    this.mantleTo.set(to.x, s.top, to.z);
+    this.mantleYaw = Math.atan2(s.x - p.pos.x, s.z - p.pos.z); // face the wall he is climbing
+    this.mantleDur = 0.4 + 0.14 * bestH;
+    this.mantleCD = 0.5;
+    p.state = 'mantle';
+    p.t = 0;
+    p.anim = null;
+    p.vel.set(0, 0, 0);
+    p.vy = 0;
+    p.flipStyle = '';
+    p.airDashT = 0;
+    p.trailOn = false;
+    this.airSlashQueued = false; // he never reached the ground, so a swing held in the air is dropped
+    this.sfx.flip();
+    this.shocks.spawn(p.pos.clone().setY(p.pos.y + 1.5), 0xdfeaff, 1.6, 0.24);
+    this.shake(0.05);
+    return true;
   }
 
   private updatePlayer(dt: number) {
@@ -3513,7 +3732,14 @@ export class Game {
       (p.state === 'heal' && p.t > 0.2 && !p.healDone);
 
     // ---- global actions ----
-    if (p.state !== 'dead' && p.state !== 'deathblow' && p.state !== 'jump' && p.state !== 'stomp' && p.state !== 'dive') {
+    if (
+      p.state !== 'dead' &&
+      p.state !== 'deathblow' &&
+      p.state !== 'jump' &&
+      p.state !== 'stomp' &&
+      p.state !== 'dive' &&
+      p.state !== 'mantle'
+    ) {
       if (this.dodgeBuf > 0 && dodgeFree()) {
         this.dodgeBuf = 0;
         if (!this.tryMikiri()) this.startDodge(move);
@@ -3613,6 +3839,7 @@ export class Game {
         copyPose(T, guarding ? P.guard : P.idle);
         p.look = tgt ? tgt.pos : (this.nearestEnemy()?.pos ?? null);
         this.walkOverlay(T, p, spd, dt, 7.6, p.vel.x, p.vel.z, !guarding);
+        if (this.stepSurf >= 0) this.stepUpPose(T, p);
         rate = guarding ? 26 : 12;
         break;
       }
@@ -3897,6 +4124,8 @@ export class Game {
           this.landFromAir(p.vy, landingY);
           break;
         }
+        // brushed a ledge and still pressing into it → the hands catch it and the climb takes over
+        if (p.t > 0.05 && this.tryMantle(move)) break;
         // in the air: a somersault opens up (blade out, arms wide), tucks in the middle, then opens again for the landing
         // A plain jump is no longer a single frozen pose either. It is three beats, all read straight off the
         // vertical speed, so the very same code covers the first jump, the double jump and a long rooftop fall:
@@ -3943,6 +4172,52 @@ export class Game {
         }
         // the pose follower snaps hard on takeoff and relaxes at the top of the arc — that is the hang time
         rate = 20 + 14 * rise * ext + 6 * fall;
+        break;
+      }
+      case 'mantle': {
+        // Climbing a ledge the hands caught in mid-air. Two beats: the pull (the body hangs long off the free
+        // arm, legs trailing, chest up) and coming over the lip (the lead knee lands on top, the torso folds
+        // forward, that arm presses down), then he stands out of it. The body is interpolated from where the
+        // hands caught the ledge to a spot past the edge, so a mantle always ends on solid surface.
+        const u = clamp(p.t / this.mantleDur, 0, 1);
+        p.vel.set(0, 0, 0);
+        p.vy = 0;
+        p.look = null;
+        // a somersault that ends on a ledge is unwound by the flip settle in updatePlayer, not snapped flat
+        // The pull is the slow part, and it happens *on the face*: the body rises first and only swings in
+        // once the hips are level with the lip, otherwise the legs would bury themselves in the rooftop.
+        const rise = smooth01(u / 0.7);
+        const slide = smooth01((u - 0.7) / 0.3);
+        p.pos.y = this.mantleFrom.y + (this.mantleTo.y - this.mantleFrom.y) * rise;
+        p.pos.x = this.mantleFrom.x + (this.mantleTo.x - this.mantleFrom.x) * slide;
+        p.pos.z = this.mantleFrom.z + (this.mantleTo.z - this.mantleFrom.z) * slide;
+        p.yaw = turnToward(p.yaw, this.mantleYaw, 9 * dt);
+        p.aim = p.yaw;
+        const over = smooth01((u - 0.3) / 0.42);
+        blendInto(T, MANTLE_PULL, MANTLE_OVER, over);
+        // the hang breathes while the arm takes the weight
+        const hang = 1 - over;
+        T.torsoZ += Math.sin(p.t * 7.5) * 0.035 * hang;
+        T.hipYaw += Math.sin(p.t * 5.1) * 0.05 * hang;
+        T.dy -= 0.06 * hang;
+        T.headX -= 0.05 * hang;
+        // the last third stands up out of the climb
+        const stand = smooth01((u - 0.7) / 0.3);
+        if (stand > 0) blendInto(T, T, P.idle, stand);
+        rate = 26 + 10 * over;
+        if (u >= 1) {
+          p.state = 'idle';
+          p.t = 0;
+          p.pos.copy(this.mantleTo);
+          p.jumps = 0; // both jumps are back: mantle, then double-jump to the next roof
+          p.diveAvail = true;
+          p.dashAvail = true;
+          p.settle = 0.28;
+          this.sfx.step(2.4);
+          this.sfx.land(0.3);
+          this.dustBurst(this.tmpV2.set(p.pos.x, p.pos.y + 0.06, p.pos.z), 6, 2);
+          this.shake(0.07);
+        }
         break;
       }
       case 'impale': {
@@ -4140,21 +4415,28 @@ export class Game {
       p.pos.x += p.vel.x * dt;
       p.pos.z += p.vel.z * dt;
     }
-    this.resolveParkourSideCollision(previousX, previousZ);
-    if (p.state === 'idle') {
-      const floor = this.parkourFloorAt(p.pos.x, p.pos.z);
-      if (p.pos.y > floor + 0.02) {
-        // Walking off a step becomes a real fall, preserving double-jump and air-dash access.
-        p.state = 'jump';
-        p.t = 0;
-        p.anim = null;
-        p.vy = 0;
-        p.jumps = 1;
-        p.diveAvail = true;
-        p.dashAvail = true;
-        p.airDashT = 0;
-        p.jumpStart = -9;
-      } else p.pos.y = floor;
+    this.mantleCD = Math.max(0, this.mantleCD - dt);
+    // a step-up interrupted by a jump, a hit or a mantle is simply dropped — it must never stay booked
+    if (p.state !== 'idle' && this.stepSurf >= 0) this.stepSurf = -1;
+    // A climb owns the body for its length: no side push-out (that is what the climb is defeating) and no
+    // floor snap (the body is deliberately above the ground it left while it rides up the face).
+    if (!(p.state === 'idle' && this.stepUp(dt, move))) {
+      if (p.state !== 'mantle') this.resolveParkourSideCollision(previousX, previousZ);
+      if (p.state === 'idle') {
+        const floor = this.parkourFloorAt(p.pos.x, p.pos.z);
+        if (p.pos.y > floor + 0.02) {
+          // Walking off a step becomes a real fall, preserving double-jump and air-dash access.
+          p.state = 'jump';
+          p.t = 0;
+          p.anim = null;
+          p.vy = 0;
+          p.jumps = 1;
+          p.diveAvail = true;
+          p.dashAvail = true;
+          p.airDashT = 0;
+          p.jumpStart = -9;
+        } else p.pos.y = floor;
+      }
     }
     if (
       p.state !== 'attack' &&
@@ -4174,7 +4456,8 @@ export class Game {
           : p.state === 'dodge' || p.state === 'land'
             ? p.state + (p.anim?.name ?? '')
             : p.state;
-    p.soft = p.state === 'idle' || p.state === 'heal' || p.state === 'stomp' || p.state === 'jump' || p.state === 'style';
+    p.soft =
+      p.state === 'idle' || p.state === 'heal' || p.state === 'stomp' || p.state === 'jump' || p.state === 'style' || p.state === 'mantle';
     this.finishPose(p, rate, dt);
     if (p.state === 'dead') p.rig.root.position.y = 0.12 * clamp(p.t / 0.9, 0, 1);
     void desiredSpeed;

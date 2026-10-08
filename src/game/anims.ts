@@ -664,6 +664,29 @@ export const LAND_BACK_ANIM: AnimDef = {
   hits: [], trail: [], lunge: [], trackUntil: 0, cancelFrom: 99,
 };
 
+/* ---------- air mantle: climbing a ledge the hands caught in mid-air ---------- */
+/**
+ * First beat — the hang: the free arm is up on the lip taking the weight, the chest stays long and slightly
+ * back, the legs trail below and swing in, the eyes are on the ledge. One hand stays on the sword (two = 0)
+ * so the left arm is free to reach, and the feet are un-planted (plant 0) because what is under them is a
+ * wall, not a floor.
+ */
+export const MANTLE_PULL = mk({
+  torsoX: -0.12, torsoY: 0, headX: -0.34, headY: 0, hipX: 0.16, hipYaw: 0,
+  ...S(-0.12, 0.34, 0.3, 1.05, 0.12, 0, 0),
+  lsX: -2.62, lsZ: 0.46, leX: -0.42,
+  rhX: 0.46, rkX: 1.12, lhX: 0.26, lkX: 1.5,
+  dy: -0.3, plant: 0, rl: 0, ll: 0,
+});
+/** Second beat — coming over the lip: the lead knee lands on top, the torso folds forward, the free arm presses down. */
+export const MANTLE_OVER = mk({
+  torsoX: 0.5, torsoY: -0.06, headX: -0.16, headY: 0.04, hipX: 0.04, hipYaw: -0.04,
+  ...S(-0.08, 0.46, 0.38, 0.86, 0.08, 0, 0),
+  lsX: -1.34, lsZ: 0.4, leX: -0.56,
+  rhX: -1.12, rkX: 2.02, lhX: 0.22, lkX: 1.18,
+  dy: -0.12, plant: 0, rl: 0, ll: 0,
+});
+
 /* ---------- enemy attacks ---------- */
 export type EnemyAttackName = 'slash' | 'combo2' | 'combo3' | 'combo4' | 'thrust' | 'sweep';
 

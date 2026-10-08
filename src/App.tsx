@@ -234,13 +234,14 @@ const CONTROLS: [string, string][] = [
   ['Stick kiri', 'Jalan — layar sentuh, sama saja dengan W A S D'],
   ['Tombol kanan', '斬 serang · 瞬 dash · 跳 lompat · 弾 guard · 蹴 tendang · 怒 rage · 薬 heal · ◎ ganti target'],
   ['Tap layar', 'Tebas · swipe atas = lompat · swipe bawah = dash · swipe kiri/kanan = ganti target'],
-  ['W A S D', 'Bergerak · Shift sprint'],
+  ['W A S D', 'Bergerak · Shift sprint · jalan ke undakan rendah = naik otomatis'],
   ['Mouse', 'Kamera'],
   ['Klik kiri', 'Tebas — combo 5 serangan'],
   ['Klik kanan tahan', 'Guard depan · ketuk saat benturan = Deflect'],
   ['C', 'Dodge / Mikiri saat tusukan · mundur = backflip'],
   ['E', 'Lompat · tekan 2× = double jump · arah lompat ikut stick (bukan lock) · serang di udara ditahan sampai mendarat'],
   ['C di udara', 'Roll depan (air dash) · sesudahnya 斬 = 1 tebasan terbang sekuat tendangan'],
+  ['Lompat ke atap', 'Mantle: undakan ≤ 0,95 m dinaiki sambil jalan, yang lebih tinggi ditangkap tangan saat kamu melompat ke arahnya'],
   ['V', 'Tendangan keras — tembus tangkisan'],
   ['Klik tengah', 'Tancap pedang → tendang lepas, musuh terjungkal'],
   ['F / K', 'Tahan = guard · Rage: tebasan terakhir'],
@@ -269,6 +270,8 @@ const RULES: [string, string][] = [
   ['九', 'Musuh sekarang lebih galak sekaligus lebih rapat bertahan: sampai tiga bilah menekan bersamaan, jeda antar serangan lebih pendek, ayunan mereka lebih cepat, guard dan parry lebih lama serta lebih sering, dan postur mereka pulih lebih cepat. Jebol pertahanan dengan tendang (V), deflect, Mikiri, atau tebasan terbang.'],
   ['十', 'Lompat ya lompat: di udara tubuh dan kepala menghadap arah gerak (stick), bukan musuh — kamera tetap mengunci target. Double jump mendorong ke arah yang kamu tekan, salto mengikuti arah itu, dan pendaratan menekuk sedalam jatuhmu (jatuh dari atap = kompresi berat, lengan terbuka, debu lebih lama).'],
   ['十一', 'Sistem gerak diperhalus: ada dorongan awal (badan memanjang, langkah pertama lebih panjang), pengereman (badan menahan ke belakang, tumit menjejak lebih depan), dan potong arah (bahu memuntir melawan belokan lalu melepas, kaki menyilang, badan miring ke dalam belokan). Kepala distabilkan terhadap ayunan langkah dan mengangkat dagu saat sprint.'],
+  ['十二', 'Kamera ikut aturan lompat: saat double jump kamera melepas lock dan berayun ke belakang arah gerak, lalu mengunci lagi begitu kaki menyentuh tanah.'],
+  ['十三', 'Atap Kota Putih benar-benar bisa dipanjat. Undakan setinggi lutut sampai pinggang dinaiki sambil jalan (kaki depan mengangkat, pinggul naik, badan condong ke undakan); yang lebih tinggi ditangkap dengan mantle saat melompat ke arahnya — tarik, lalu lutut depan naik ke bibir atap. Telapak kaki sekarang mengikuti permukaan: tumit yang melewati bibir atap meraih ke bawah dan menegang, bukan mengambang di udara.'],
 ];
 
 /** Slow-drifting embers behind the title. */
