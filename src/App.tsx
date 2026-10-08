@@ -239,8 +239,8 @@ const CONTROLS: [string, string][] = [
   ['Klik kiri', 'Tebas — combo 5 serangan'],
   ['Klik kanan tahan', 'Guard depan · ketuk saat benturan = Deflect'],
   ['C', 'Dodge / Mikiri saat tusukan · mundur = backflip'],
-  ['E', 'Lompat · tekan 2× = double jump'],
-  ['C / Klik di udara', 'Air dash · Flying Swallow'],
+  ['E', 'Lompat · tekan 2× = double jump · serang di udara ditahan sampai mendarat'],
+  ['C di udara', 'Roll depan (air dash) · sesudahnya 斬 = 1 tebasan terbang sekuat tendangan'],
   ['V', 'Tendangan keras — tembus tangkisan'],
   ['Klik tengah', 'Tancap pedang → tendang lepas, musuh terjungkal'],
   ['F / K', 'Tahan = guard · Rage: tebasan terakhir'],
@@ -264,6 +264,9 @@ const RULES: [string, string][] = [
   ['四', 'Tebasan mengikuti arah hadap/lock-on dan hanya efektif dari jarak dekat. Musuh menampilkan GUARD, PARRY, atau CELAH saat mode AFTER aktif.'],
   ['五', 'Pecah GUARD dengan tendang (V) atau tebas berat A5; jangan spam slash ke PARRY—tunggu CELAH atau tendang. Pemanah/penembak menekan dari jauh, jadi terus bergerak mendekat.'],
   ['六', 'Deflect, Mikiri, Deathblow, dan kill mengisi Rage; tenangkan postur dengan guard saat aman. Rage tetap mode slow-motion terpisah.'],
+  ['七', 'Tidak ada lagi mencocor dari udara. Lompat lalu tekan serang tidak mengeluarkan apa-apa — kecuali musuh sudah masuk jangkauan pedang: tebasan ditahan (bilah menyala) dan baru keluar begitu kaki menyentuh tanah.'],
+  ['八', 'Satu-satunya serangan udara adalah sesudah roll depan (C di udara): SATU tebasan terbang, sekali saja, sekuat tendangan — damage kecil tetapi postur musuh jebol, lalu kamu jatuh dan mendarat.'],
+  ['九', 'Musuh sekarang lebih galak sekaligus lebih rapat bertahan: sampai tiga bilah menekan bersamaan, jeda antar serangan lebih pendek, ayunan mereka lebih cepat, guard dan parry lebih lama serta lebih sering, dan postur mereka pulih lebih cepat. Jebol pertahanan dengan tendang (V), deflect, Mikiri, atau tebasan terbang.'],
 ];
 
 /** Slow-drifting embers behind the title. */

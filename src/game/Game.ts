@@ -356,6 +356,8 @@ export class Game {
   private touchControls = false;
   /** on-screen stick vector, -1..1 per axis (0,0 = nobody touching it) */
   private touchMove = { x: 0, y: 0 };
+  /** a swing pressed in mid-air with an enemy in reach: it is held and comes out the instant feet land */
+  private airSlashQueued = false;
   private attackBuf = 0;
   private dodgeBuf = 0;
   private jumpBuf = 0;
@@ -564,6 +566,7 @@ export class Game {
     this.sfx.init();
     this.requestLock();
     this.initRage();
+    this.airSlashQueued = false;
     this.nextStage();
     // the duel opens on a crane shot that settles into the fight
     const openingBoss = this.enemies.find((e) => this.isHeavyBoss(e)) ?? null;
@@ -1017,10 +1020,10 @@ export class Game {
   private makeEnemy(kind: EKind, angle: number): Enemy {
     const boss = kind === 'boss';
     const spec = {
-      blade: { name: 'Prajurit Robot', hp: 130, posture: 110, atk: 0.9, dist: 8.5, trail: 0xff9a60 },
-      archer: { name: 'Pemanah Robot', hp: 80, posture: 70, atk: 1.1, dist: 12.5, trail: 0x9acf60 },
-      gunner: { name: 'Penembak Robot', hp: 95, posture: 80, atk: 1.6, dist: 11.5, trail: 0xffb060 },
-      boss: { name: 'Kurogane, Panglima Baja', hp: 520, posture: 240, atk: 2.0, dist: 18, trail: 0xff241c },
+      blade: { name: 'Prajurit Robot', hp: 130, posture: 128, atk: 0.6, dist: 8.5, trail: 0xff9a60 },
+      archer: { name: 'Pemanah Robot', hp: 80, posture: 80, atk: 0.85, dist: 12.5, trail: 0x9acf60 },
+      gunner: { name: 'Penembak Robot', hp: 95, posture: 92, atk: 1.2, dist: 11.5, trail: 0xffb060 },
+      boss: { name: 'Kurogane, Panglima Baja', hp: 520, posture: 268, atk: 1.5, dist: 18, trail: 0xff241c },
     }[kind];
     const rig = createHumanoid(
       // every enemy is a machine: brushed-steel frame, cyan optics, neon trim
@@ -1072,7 +1075,7 @@ export class Game {
       hitIdx: 0,
       swingIdx: 0,
       warned: false,
-      speedMul: boss ? 0.78 : 1.05,
+      speedMul: boss ? 0.86 : 1.16, // swings arrive quicker: less time to read them
       lungeD: [],
       pips: boss ? 2 : 1,
       maxPips: boss ? 2 : 1,
@@ -1085,7 +1088,7 @@ export class Game {
       defense: null,
       defenseUntil: 0,
       evadeCD: 0,
-      parryCD: this.combatMode === 'after' ? (boss ? 10 : kind === 'blade' ? 3.2 : 0) : 0,
+      parryCD: this.combatMode === 'after' ? (boss ? 6.5 : kind === 'blade' ? 2.2 : 0) : 0,
       evadeSide: 0,
       evadeDir: new THREE.Vector3(),
       punish: 0,
@@ -3789,11 +3792,22 @@ export class Game {
           this.kickV.addScaledVector(dd, 0.14);
           this.shocks.spawn(p.pos.clone().setY(p.pos.y + 1), 0xbfd8ff, 2.2, 0.3);
         }
-        // ---- Flying Swallow (attack in mid-air): dive at the target, rebound off it, repeat ----
-        if (this.attackBuf > 0 && p.diveAvail && p.pos.y > 0.4) {
+        // ---- air attacks: you cannot fence from the sky any more ----
+        // Only two things are allowed up here:
+        //  1. after an air dash (roll depan, C) → ONE flying slash, kick-weight, then gravity finishes it
+        //  2. with an enemy already inside blade reach → the swing is HELD and comes out on landing
+        // Anything else is dropped: a jump is for jumping, not for pecking people out of the air.
+        if (this.attackBuf > 0 && p.pos.y > 0.4) {
           this.attackBuf = 0;
-          this.startDive();
-          break;
+          if (!p.dashAvail && p.diveAvail) {
+            this.startDive();
+            break;
+          }
+          if (this.nearestCloseEnemy()) {
+            this.airSlashQueued = true;
+            p.glow = Math.max(p.glow, 0.9); // the blade answers: this swing is booked for the landing
+            this.sfx.unsheathe();
+          }
         }
         if (p.airDashT > 0) {
           p.airDashT -= dt;
@@ -3913,9 +3927,10 @@ export class Game {
           }
         }
         const landingY = this.landingHeightAt(previousY, p.pos.y, p.pos.x, p.pos.z);
-        if (hitE) this.diveStrike(hitE);
-        else if (landingY !== null) this.diveLand(landingY);
-        else if (p.t > 1.2) this.diveLand(this.parkourFloorAt(p.pos.x, p.pos.z));
+        // one contact only: after the slash connects the dive simply falls to the ground
+        if (hitE && !p.diveHit) this.diveStrike(hitE);
+        if (landingY !== null) this.diveLand(landingY, !p.diveHit);
+        else if (p.t > 1.2) this.diveLand(this.parkourFloorAt(p.pos.x, p.pos.z), !p.diveHit);
         break;
       }
       case 'stomp': {
@@ -4108,17 +4123,17 @@ export class Game {
         const d = this.enemySurfaceDistance(e, p.pos);
         if (d > 5.0) continue;
         const ranged = e.kind === 'archer' || e.kind === 'gunner';
-        const evadeChance = ranged ? 0.5 : this.isHeavyBoss(e) ? (e.phase2 ? 0.08 : 0.03) : e.boss ? (e.phase2 ? 0.34 : 0.24) : 0.2;
+        const evadeChance = ranged ? 0.55 : this.isHeavyBoss(e) ? (e.phase2 ? 0.11 : 0.05) : e.boss ? (e.phase2 ? 0.4 : 0.3) : 0.26;
         if (e.evadeCD <= 0 && Math.random() < evadeChance) {
           this.startEvade(e, d < 2.6);
           continue;
         }
         if (ranged) continue;
-        const parryChance = e.boss ? (e.phase2 ? 0.4 : 0.3) : 0.16;
-        const blockChance = e.boss ? 0.3 : 0.34;
+        const parryChance = e.boss ? (e.phase2 ? 0.46 : 0.36) : 0.24;
+        const blockChance = e.boss ? 0.36 : 0.42;
         const r = Math.random();
         e.defense = e.parryCD <= 0 && r < parryChance ? 'deflect' : r < parryChance + blockChance ? 'block' : null;
-        e.defenseUntil = this.time + 0.6;
+        e.defenseUntil = this.time + 0.72;
       }
     } else if (!this.rage.on && special?.hits[0]?.kind !== 'kick') {
       // Tactical update: readable guards replace random melee evasions; wind-ups and recovery remain punishable.
@@ -4134,8 +4149,8 @@ export class Game {
         if (e.defense && this.time < e.defenseUntil) continue;
         const parryReady = e.parryCD <= 0;
         e.defense = parryReady ? 'deflect' : 'block';
-        e.defenseUntil = this.time + (parryReady ? 0.5 : 0.62);
-        if (parryReady) e.parryCD = e.boss ? 2.2 : 3.6;
+        e.defenseUntil = this.time + (parryReady ? 0.6 : 0.78);
+        if (parryReady) e.parryCD = e.boss ? 1.5 : 2.4;
       }
     }
   }
@@ -4153,7 +4168,7 @@ export class Game {
     e.state = 'evade';
     e.stateT = 0;
     e.stateDur = back ? 0.42 : 0.38;
-    e.evadeCD = this.combatMode === 'after' ? (e.boss ? 2.1 : 3.2) : e.boss ? rand(1.6, 2.6) : rand(2.6, 4.2);
+    e.evadeCD = this.combatMode === 'after' ? (e.boss ? 1.5 : 2.3) : e.boss ? rand(1.2, 2.0) : rand(1.9, 3.0);
     e.yaw = Math.atan2(toP.x, toP.z);
     e.aim = e.yaw;
     // a dodge is a free opening to strike back
@@ -4309,10 +4324,13 @@ export class Game {
     const p = this.player;
     const back = p.flipStyle === 'back';
     const airtime = p.t;
+    const held = this.airSlashQueued;
+    this.airSlashQueued = false;
     p.pos.y = floorY;
     p.jumps = 0;
     p.diveAvail = true;
     p.dashAvail = true;
+    p.diveHit = false;
     p.airDashT = 0;
     p.flipStyle = '';
     const power = clamp(-impactVy / 12, 0.2, 1);
@@ -4333,6 +4351,9 @@ export class Game {
       p.t = 0;
       p.vel.multiplyScalar(0.25);
     }
+    // a swing held in the air is delivered on contact (the landing pose already cancels into it)
+    // generous on purpose: 'land' only cancels into a swing after 0.2 s, and slow-motion stretches that
+    if (held) this.attackBuf = Math.max(this.attackBuf, 0.5);
   }
 
   /**
@@ -4440,8 +4461,13 @@ export class Game {
   }
 
   /** Flying Swallow: a hard dive at the locked target (or straight ahead if none). */
+  /**
+   * Flying slash — only reachable after an air dash (roll depan). One cut, kick-weight, and then the
+   * fighter drops to the ground; there is no rebound and no second pass at the same body.
+   */
   private startDive() {
     const p = this.player;
+    p.diveHit = false;
     let tgt = this.lockOn ? this.lockTarget : null;
     if (!tgt || !this.alive(tgt) || this.enemySurfaceDistance(tgt, p.pos) > CLOSE_ATTACK_RANGE) {
       tgt = this.nearestCloseEnemy();
@@ -4472,38 +4498,32 @@ export class Game {
     this.kickV.addScaledVector(dir, 0.2);
   }
 
-  /** The dive connects: heavy cut, then the player rebounds off the target and can dive again. */
+  /**
+   * The flying slash connects: ONE cut weighted like the kick — little HP, enough posture to break a
+   * guard — and that is the whole move. The dive's momentum dies on contact, so gravity drops the
+   * fighter straight to the ground instead of bouncing him back up for another peck.
+   */
   private diveStrike(e: Enemy) {
     const p = this.player;
-    const h: HitDef = { t: 0, dmg: 34, post: 34, reach: 3, arc: 360, kind: 'slash', heavy: true, ang: 0.95 };
+    const h: HitDef = { t: 0, dmg: 10, post: 36, reach: 2.6, arc: 140, kind: 'slash', heavy: true, ang: 0.95 };
+    p.diveHit = true;
     p.aim = Math.atan2(e.pos.x - p.pos.x, e.pos.z - p.pos.z);
     p.yaw = p.aim;
     this.onPlayerStrike(h);
     this.applyPlayerHit(e, h);
-    this.addStyle(18);
-    this.shake(0.55);
-    this.fovPunch = 6;
-    this.shocks.spawn(this.tmpV.copy(e.pos).setY(this.isHeavyBoss(e) ? 2.2 * this.sizeK : 1.1 * e.scale), 0xfff0c0, 3, 0.35);
-    // rebound: spring back up and away
-    const away = new THREE.Vector3(p.pos.x - e.pos.x, 0, p.pos.z - e.pos.z);
-    if (away.lengthSq() < 0.01) away.copy(fwd(p.yaw)).multiplyScalar(-1);
-    away.normalize();
-    p.state = 'jump';
-    p.t = 0;
-    p.vy = 9;
-    p.vel.copy(away).multiplyScalar(5);
-    p.jumps = 1;
-    p.diveAvail = true;
-    p.dashAvail = true;
-    p.airDashT = 0;
-    p.jumpStart = -9;
-    p.flipV = -10.5;
-    p.flipEnd = p.flip - TAU;
+    this.addStyle(14);
+    this.shake(0.42);
+    this.fovPunch = 4;
+    this.shocks.spawn(this.tmpV.copy(e.pos).setY(this.isHeavyBoss(e) ? 2.2 * this.sizeK : 1.1 * e.scale), 0xfff0c0, 2.6, 0.32);
+    p.vel.multiplyScalar(0.2);
+    p.vy = Math.min(p.vy, -3);
   }
 
   /** The dive hits the ground: shockwave that staggers anything close. */
-  private diveLand(floorY = 0) {
+  private diveLand(floorY = 0, shock = true) {
     const p = this.player;
+    this.airSlashQueued = false;
+    p.diveHit = false;
     p.pos.y = floorY;
     p.state = 'land';
     p.t = 0;
@@ -4514,14 +4534,17 @@ export class Game {
     p.jumps = 0;
     p.diveAvail = true;
     p.dashAvail = true;
-    this.shocks.spawn(p.pos.clone().setY(floorY + 0.1), 0xffd9b0, 5, 0.5);
-    this.dustBurst(p.pos.clone().setY(floorY + 0.1), 18, 4);
-    this.shake(0.4);
+    this.shocks.spawn(p.pos.clone().setY(floorY + 0.1), 0xffd9b0, shock ? 5 : 3.2, 0.5);
+    this.dustBurst(p.pos.clone().setY(floorY + 0.1), shock ? 18 : 10, shock ? 4 : 2.6);
+    this.shake(shock ? 0.4 : 0.24);
     this.sfx.kick();
-    for (const e of this.enemies.slice()) {
-      if (!this.alive(e)) continue;
-      if (this.enemySurfaceDistance(e, p.pos) < 2.8) {
-        this.applyPlayerHit(e, { t: 0, dmg: 14, post: 24, reach: 3, arc: 360, kind: 'slash', heavy: false, ang: 0.95 });
+    // an empty dive still dents the ground; one that already cut somebody does not hit him twice
+    if (shock) {
+      for (const e of this.enemies.slice()) {
+        if (!this.alive(e)) continue;
+        if (this.enemySurfaceDistance(e, p.pos) < 2.8) {
+          this.applyPlayerHit(e, { t: 0, dmg: 14, post: 24, reach: 3, arc: 360, kind: 'slash', heavy: false, ang: 0.95 });
+        }
       }
     }
   }
@@ -4721,7 +4744,7 @@ export class Game {
     if (def === 'deflect') {
       // a real parry: your blade is thrown off, you stagger, and he is already swinging back
       e.defense = null;
-      e.parryCD = this.combatMode === 'before' ? (e.boss ? rand(1.4, 2.4) : rand(3.0, 5.0)) : e.boss ? 2.2 : 3.6;
+      e.parryCD = this.combatMode === 'before' ? (e.boss ? rand(1.0, 1.8) : rand(2.2, 3.6)) : e.boss ? 1.5 : 2.4;
       this.interruptEnemy(e);
       e.state = 'parry';
       e.stateT = 0;
@@ -4968,12 +4991,12 @@ export class Game {
     const r = Math.random();
     let n: EnemyAttackName;
     // The heavy boss favors slow, readable, high-impact strikes over rapid multi-hit strings.
-    if (!e.boss) n = r < 0.26 ? 'slash' : r < 0.58 ? 'combo2' : r < 0.78 ? 'combo3' : r < 0.92 ? 'thrust' : 'sweep';
+    if (!e.boss) n = r < 0.18 ? 'slash' : r < 0.46 ? 'combo2' : r < 0.68 ? 'combo3' : r < 0.86 ? 'thrust' : 'sweep';
     else if (this.isHeavyBoss(e)) {
       if (!e.phase2) n = r < 0.38 ? 'slash' : r < 0.68 ? 'sweep' : r < 0.9 ? 'thrust' : 'combo2';
       else n = r < 0.3 ? 'sweep' : r < 0.65 ? 'thrust' : r < 0.85 ? 'slash' : 'combo3';
-    } else if (!e.phase2) n = r < 0.16 ? 'slash' : r < 0.52 ? 'combo3' : r < 0.74 ? 'combo4' : r < 0.88 ? 'thrust' : 'sweep';
-    else n = r < 0.08 ? 'combo3' : r < 0.5 ? 'combo4' : r < 0.74 ? 'thrust' : 'sweep';
+    } else if (!e.phase2) n = r < 0.12 ? 'slash' : r < 0.46 ? 'combo3' : r < 0.72 ? 'combo4' : r < 0.88 ? 'thrust' : 'sweep';
+    else n = r < 0.06 ? 'combo3' : r < 0.44 ? 'combo4' : r < 0.72 ? 'thrust' : 'sweep';
     if ((n === 'thrust' || n === 'sweep') && e.lastAttack === n) n = this.isHeavyBoss(e) ? 'slash' : e.boss ? 'combo3' : 'slash';
     return n;
   }
@@ -5130,6 +5153,7 @@ export class Game {
     p.state = 'dead';
     p.t = 0;
     this.deadT = 0;
+    this.airSlashQueued = false; // a swing booked for a landing that will never happen
     this.sfx.die();
     this.slowmo(1.2, 0.25);
     this.onEvent({ type: 'playerDeath', text: '死' });
@@ -5153,8 +5177,8 @@ export class Game {
     const wantYaw = Math.atan2(toP.x, toP.z);
     let speed = 0;
 
-    if (e.state !== 'broken' && e.state !== 'dying' && e.state !== 'dead' && e.state !== 'spawn' && e.postureT > 1.6) {
-      e.posture = Math.max(0, e.posture - 16 * (0.5 + 0.5 * (e.hp / e.hpMax)) * dt);
+    if (e.state !== 'broken' && e.state !== 'dying' && e.state !== 'dead' && e.state !== 'spawn' && e.postureT > 1.15) {
+      e.posture = Math.max(0, e.posture - 21 * (0.5 + 0.5 * (e.hp / e.hpMax)) * dt);
     }
 
     switch (e.state) {
@@ -5179,13 +5203,13 @@ export class Game {
         }
         const ranged = e.kind === 'archer' || e.kind === 'gunner';
         // ranged enemies never block the melee queue — they snipe independently
-        // two blades may press you at once now (three used to take turns politely)
+        // three blades may press you at once now: the duel is meant to feel outnumbered
         const busy =
           !ranged &&
-          this.enemies.filter((o) => o !== e && o.state === 'attack' && o.kind !== 'archer' && o.kind !== 'gunner').length >= 2;
+          this.enemies.filter((o) => o !== e && o.state === 'attack' && o.kind !== 'archer' && o.kind !== 'gunner').length >= 3;
         let fwdS = 0;
         let side = 0;
-        const approach = heavyBoss ? 1.75 * (0.45 + 0.55 * this.sizeK) : (e.boss ? 4.4 : 3.7) * (0.45 + 0.55 * this.sizeK);
+        const approach = heavyBoss ? 2.15 * (0.45 + 0.55 * this.sizeK) : (e.boss ? 5.2 : 4.6) * (0.45 + 0.55 * this.sizeK);
         if (ranged) {
           // keep a firing distance: back off fast when rushed, close in when too far, always sidestep
           const lo = e.kind === 'archer' ? 8 : 6.5;
@@ -5199,15 +5223,16 @@ export class Game {
           else if (dist < 3.2) fwdS = -0.45 * this.sizeK;
           side = e.circleDir * (dist < 3.2 ? 0.06 : 0.18) * this.sizeK;
         } else if (busy) {
-          if (dist < 4.5) fwdS = -1.8;
-          else if (dist > 6) fwdS = approach * 0.6;
-          side = e.circleDir * 1.2;
-        } else if (dist > 3.4) {
+          // waiting their turn no longer means walking away: they crowd you and look for the gap
+          if (dist < 4.0) fwdS = -0.9;
+          else if (dist > 5.4) fwdS = approach * 0.85;
+          side = e.circleDir * 1.5;
+        } else if (dist > 3.0) {
           fwdS = approach;
-          side = e.circleDir * 0.5;
-        } else if (dist < 1.9) {
-          fwdS = -1.6;
-          side = e.circleDir * 1.0;
+          side = e.circleDir * 0.6;
+        } else if (dist < 1.6) {
+          fwdS = -1.2;
+          side = e.circleDir * 1.15;
         } else {
           side = e.circleDir * 1.3;
         }
@@ -5233,7 +5258,7 @@ export class Game {
           e.attackTimer <= 0 &&
           !e.disarmed &&
           !busy &&
-          dist < (heavyBoss ? HEAVY_BOSS_ATTACK_RANGE : 4.3) &&
+          dist < (heavyBoss ? HEAVY_BOSS_ATTACK_RANGE : 4.9) &&
           playerAlive &&
           this.alive(e)
         ) {
@@ -5307,12 +5332,12 @@ export class Game {
           e.trailOn = false;
           e.settle = 0.3;
           e.attackTimer = this.isHeavyBoss(e)
-            ? rand(e.phase2 ? 0.65 : 1.15, e.phase2 ? 1.05 : 1.8)
+            ? rand(e.phase2 ? 0.5 : 0.85, e.phase2 ? 0.8 : 1.35)
             : e.boss
-              ? rand(e.phase2 ? 0.18 : 0.32, e.phase2 ? 0.5 : 0.8)
+              ? rand(e.phase2 ? 0.14 : 0.24, e.phase2 ? 0.4 : 0.62)
               : e.kind === 'archer' || e.kind === 'gunner'
-                ? rand(0.8, 1.7)
-                : rand(0.35, 0.95);
+                ? rand(0.65, 1.35)
+                : rand(0.22, 0.62);
         }
         break;
       }
@@ -5323,7 +5348,7 @@ export class Game {
         if (e.stateT > e.stateDur) {
           e.state = 'idle';
           e.stateT = 0;
-          e.attackTimer = Math.min(e.attackTimer, rand(0.3, 0.9));
+          e.attackTimer = Math.min(e.attackTimer, rand(0.18, 0.5));
         }
         break;
       }
@@ -5333,7 +5358,7 @@ export class Game {
         if (e.stateT > e.stateDur) {
           e.state = 'idle';
           e.stateT = 0;
-          e.attackTimer = rand(0.2, 0.6);
+          e.attackTimer = rand(0.1, 0.35);
         }
         break;
       }
