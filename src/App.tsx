@@ -234,7 +234,7 @@ const CONTROLS: [string, string][] = [
   ['Stick kiri', 'Jalan — layar sentuh, sama saja dengan W A S D'],
   ['Tombol kanan', '斬 serang · 瞬 dash · 跳 lompat · 弾 guard · 蹴 tendang · 怒 rage · 薬 heal · ◎ ganti target'],
   ['Tap layar', 'Tebas · swipe atas = lompat · swipe bawah = dash · swipe kiri/kanan = ganti target'],
-  ['W A S D', 'Bergerak · Shift sprint · jalan ke undakan rendah = naik otomatis'],
+  ['W A S D', 'Bergerak · Shift sprint (badan merendah, pedang terseret di belakang) · jalan ke undakan rendah = naik otomatis'],
   ['Mouse', 'Kamera'],
   ['Klik kiri', 'Tebas — combo 5 serangan'],
   ['Klik kanan tahan', 'Guard depan · ketuk saat benturan = Deflect'],
@@ -272,6 +272,7 @@ const RULES: [string, string][] = [
   ['十一', 'Sistem gerak diperhalus: ada dorongan awal (badan memanjang, langkah pertama lebih panjang), pengereman (badan menahan ke belakang, tumit menjejak lebih depan), dan potong arah (bahu memuntir melawan belokan lalu melepas, kaki menyilang, badan miring ke dalam belokan). Kepala distabilkan terhadap ayunan langkah dan mengangkat dagu saat sprint.'],
   ['十二', 'Kamera ikut aturan lompat: saat double jump kamera melepas lock dan berayun ke belakang arah gerak, lalu mengunci lagi begitu kaki menyentuh tanah.'],
   ['十三', 'Atap Kota Putih benar-benar bisa dipanjat. Undakan setinggi lutut sampai pinggang dinaiki sambil jalan (kaki depan mengangkat, pinggul naik, badan condong ke undakan); yang lebih tinggi ditangkap dengan mantle saat melompat ke arahnya — tarik, lalu lutut depan naik ke bibir atap. Telapak kaki sekarang mengikuti permukaan: tumit yang melewati bibir atap meraih ke bawah dan menegang, bukan mengambang di udara.'],
+  ['十四', 'Lari dirombak total ala Black Myth: Wukong. Langkah jadi pendek dan berputar cepat (bukan langkah panjang yang melayang), ada fase kedua kaki lepas tanah saat sprint, pinggul memantul dua kali per langkah, badan merendah dan condong jauh ke depan, ayunan lengan lebar dengan garis bahu yang berputar melawan langkah. Pedang selalu dibawa RENDAH dan TERTINGGAL DI BELAKANG badan pada semua kecepatan lari — bilahnya menyapu mengikuti irama langkah, seperti tongkat yang diseret. Akselerasi sprint menyentak dan rem lebih pakem, kamera ikut mendekat, FOV melebar, naik-turun tiap tapak dan miring halus tiap langkah, afterimage keluar lebih awal, dan setiap tapak sprint melempar debu lebih banyak.'],
 ];
 
 /** Slow-drifting embers behind the title. */

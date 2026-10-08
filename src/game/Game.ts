@@ -415,6 +415,8 @@ export class Game {
   private skidT = 0;
   private camRoll = 0;
   private rollKick = 0;
+  /** a breath of camera roll locked to the stride phase, so the frame leans into each step while running */
+  private camStride = 0;
   private camBob = 0;
   private camSide = 0.65;
   private cineW = 0;
@@ -1292,10 +1294,10 @@ export class Game {
         pl.state === 'dodge' ||
         pl.state === 'dive' ||
         (pl.state === 'jump' && (pl.airDashT > 0 || pl.inv > 0)) ||
-        (pl.state === 'idle' && spd > this.sprintSpd * 0.78);
+        (pl.state === 'idle' && spd > this.sprintSpd * 0.6);
       this.ghostT -= real;
       if (dashing && this.ghostT <= 0) {
-        this.ghostT = pl.state === 'idle' ? 0.075 : 0.05;
+        this.ghostT = pl.state === 'idle' ? (spd > this.sprintSpd * 0.85 ? 0.042 : 0.07) : 0.05;
         const col = this.rage.on ? 0xff5a48 : 0x7fa6ff;
         this.ghosts.snap(pl.rig.root, col, this.rage.on ? 0.3 : 0.22, 0.34);
       }
@@ -2818,8 +2820,9 @@ export class Game {
     let pitch = this.camPitch;
     // sense of speed: the lens widens when sprinting — and through the air too, so an air dash (17.5 m/s)
     // and a long rooftop leap stretch the frame instead of flying past at walking lens
+    const spdNow = Math.hypot(p.vel.x, p.vel.z);
     const fastStates = p.state === 'idle' || p.state === 'jump' || p.state === 'dive';
-    let fovT = 58 + (fastStates ? clamp((Math.hypot(p.vel.x, p.vel.z) - 6) * 1.7, 0, 8) : 0);
+    let fovT = 58 + (fastStates ? clamp((spdNow - 5.5) * 2.1, 0, 11) : 0);
     const pivot = this.tmpV.copy(p.pos).add(new THREE.Vector3(0, 1.55 * this.sizeK, 0));
     // A double jump is the player's own move, not part of the duel, so the camera lets go of the target for
     // its length and swings behind the direction of travel, then eases back onto the lock once the feet are
@@ -2878,6 +2881,9 @@ export class Game {
         fovT -= 3;
       }
     }
+    // a sprint pulls the camera in as the lens widens: closer + wider reads as faster without touching movement
+    const sprintK = p.state === 'idle' ? clamp((spdNow - 8) / 6, 0, 1) : 0;
+    dist *= 1 - 0.1 * sprintK;
     if (this.kickV.lengthSq() > 1e-6) {
       this.camPos.add(this.kickV);
       this.kickV.multiplyScalar(Math.exp(-30 * real));
@@ -2941,13 +2947,15 @@ export class Game {
     this.camLook.lerp(lookT, 1 - Math.exp(-16 * real));
 
     // camera roll: banks into strafes and turns, kicked sideways by deflects
-    const spdNow = Math.hypot(p.vel.x, p.vel.z);
     const rollT = clamp(-lat * 0.0055, -0.05, 0.05) + clamp(-p.yawRate * 0.004 * Math.min(1, spdNow / 5), -0.04, 0.04);
     this.camRoll += (rollT - this.camRoll) * (1 - Math.exp(-6 * real));
     this.rollKick *= Math.exp(-7 * real);
-    // run bob: head-height rhythm locked to the footfalls (stronger when sprinting)
+    // run bob: head-height rhythm locked to the footfalls, growing with the sprint so the ground rushes past
     const bobAmt = p.state === 'idle' ? clamp((spdNow - 2.5) / 7, 0, 1) : 0;
-    this.camBob += ((Math.sin(p.loco.phase * Math.PI * 4) * 0.045 * bobAmt) - this.camBob) * (1 - Math.exp(-18 * real));
+    const bobAmp = (0.035 + 0.05 * sprintK) * bobAmt;
+    this.camBob += (Math.sin(p.loco.phase * Math.PI * 4) * bobAmp - this.camBob) * (1 - Math.exp(-18 * real));
+    // …and a breath of roll per stride, so the frame leans into each step instead of floating over them
+    this.camStride += (Math.cos(p.loco.phase * TAU) * 0.007 * bobAmt - this.camStride) * (1 - Math.exp(-16 * real));
 
     const tr = this.trauma * this.trauma;
     const tt = this.time * 40 + performance.now() * 0.03;
@@ -2958,7 +2966,7 @@ export class Game {
     this.camera.position.y += sy + this.camBob;
     this.camera.up.set(0, 1, 0);
     this.camera.lookAt(this.camLook);
-    this.camera.rotation.z += Math.sin(tt * 2.1) * tr * 0.03 + this.camRoll + this.rollKick;
+    this.camera.rotation.z += Math.sin(tt * 2.1) * tr * 0.03 + this.camRoll + this.rollKick + this.camStride;
     const f = this.fov - this.fovPunch;
     if (Math.abs(this.camera.fov - f) > 0.01) {
       this.camera.fov = f;
@@ -3267,7 +3275,8 @@ export class Game {
           const ft = f.feet[i];
           if (f === this.player) {
             this.sfx.step(L.sp);
-            if (L.sp > this.sprintSpd * 0.72) this.shake(0.024); // sprinting: every footfall thumps the frame
+            // sprinting: every footfall thumps the frame, harder the faster he is going
+            if (L.sp > this.sprintSpd * 0.58) this.shake(0.02 + 0.02 * (L.sp / this.sprintSpd));
           }
           if (heavyBoss) {
             const foot = this.tmpV2.set(ft.wx, 0.04, ft.wz);
@@ -3276,11 +3285,11 @@ export class Game {
             this.shake(0.07);
           } else {
             const fs = L.sp / this.sprintSpd;
-            if (fs > 0.3) {
-              const big = fs > 0.62;
-              this.dustBurst(this.tmpV2.set(ft.wx, 0.05, ft.wz), big ? 5 : 2, big ? 2.2 : 1.2);
+            if (fs > 0.24) {
+              const big = fs > 0.55;
+              this.dustBurst(this.tmpV2.set(ft.wx, 0.05, ft.wz), big ? 7 : 3, big ? 2.6 : 1.4);
               if (big && f === this.player) {
-                this.shocks.spawn(this.tmpV2.set(ft.wx, 0.04, ft.wz), 0xffffff, 0.9, 0.22);
+                this.shocks.spawn(this.tmpV2.set(ft.wx, 0.04, ft.wz), 0xffffff, 0.9 + 0.5 * fs, 0.22);
               }
             }
           }
@@ -3332,40 +3341,51 @@ export class Game {
       out.torsoX += 0.05 * tightW;
     }
     if (carryW > 0.001) {
-      // The free arm trails back; keep the sword hand lower and close to the hip in a ready carry.
-      const c = smooth01((L.sp - 0.9) / 1.6) * carryW;
-      const amp = 0.24 + 0.34 * o.run + 0.1 * o.spr + 0.16 * o.burst; // the arms pump harder when driving off
-      out.lsX += (-0.3 - o.arm * amp - out.lsX) * c;
-      out.lsZ += (0.12 + 0.08 * o.run - out.lsZ) * c;
-      out.leX += (-(0.7 + 0.75 * o.run) - 0.25 * Math.max(0, o.arm) * o.run - out.leX) * c;
+      // ---- the carry: sword LOW and TRAILING BEHIND the body ----
+      // This is the silhouette the whole run is built around. The right arm drops back and hangs long, the grip
+      // sits down at the hip and behind it, and the blade streams out back-and-down instead of being held ready
+      // in front — so it whips through the stride the way a carried staff does. The free arm swings wide to
+      // answer it, and the shoulder line rocks against the swing, which is most of what reads from behind.
+      // fully carried from a slow jog up: the blade is low and trailing at every running speed, not just a sprint
+      const c = smooth01((L.sp - 0.6) / 0.9) * carryW;
+      const amp = 0.3 + 0.5 * o.run + 0.26 * o.spr + 0.18 * o.burst; // wide swing, harder when driving off
+      out.lsX += (-0.14 - o.arm * amp - out.lsX) * c;
+      out.lsZ += (0.18 + 0.12 * o.run + 0.07 * o.arm - out.lsZ) * c;
+      out.leX += (-(0.5 + 0.5 * o.run + 0.22 * o.spr) - 0.3 * Math.max(0, o.arm) * o.run - out.leX) * c;
       out.two *= 1 - c;
-      out.sx += (-0.27 - out.sx) * c;
-      out.sy += (0.2 - out.sy) * c;
-      out.sz += (0.22 - out.sz) * c;
-      out.sp += (0.58 - out.sp) * c;
-      out.sw += (0.28 - out.sw) * c;
-      out.sr += (0.14 - out.sr) * c;
-      // The sword stays steady; only a small wrist follow-through answers the running rhythm.
-      out.sp += Math.sin(ph * 2) * 0.025 * c;
-      out.sw += -0.035 * o.arm * c;
+      // the right shoulder is IK-solved to this grip point, so it is what swings the sword arm: sweep it back
+      // and forward with the stride (opposite the free arm) and the arm follows, near-straight and hanging long
+      const swR = -o.arm;
+      out.sx += (-0.3 + 0.02 * swR - out.sx) * c;
+      out.sy += (0.11 - out.sy) * c; // low — the hilt rides at hip height, never raised
+      out.sz += (-0.05 + 0.12 * swR * (0.55 + 0.45 * o.spr) - out.sz) * c; // …and trailing behind the body
+      out.sp += (-0.3 - out.sp) * c; // tip down
+      out.sw += (2.78 - out.sw) * c; // …and streaming back behind the hip
+      out.sr += (0.5 - out.sr) * c;
+      // the blade lags the stride: it whips on the toe-off and settles through the flight
+      out.sp += Math.sin(ph * 2) * 0.05 * c;
+      out.sw += -0.08 * o.arm * c;
+      out.sr += 0.05 * Math.cos(ph * 2) * c;
+      out.torsoZ += -o.arm * (0.022 + 0.035 * o.run + 0.03 * o.spr) * c;
 
-      // Forward-running posture: the free arm trails while the right hand carries the katana ready to strike.
+      // ---- the folded sprint on top of the carry ----
+      // Deeper torso fold, head still up toward the path, the free arm swinging around a pinned-back centre, and
+      // the sword streaming further out behind: at a full sprint the blade is dragging in his wake.
       const n = o.ninja * carryW;
       if (n > 0.001) {
-        out.lsX += (0.82 + o.arm * 0.26 - out.lsX) * n;
-        out.lsZ += (0.3 - out.lsZ) * n;
-        out.leX += (-0.22 - 0.12 * Math.max(0, o.arm) - out.leX) * n;
+        out.lsX += (0.34 - o.arm * amp * 0.72 - out.lsX) * n;
+        out.lsZ += (0.34 - out.lsZ) * n;
+        out.leX += (-0.3 - 0.16 * Math.max(0, o.arm) - out.leX) * n;
         out.two *= 1 - n;
-        out.sx += (-0.27 - out.sx) * n;
-        out.sy += (0.16 - out.sy) * n;
-        out.sz += (0.28 - out.sz) * n;
-        out.sp += (0.52 - out.sp) * n;
-        out.sw += (0.34 - 0.04 * o.arm - out.sw) * n;
-        out.sr += (0.14 - out.sr) * n;
-        // The torso leans into the run; the head stays lifted toward the path ahead.
-        out.torsoX += 0.15 * n;
-        out.hipX += 0.05 * n;
-        out.headX -= 0.08 * n;
+        out.sx += (-0.32 - out.sx) * n;
+        out.sy += (0.12 - out.sy) * n;
+        out.sz += (-0.12 + 0.09 * swR * (0.5 + 0.5 * o.spr) - out.sz) * n;
+        out.sp += (-0.44 - out.sp) * n;
+        out.sw += (2.95 - 0.05 * o.arm - out.sw) * n;
+        out.sr += (0.62 - out.sr) * n;
+        out.torsoX += 0.2 * n;
+        out.hipX += 0.07 * n;
+        out.headX -= 0.12 * n; // the head stays up and level while the torso folds under it
       }
     }
   }
@@ -3805,14 +3825,17 @@ export class Game {
         // short legs cover less ground, so speed follows body size
         // speed is capped by what the legs can actually turn over — outrun your own stride and the feet skate
         const bodyK = this.sizeK * (this.chibi ? 0.9 : 1);
-        let spd = (guarding ? 2.4 : sprint ? 14.0 : 8.4) * (1 + 0.08 * this.flowLevel()) * (0.3 + 0.7 * bodyK);
+        // A clear jog and a clear sprint: the jog sits a touch lower so letting go of Shift visibly settles the
+        // body, and the sprint bursts out of it instead of winding up.
+        let spd = (guarding ? 2.5 : sprint ? 14.0 : 8.0) * (1 + 0.08 * this.flowLevel()) * (0.3 + 0.7 * bodyK);
         if (move.lengthSq() > 0.01) desiredSpeed = spd;
-        // weighty acceleration: ~0.2 s to full run, firm braking — the lean in the animation comes from this
+        // snap into the sprint (~0.3 s), settle into the jog, and stop on a dime — the lean and the push-off
+        // transient in the gait are driven by this, so harder acceleration is also better animation
         const desVel = move.clone().multiplyScalar(spd);
         const dvx = desVel.x - p.vel.x;
         const dvz = desVel.z - p.vel.z;
         const dvl = Math.hypot(dvx, dvz);
-        const maxStep = (move.lengthSq() > 0.01 ? (sprint ? 30 : 36) : 46) * dt;
+        const maxStep = (move.lengthSq() > 0.01 ? (sprint ? 46 : 34) : 56) * dt;
         const k = dvl > maxStep ? maxStep / dvl : 1;
         p.vel.x += dvx * k;
         p.vel.z += dvz * k;
